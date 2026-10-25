@@ -1,0 +1,62 @@
+name: CI
+on:
+  push:
+    branches: ['*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.40', '5.38', '5.36', '5.34', '5.32', '5.30', '5.28', '5.26', '5.24', '5.22']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+      # Backends are recommends now, so the full matrix asks for them explicitly;
+      # the other jobs install core deps only and let backend cases skip.
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL
+      # This row installs every leaf, so make it prove all 39 ran rather than
+      # counting skipped subtests as passes.
+      - run: make test
+        env:
+          DS_ALL_BACKENDS: 1
+
+  test-alpine:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: apk add --no-cache perl perl-dev make gcc musl-dev linux-headers wget
+      - run: wget -qO- https://cpanmin.us | perl - App::cpanminus
+      - run: cpanm -n --installdeps .
+      - run: perl Makefile.PL && make test
+
+  test-arm:
+    runs-on: ubuntu-24.04-arm
+    name: ARM64 / Linux
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n --installdeps .
+      - run: perl Makefile.PL && make test
+
+  test-xt:
+    runs-on: ubuntu-latest
+    name: AUTHOR_TESTING (xt/)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n Test::Kwalitee Test::Pod Test::Pod::Coverage
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL && make
+      - run: AUTHOR_TESTING=1 prove -Ilib xt/

@@ -1,0 +1,10 @@
+^MANIFEST\.bak$
+^Makefile$
+^MYMETA\.
+(^|/)blib/
+^pm_to_blib$
+^\.git/
+^REVIEW\.md$
+^Data-Shared-.*\.tar\.gz$
+^Data-Shared-\d
+^cover_db/

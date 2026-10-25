@@ -1,0 +1,53 @@
+Data-Shared
+
+Path-addressed facade over the 39 Data-*-Shared distributions,
+with an API inspired by Data::Path::XS (string, array and compiled
+path tiers). A root object holds named mounts; a slash path such as
+/cache/42 resolves to a mount plus an intra-structure operation.
+
+    use Data::Shared qw(shared_get shared_set shared_call);
+    my $root = Data::Shared->new('/tmp/app.shared');
+    $root->mount('cache', 'hashmap:ii', undef, 100_000);
+    shared_set($root, '/cache/42', 100);
+    shared_get($root, '/cache/42');
+
+See lib/Data/Shared.pm for the full documentation and
+lib/Data/Shared/Cookbook.pod for per-dist recipes.
+
+Linux only, 64-bit Perl. Pure Perl; all operations execute in the
+underlying XS of each leaf.
+
+Architecture: Data::Shared owns roots, lifecycle coordination, and path dispatch.
+Manifest validates/publishes configuration; Storage plans paths and constructs
+backends with explicit creation/reopening rules.
+Registry declares backend classes and operation mappings; six adapters
+translate generic operations to native methods. Compiled paths cache
+dispatch and invalidate it when mounts change. Composite mounts keep
+a hidden child registry and lazily open one backend per child; Node
+provides a relative-path cursor.
+
+Use compiled paths for repeated access and native handles or backend
+batch methods for tight loops. File-backed composites bound their
+open-child cache; anonymous composites retain children to preserve data.
+Configure mount topology in one coordinator before starting workers.
+Read-only native access depends on backend support for new_readonly.
+
+Reopening requires every mount backing file to exist; missing child files
+also fail when opened lazily. PerfectHash files are built once and then loaded.
+Manifest updates are locked and revision checked: reopen a stale root before
+retrying a topology change. Failed construction/publication rolls back new
+registrations and files. Lifecycle locks coordinate child creation/deletion;
+ordinary leaf calls retain backend locking.
+
+For native data-write protection, use
+Data::Shared->open_readonly($dir, strict => 1). This rejects unsupported
+backends throughout the declared tree. The default retains compatibility
+fallbacks. Native minimum versions are recorded in Registry.pm.
+
+Benchmarks: bench/benchmark.pl (flat paths), bench/overhead.pl
+(dispatch costs), bench/composite.pl (warm versus evicted children).
+Set DS_BENCH_TIME to the minimum CPU seconds per benchmark case.
+bench/scaling.pl also measures creation scaling, RSS, cache working sets,
+and multiprocess latency; see bench/scaling-results.txt for a recorded run.
+
+Install: perl Makefile.PL && make && make test && make install

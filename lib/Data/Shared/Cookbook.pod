@@ -1,0 +1,224 @@
+=encoding utf8
+
+=head1 NAME
+
+Data::Shared::Cookbook - Per-dist recipes for the Data::Shared facade
+
+=head1 DESCRIPTION
+
+One small recipe per leaf. Every recipe assumes:
+
+    use Data::Shared qw(shared_get shared_set shared_delete shared_exists
+                        shared_incr shared_call shared_push shared_pop);
+    my $root = Data::Shared->new('/tmp/app.shared');   # file-backed
+    # or: my $root = Data::Shared->new;                # anonymous
+
+and that another process can reopen everything with
+C<< Data::Shared->open('/tmp/app.shared') >>.
+
+=head1 MAP-LIKE
+
+=head2 HashMap (cache with variants)
+
+    $root->mount('cache', 'hashmap:ii', undef, 100_000);
+    $root->mount('names', 'hashmap:ss', undef, 100_000);
+    shared_set($root, '/cache/42', 100);
+    shared_get($root, '/cache/42');
+    shared_incr($root, '/cache/42');          # native incr
+    shared_incr($root, '/cache/42', 10);      # native incr_by
+    shared_call($root, '/cache', 'cas', 42, 110, 200);
+    shared_delete($root, '/cache/42');
+
+=head2 Buffer (typed shared array)
+
+    $root->mount('counters', 'buffer:i64', undef, 1024);   # file auto-supplied
+    shared_set($root, '/counters/0', 42);
+    shared_get($root, '/counters/0');
+    shared_incr($root, '/counters/0');
+
+Buffer needs a backing file (or memfd), so anonymous mounts should
+pass an explicit path/factory; a file-backed root handles it.
+
+=head2 RadixTree (route table)
+
+    $root->mount('routes', 'radixtree', undef, 65536, 1 << 20);
+    shared_set($root, '/routes/10.0.0.0/8', 100);   # remainder is joined
+    shared_get($root, '/routes/10.0.0.0/8');
+    shared_call($root, '/routes', 'longest_prefix', '10.0.0.5');
+
+=head2 Intern + SortedSet Strings (string-keyed ZSET)
+
+    $root->mount('ids', 'intern', undef, 1_000_000, 32 << 20);
+    my $id = shared_set($root, '/ids/alice');       # intern, returns id
+    shared_get($root, '/ids/alice');                # id_of
+    shared_call($root, '/ids', 'string', $id);      # reverse lookup
+
+    $root->mount('board', 'sortedset:strings', { max => 100_000 });
+    shared_set($root, '/board/alice', 1500);
+    shared_get($root, '/board/alice');              # score
+    shared_call($root, '/board', 'rev_range_by_rank', 0, 9);
+
+=head2 Pool (slot allocator)
+
+    $root->mount('slots', 'pool:i64', undef, 1000);
+    my $idx = shared_call($root, '/slots', 'alloc');
+    shared_set($root, "/slots/$idx", 42);
+    shared_delete($root, "/slots/$idx");            # free
+
+=head2 PerfectHash (immutable exact set)
+
+    # build elsewhere (or via the hashref mount form), then:
+    $root->mount('words', 'perfecthash', { build_str => ['apple', 'banana'], path => '/tmp/words.phs' });
+    shared_exists($root, '/words/banana');          # 1
+
+=head1 SET-LIKE
+
+    $root->mount('seen', 'bloomfilter', undef, 1_000_000, 0.01);
+    shared_set($root, '/seen/event-42');            # add
+    shared_exists($root, '/seen/event-42');
+
+    $root->mount('bits', 'bitset', undef, 256);
+    shared_set($root, '/bits/10', 1);
+    shared_get($root, '/bits/10');                  # test
+    shared_set($root, '/bits/10', 0);               # clear by falsy value
+
+    $root->mount('members', 'roaringbitmap', undef, 256);
+    shared_set($root, '/members/70000', 1);
+    shared_call($root, '/members', 'union', $root->handle('/other'));
+
+    $root->mount('ds', 'disjointset', undef, 1000);
+    shared_set($root, '/ds/0', 1);                  # union(0, 1)
+    shared_get($root, '/ds/0');                     # find
+
+=head1 QUEUE-LIKE
+
+    $root->mount('jobs', 'queue:int', undef, 1024);
+    shared_push($root, '/jobs', 42);
+    shared_pop($root, '/jobs');
+    shared_call($root, '/jobs', 'pop_wait', 1.5);
+
+    $root->mount('stack', 'stack:str', undef, 50, 256);
+    shared_push($root, '/stack', 'hello');
+    shared_pop($root, '/stack');
+
+    $root->mount('tasks', 'heap', undef, 1000);
+    shared_push($root, '/tasks', 3, 300);           # priority, value
+    my ($pri, $val) = shared_pop($root, '/tasks');
+
+    $root->mount('audit', 'log', undef, 1_000_000);
+    shared_push($root, '/audit', 'first entry');    # append
+    shared_call($root, '/audit', 'entry_count');
+
+    $root->mount('events', 'pubsub:int', undef, 1024);
+    shared_push($root, '/events', 42);              # publish
+    my $sub = shared_call($root, '/events', 'subscribe');
+    $sub->poll;
+
+=head1 INDEXED
+
+    $root->mount('lat', 'ndarray', undef, 'f64', 2, 3);
+    shared_set($root, '/lat/0/1', 1.5);
+    shared_get($root, '/lat/0/1');
+    shared_call($root, '/lat', 'sum');
+
+    $root->mount('counts', 'fenwick', undef, 1_000_000);
+    shared_incr($root, '/counts/5', 3);             # update(5, 3)
+    shared_get($root, '/counts/5');                 # point
+    shared_call($root, '/counts', 'prefix', 9);
+
+    $root->mount('grid', 'fenwick2d', undef, 24, 7);
+    shared_set($root, '/grid/9/1', 100);
+    shared_get($root, '/grid/9/1');
+
+    $root->mount('arr', 'segmenttree', undef, 1000);
+    shared_set($root, '/arr/10', 42);
+    shared_incr($root, '/arr/10', 5);
+    shared_call($root, '/arr', 'sum', 0, 99);
+
+KDTree, IntervalTree, SpatialHash and Graph are call-driven:
+
+    $root->mount('cities', 'kdtree', undef, 2, 100_000);
+    shared_call($root, '/cities', 'add', [10.5, 20.5], 42);
+    shared_call($root, '/cities', 'nearest', [10.0, 20.0]);
+
+=head1 SKETCHES AND STATS
+
+Keyed sketches accept generic verbs; the rest are call-driven.
+
+    $root->mount('freq', 'countminsketch', undef, 0.001, 0.001);
+    shared_set($root, '/freq/alice', 5);            # add(alice, 5)
+    shared_get($root, '/freq/alice');               # estimate
+
+    $root->mount('hitters', 'topk', undef, 100);
+    shared_set($root, '/hitters/popular');          # add once
+    shared_get($root, '/hitters/popular');          # estimate
+    shared_call($root, '/hitters', 'top', 10);
+
+    $root->mount('visitors', 'hyperloglog', undef, 14);
+    shared_call($root, '/visitors', 'add', 'alice');
+    shared_call($root, '/visitors', 'count');
+
+    $root->mount('latency', 'ddsketch', undef, 0.01);
+    shared_call($root, '/latency', 'add', 123);
+    shared_call($root, '/latency', 'quantile', 0.99);
+
+    $root->mount('hist', 'histogram', undef, 1, 3_600_000_000, 3);
+    shared_call($root, '/hist', 'record', 120);
+    shared_call($root, '/hist', 'value_at_percentile', 99);
+
+    $root->mount('sample', 'reservoir', undef, 100);
+    shared_call($root, '/sample', 'add', $_) for @stream;
+    shared_call($root, '/sample', 'sample');
+
+    $root->mount('setsim', 'minhash', undef, 256);
+    shared_call($root, '/setsim', 'add', 'element');
+
+=head1 SYNC AND TIMING (call-only)
+
+    $root->mount('sem', 'sync:semaphore', undef, 4);
+    shared_call($root, '/sem', 'acquire');
+    shared_call($root, '/sem', 'release');
+
+    $root->mount('timers', 'timingwheel', undef, 512, 10_000);
+    my $id = shared_call($root, '/timers', 'add', 30, $job_id);
+    shared_call($root, '/timers', 'advance', 1);
+
+ReqRep is likewise call-driven (server C<recv_wait>/C<reply>, client
+objects obtained from the native handle).
+
+=head1 COMPOSITES (DEEP PATHS)
+
+    use Data::Shared qw(shared_set shared_get shared_exists shared_delete);
+    $root->mount('users', ['hashmap:ss', 100_000, ['bloomfilter', 10_000, 0.01]]);
+    shared_set($root, '/users/alice/event-42', 1);
+    shared_exists($root, '/users/alice/event-42');
+    $root->children('/users');                       # ('alice', ...)
+    $root->node('/users/alice')->call('count');
+    shared_delete($root, '/users/alice');            # whole subtree
+
+    $root->mount('leaders', ['sortedset:strings', { max => 100_000 }, ['bloomfilter', 10_000, 0.01]]);
+    shared_set($root, '/leaders/alice', 1500);        # score
+    shared_set($root, '/leaders/alice/event-9', 1);   # in alice's filter
+
+    $root->mount('queues', ['hashmap:ss', 1000, ['queue:int', 1024]]);
+    $root->push('/queues/alice', 42);                 # per-user job queue
+    $root->pop('/queues/alice');
+
+With a budget and open-child cache, in hashref form:
+
+    $root->mount('users', { spec => 'hashmap:ss', args => [100_000],
+        child => { spec => 'bloomfilter', args => [10_000, 0.01] },
+        max_children => 10_000, cache_size => 64 });
+
+Parents must be addressable (hashmap, sortedset, kdtree/graph by
+id); bloom filters, sketches, queues and sync mounts are leaves.
+See the DEEP PATHS section of L<Data::Shared>.
+
+=head1 FREEZE AND SHIP
+
+    $root->freeze_all;                               # where leaves support it
+    my $ro = Data::Shared->open_readonly('/tmp/app.shared');
+    shared_get($ro, '/cache/42');                    # lock-free reads
+    # shared_set($ro, ...) croaks: root is read-only
+
+=cut

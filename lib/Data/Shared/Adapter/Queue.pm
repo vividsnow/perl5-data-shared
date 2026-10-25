@@ -1,0 +1,113 @@
+package Data::Shared::Adapter::Queue;
+use strict;
+use warnings;
+use Carp ();
+
+our $VERSION = '0.01';
+
+our @CARP_NOT = qw(Data::Shared);
+
+sub make_verb {
+    my ($class, $verb, $handle, $entry) = @_;
+    my $verbs = $entry->{verbs} || {};
+    return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
+    my $spec = $verbs->{$verb};
+    if (ref $spec eq 'CODE') {
+        return sub { my ($rest, @a) = @_; return $spec->($handle, @$rest, @a) };
+    }
+    my $method = $handle->can($spec);
+    if (!$method) {
+        my $msg = "$entry->{key}: handle does not support '$spec'";
+        return sub { Carp::croak($msg) };
+    }
+    return sub { my ($rest, @a) = @_; return $handle->$method(@$rest, @a) };
+}
+
+
+sub make_bound {
+    my ($class, $verb, $handle, $entry, $rest) = @_;
+    my $verbs = $entry->{verbs} || {};
+    return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
+    my $spec = $verbs->{$verb};
+    my @idx = @$rest;
+    if (ref $spec eq 'CODE') {
+        return sub { my @a = @_; return $spec->($handle, @idx, @a) };
+    }
+    my $method = $handle->can($spec);
+    if (!$method) {
+        my $msg = "$entry->{key}: handle does not support '$spec'";
+        return sub { Carp::croak($msg) };
+    }
+    return sub { my @a = @_; return $handle->$method(@idx, @a) };
+}
+
+sub make_bound_push {
+    my ($class, $handle, $entry, $rest) = @_;
+    return _make_pushpop($entry, $handle, 'push', $rest);
+}
+
+sub make_bound_pop {
+    my ($class, $handle, $entry, $rest) = @_;
+    return _make_pushpop($entry, $handle, 'pop', $rest);
+}
+
+sub perform {
+    my ($class, $verb, $handle, $entry, $rest, @args) = @_;
+    my $code = $class->make_verb($verb, $handle, $entry);
+    Carp::croak("operation '$verb' is not supported for queue mount '$entry->{key}'; use shared_push/shared_pop or shared_call")
+        unless $code;
+    return $code->($rest, @args);
+}
+
+sub _make_pushpop {
+    my ($entry, $handle, $field, $rest) = @_;
+    my $name = $entry->{$field};
+    return undef unless $name;
+    my $method = $handle->can($name);
+    if (!$method) {
+        my $msg = "$entry->{key}: handle does not support '$name'";
+        return sub { Carp::croak($msg) };
+    }
+    if (defined $rest) {
+        my @idx = @$rest;
+        # Copy, as every other bound closure does: forwarding @_ uncopied would
+        # pass the caller's own SVs to the backend.
+        return sub { my @a = @_; return $handle->$method(@idx, @a) };
+    }
+    return sub { my ($rest, @a) = @_; return $handle->$method(@$rest, @a) };
+}
+
+sub make_push { my ($class, $handle, $entry) = @_; return _make_pushpop($entry, $handle, 'push') }
+sub make_pop  { my ($class, $handle, $entry) = @_; return _make_pushpop($entry, $handle, 'pop') }
+
+sub perform_push {
+    my ($class, $handle, $entry, $rest, @args) = @_;
+    my $code = $class->make_push($handle, $entry);
+    Carp::croak("push is not supported for $entry->{key} (use shared_call)") unless $code;
+    return $code->($rest, @args);
+}
+
+sub perform_pop {
+    my ($class, $handle, $entry, $rest, @args) = @_;
+    my $code = $class->make_pop($handle, $entry);
+    Carp::croak("pop is not supported for $entry->{key} (use shared_call)") unless $code;
+    return $code->($rest, @args);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Data::Shared::Adapter::Queue - Internal adapter for queue-like mounts (Data::Shared)
+
+=head1 DESCRIPTION
+
+Internal to L<Data::Shared>; not a public API. Maps C<push>/C<pop>
+sugar to each leaf's native pair (Queue C<push/pop>, Deque
+C<push_back/pop_front>, Heap C<push/pop>, Log C<append>, PubSub
+C<publish>, RingBuffer C<write>) and serves the few generic verbs
+queue mounts honestly support.
+
+=cut
