@@ -1,0 +1,153 @@
+name: CI
+on:
+  push:
+    branches: ['*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.42', '5.40', '5.38', '5.36', '5.34', '5.32', '5.30', '5.28', '5.26', '5.24', '5.22']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+      # Backends are recommends, so every job that wants them asks explicitly.
+      # test-no-backends and test-alpine install required deps alone.
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL
+      # This row installs every leaf, so make it prove all 39 ran rather than
+      # counting skipped subtests as passes.
+      - run: make test
+        env:
+          DS_ALL_BACKENDS: 1
+
+  # The no-backend install `cpanm Data::Shared` gives by default, on the
+  # platform the rest of the matrix uses. test-alpine covers the same contract
+  # on musl, but it is a container job whose runner-injected node is a known
+  # failure mode there, and this contract is too load-bearing to be covered
+  # only by the job most likely not to start. This row exercises the default
+  # install without recommended backends.
+  test-no-backends:
+    runs-on: ubuntu-latest
+    name: no backends (default install)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n --installdeps .
+      - run: perl Makefile.PL && make test
+
+  # The same contract on musl, which this family's alignment and atomics care
+  # about. Deliberately without --with-recommends.
+  test-alpine:
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: apk add --no-cache perl perl-dev make gcc musl-dev linux-headers wget
+      - run: wget -qO- https://cpanmin.us | perl - App::cpanminus
+      - run: cpanm -n --installdeps .
+      - run: perl Makefile.PL && make test
+
+  # With the backends: this is the only non-x86_64 row, and the family's
+  # alignment and atomics behave differently here, so it has to exercise the
+  # composite runtime rather than skip it.
+  test-arm:
+    runs-on: ubuntu-24.04-arm
+    name: ARM64 / Linux
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n --with-recommends --installdeps .
+      # Asserted, because cpanm counts only `requires` toward its own success:
+      # a backend that fails to build here would otherwise leave the step green
+      # and this row would silently skip the runtime it exists to exercise.
+      - run: perl Makefile.PL && make test
+        env:
+          DS_ALL_BACKENDS: 1
+
+  test-xt:
+    runs-on: ubuntu-latest
+    name: AUTHOR_TESTING (xt/)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n Test::Kwalitee Test::Pod Test::Pod::Coverage
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL && make && make distdir
+      # Validate the files and META that ship, from the release directory.
+      - run: |
+          cd Data-Shared-*/
+          AUTHOR_TESTING=1 prove -Ilib xt/
+
+  test-threads:
+    runs-on: ubuntu-latest
+    name: ithreads / Perl 5.40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+          multi-thread: 'true'
+      # The facade has no XS: exercise backends built for the threaded Perl.
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL && make test
+        env:
+          DS_ALL_BACKENDS: 1
+      - name: roots are skipped when cloning an ithread
+        run: |
+          perl -Mblib <<'PERL'
+          use strict;
+          use warnings;
+          use threads;
+          use Test::More;
+          use File::Temp qw(tempdir);
+          use Scalar::Util qw(blessed);
+          use Data::Shared qw(shared_get shared_set);
+
+          my $dir = tempdir(CLEANUP => 1);
+          my $root = Data::Shared->new($dir);
+          $root->mount('cache', 'hashmap:ii', undef, 16);
+          shared_set($root, '/cache/1', 42);
+          my $result = threads->create(sub {
+              my $own = Data::Shared->open($dir);
+              return { class => blessed($root), value => shared_get($own, '/cache/1') };
+          })->join;
+          ok !defined($result->{class}), 'parent root is not cloned into the thread';
+          is $result->{value}, 42, 'thread can open its own root and backend';
+          is shared_get($root, '/cache/1'), 42, 'parent root still works';
+          done_testing;
+          PERL
+
+  longdouble:
+    name: long double NV / codec only
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # No prebuilt flavour carries a wide NV, so this one is compiled. The
+      # manifest codec picks a decimal width that must round trip the perl's
+      # own NV, and every defect in it so far has been representation
+      # dependent; the leaf dists are not needed to exercise it.
+      - run: |
+          curl -fsSL https://www.cpan.org/src/5.0/perl-5.40.2.tar.gz | tar xz
+          cd perl-5.40.2
+          ./Configure -des -Duselongdouble -Dprefix="$HOME/perl-ld"
+          make -j4 && make install
+      # Every module these tests need is core, so nothing is installed here.
+      - run: |
+          export PATH="$HOME/perl-ld/bin:$PATH"
+          perl -MConfig -e 'die "not a wide NV\n" unless $Config{nvsize} > 8;
+              printf "nvtype=%s nvsize=%s\n", $Config{nvtype}, $Config{nvsize}'
+          perl Makefile.PL && make && make test
