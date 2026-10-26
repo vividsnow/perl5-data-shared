@@ -2,7 +2,9 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use JSON::PP ();
 use Data::Shared qw(shared_get shared_set);
+use Data::Shared::Manifest ();
 
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
 eval { $probe->mount('p', 'hashmap:ss', undef, 8); 1 }
@@ -92,6 +94,18 @@ subtest 'a float argument does not fake a stale revision' => sub {
         ok eval { $root->mount('m', 'hashmap:ss', undef, 100); 1 },
             "$value: a later mount still works" or diag $@;
         ok eval { Data::Shared->open($dir); 1 }, "$value: the store reopens";
+    }
+};
+
+# A float is written with %.15g, so a whole number that arrived as a float --
+# 2**50 is one, the same digits typed out are not -- was replayed several short
+# of the value the store was built with.
+subtest 'a numeric mount argument survives the round trip exactly' => sub {
+    for my $value (2**50, 2**53, 1e15, 1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300) {
+        my ($stored) = Data::Shared::Manifest::snapshot($value);
+        my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
+        my $back = JSON::PP->new->decode($json)->[0];
+        cmp_ok $back, '==', $value, "$value round trips exactly";
     }
 };
 

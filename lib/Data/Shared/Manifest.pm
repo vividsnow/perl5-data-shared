@@ -63,12 +63,19 @@ sub _scalar_snapshot {
         utf8::encode($bytes);
         return $bytes;
     }
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
     # Inf and NaN are written verbatim, which is not JSON. Refuse while the
     # caller is still there to be told, rather than publishing a manifest that
     # kills the store at the next topology change.
     Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
-        if (B::svref_2object(\$value)->FLAGS & (B::SVp_IOK() | B::SVp_NOK()))
-            && $value =~ /\A-?(?:inf|nan)/i;
+        if $value =~ /\A-?(?:inf|nan)/i;
+    # A float is written with %.15g, so a whole number that arrived as one --
+    # 2**50 is a float, the same digits typed out are not -- came back short of
+    # what the store was built with. Recording it as an integer is exact.
+    return int($value)
+        if !($flags & B::SVp_IOK) && $value == int($value)
+            && $value >= -9223372036854775808.0 && $value < 9223372036854775808.0;
     return $value;
 }
 
