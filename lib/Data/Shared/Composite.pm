@@ -176,6 +176,9 @@ sub _root {
 sub _key_is_int {
     my ($self) = @_;
     my $node = $self->{node};
+    # kdtree and graph address a child per point/node id, so their keys are
+    # integers even though the parent class carries no int variant.
+    return 1 if $self->_is_index_parent;
     return 0 if $node->{resolved}{class} eq 'Data::SortedSet::Shared::Strings';
     return 1 if $node->{resolved}{entry} && ($node->{resolved}{entry}{key} || '') eq 'sortedset';
     my $variant = $node->{resolved}{variant};
@@ -195,7 +198,25 @@ sub _valid_address {
     # "7\n" each registered a separate child over one parent slot. Deleting one
     # then removed the parent's record while its twin stayed registered.
     return 0 if $self->_key_is_int && $addr !~ /\A(?:0|-?[1-9][0-9]*)\z/;
+    # Same collision one step further out: a fixed-width parent truncates the
+    # key it stores, so on an i16 parent 70000 and 4464 share one slot while
+    # the index keys both strings. Only composite parents are checked; a plain
+    # leaf mount keeps the backend's documented wrapping.
+    if (my $bits = $self->_key_int_bits) {
+        my $max = (1 << ($bits - 1)) - 1;
+        return 0 if $addr > $max || $addr < -$max - 1;
+    }
     return 1;
+}
+
+sub _key_int_bits {
+    my ($self) = @_;
+    my $resolved = $self->{node}{resolved};
+    my $probe = defined $resolved->{variant} ? $resolved->{variant}
+              : ($resolved->{class} =~ /::(\w+)\z/ ? lc $1 : '');
+    return 16 if $probe =~ /\Ai16/;
+    return 32 if $probe =~ /\Ai32/;
+    return 0;
 }
 
 sub _with_lock {

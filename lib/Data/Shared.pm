@@ -1268,7 +1268,10 @@ C<get/set/delete/exists/incr/push/pop/call/call_at/node/children/handle>
 methods; C<< $root->children($path) >> (C<shared_children>) lists
 registered child addresses. C<handle> on a child leaf path returns
 its native handle. Reads of a missing child never create one;
-writes create it lazily.
+writes create it lazily, and so does any C<call> there, since the
+method may mutate. Probe with C<shared_exists>, not a read-only
+call, or a loop over candidate addresses will register every one of
+them and exhaust the child budget.
 
 Each composite declares C<max_children> (default 10_000) and
 C<cache_size> open children (default 32, LRU close/reopen) via the

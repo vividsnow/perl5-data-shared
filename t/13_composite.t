@@ -181,6 +181,56 @@ subtest 'graph of hashmap by node id' => sub {
     is_deeply [$r->children('/net')], ["$a"], 'graph children by id';
 };
 
+subtest 'fixed-width int parents reject aliasing addresses' => sub {
+    my $r = Data::Shared->new;
+    mount_or_skip($r, 'm16', ['hashmap:i16s', 100, ['hashmap:ss', 100]]);
+    shared_set($r, "/m16/$_/name", "k$_") for -32768, 32767;
+    is shared_get($r, '/m16/32767/name'), 'k32767', 'in-range i16 address works';
+    for my $bad (70000, 40000, -32769) {
+        ok !eval { shared_set($r, "/m16/$bad/name", 'alias'); 1 }, "i16 parent rejects $bad";
+    }
+    is_deeply [$r->children('/m16')], [-32768, 32767], 'no aliased children';
+
+    $r->mount('m32', ['hashmap:i32s', 100, ['hashmap:ss', 100]]);
+    shared_set($r, '/m32/2147483647/name', 'max');
+    is shared_get($r, '/m32/2147483647/name'), 'max', 'in-range i32 address works';
+    ok !eval { shared_set($r, '/m32/2147483648/name', 'alias'); 1 }, 'i32 parent rejects 2147483648';
+
+    # A plain leaf mount keeps the backend's documented wrapping.
+    $r->mount('leaf', 'hashmap:i16s', undef, 100);
+    ok eval { shared_set($r, '/leaf/70000', 'wrapped'); 1 }, 'leaf mount still accepts a wrapping key';
+};
+
+subtest 'call at a missing child materialises it' => sub {
+    my $r = Data::Shared->new;
+    mount_or_skip($r, 'm', ['hashmap:ss', 100, ['hashmap:ss', 100]]);
+    is shared_get($r, '/m/ghost/k'), undef, 'read does not create';
+    is shared_exists($r, '/m/ghost'), 0, 'exists does not create';
+    is_deeply [$r->children('/m')], [], 'still no children';
+    is shared_call($r, '/m/ghost', 'size'), 0, 'read-only call answers';
+    is_deeply [$r->children('/m')], ['ghost'], 'the call registered the child';
+};
+
+subtest 'id-parents address by integer id' => sub {
+    my $r = Data::Shared->new;
+    mount_or_skip($r, 'net', ['graph', 100, 500, ['hashmap:ss', 100]]);
+    shared_set($r, "/net/$_/name", "n$_") for 1, 2, 3, 10, 11, 12;
+    is_deeply [$r->children('/net')], [1, 2, 3, 10, 11, 12], 'graph ids list in numeric order';
+    for my $bad ('007', "7\n", 'alice', '-0') {
+        (my $show = $bad) =~ s/\n/\\n/;
+        ok !eval { shared_set($r, "/net/$bad/name", 'phantom'); 1 }, "graph rejects id '$show'";
+    }
+    is_deeply [$r->children('/net')], [1, 2, 3, 10, 11, 12], 'no phantom children registered';
+
+    if (eval { require Data::KDTree::Shared; 1 }) {
+        my $k = Data::Shared->new;
+        mount_or_skip($k, 'pts', ['kdtree', 2, 1000, ['hashmap:ss', 100]]);
+        shared_set($k, "/pts/$_/name", "p$_") for 1, 2, 10;
+        is_deeply [$k->children('/pts')], [1, 2, 10], 'kdtree ids list in numeric order';
+        ok !eval { shared_set($k, '/pts/007/name', 'phantom'); 1 }, 'kdtree rejects id 007';
+    }
+};
+
 subtest 'nested composite: hashmap of sortedset of hashmap' => sub {
     my $r = Data::Shared->new;
     mount_or_skip($r, 'org', ['hashmap:ss', 1000, ['sortedset:strings', { max => 1000 }, ['hashmap:ss', 100]]]);
