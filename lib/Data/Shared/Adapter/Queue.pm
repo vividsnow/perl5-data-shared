@@ -13,12 +13,16 @@ our @CARP_NOT = qw(Data::Shared);
 # on a heap, and on the others it surfaced as the backend's own arity error,
 # blaming its API instead of the path. The map, set and sketch families refuse
 # the same shape.
-sub _limit {
-    my ($entry, $what, $rest, $max) = @_;
-    return unless $rest && @$rest > $max;
+# Only the message is a sub call: the comparison is inlined at each call-time
+# site, because a call on every push cost more than the rest of the check.
+# Through a node cursor the relative path comes first, so addressing the node
+# itself means passing '' -- the same convention Node::delete documents.
+sub _too_long {
+    my ($entry, $what, $max) = @_;
     Carp::croak("path too long: $entry->{key} takes "
         . ($max ? 'one path component' : "no path component for $what")
-        . "; pass the value as an argument");
+        . "; pass the value as an argument"
+        . ($max ? '' : " (through a node cursor: \$node->$what('', \$value))"));
 }
 
 sub make_verb {
@@ -27,7 +31,7 @@ sub make_verb {
     return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
     my $spec = $verbs->{$verb};
     if (ref $spec eq 'CODE') {
-        return sub { my ($rest, @a) = @_; _limit($entry, $verb, $rest, 1);
+        return sub { my ($rest, @a) = @_; _too_long($entry, $verb, 1) if @$rest > 1;
                      return $spec->($handle, @$rest, @a) };
     }
     my $method = $handle->can($spec);
@@ -35,7 +39,7 @@ sub make_verb {
         my $msg = "$entry->{key}: handle does not support '$spec'";
         return sub { Carp::croak($msg) };
     }
-    return sub { my ($rest, @a) = @_; _limit($entry, $verb, $rest, 1);
+    return sub { my ($rest, @a) = @_; _too_long($entry, $verb, 1) if @$rest > 1;
                  return $handle->$method(@$rest, @a) };
 }
 
@@ -45,7 +49,7 @@ sub make_bound {
     my $verbs = $entry->{verbs} || {};
     return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
     my $spec = $verbs->{$verb};
-    _limit($entry, $verb, $rest, 1);
+    _too_long($entry, $verb, 1) if $rest && @$rest > 1;    # bind time, once
     my @idx = @$rest;
     if (ref $spec eq 'CODE') {
         return sub { my @a = @_; return $spec->($handle, @idx, @a) };
@@ -86,12 +90,12 @@ sub _make_pushpop {
         return sub { Carp::croak($msg) };
     }
     if (defined $rest) {
-        _limit($entry, $field, $rest, 0);
+        _too_long($entry, $field, 0) if @$rest;            # bind time, once
         # Copy, as every other bound closure does: forwarding @_ uncopied would
         # pass the caller's own SVs to the backend.
         return sub { my @a = @_; return $handle->$method(@a) };
     }
-    return sub { my ($r, @a) = @_; _limit($entry, $field, $r, 0);
+    return sub { my ($r, @a) = @_; _too_long($entry, $field, 0) if @$r;
                  return $handle->$method(@a) };
 }
 

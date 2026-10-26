@@ -262,6 +262,11 @@ sub _dispatch_call {
     _check_native_call($root, $method);
     Carp::croak("shared_call path must name a mount") unless @$components;
     my ($name, $mount, $rest) = _resolve($root, $components);
+    # Retiring a mount's storage retires the mount with it: removing the files
+    # while the manifest still named them left a store that no later new,
+    # open or open_readonly would accept, in any process.
+    return $root->unmount($name, unlink => 1)
+        if !@$rest && ($method eq 'unlink' || $method eq 'destroy');
     if (my $comp = $mount->{composite}) {
         return $comp->dispatch_call($root, $rest, $method, @args);
     }
@@ -492,6 +497,12 @@ sub sharedc_call {
     _check_compiled($cp);
     Carp::croak("shared_call requires a method name") unless defined $m && length $m;
     _check_native_call($r, $m);
+    # As the string tier does: the manifest must stop naming storage that is
+    # being removed, or no process can open the store again.
+    if (($m eq 'unlink' || $m eq 'destroy') && @{ $cp->{components} }) {
+        my ($name, $mount, $rest) = _resolve($r, $cp->{components});
+        return $r->unmount($name, unlink => 1) unless @$rest;
+    }
     my $bound = _compiled_code($r, $cp, 'call', $m);
     return $bound->(@a);
 }
@@ -682,12 +693,18 @@ sub _mutate {
         local $self->{_pending_paths} = [];
         local $self->{_abs_cache} = {};
         local $self->{_changed} = 0;
+        # Separate from _changed: a transient mount changes this root's own
+        # view, so compiled bindings must be invalidated, but it is not in the
+        # manifest. Republishing it bumped the revision for nothing and told
+        # every sibling process its topology was stale -- which broke the
+        # ordinary pattern of forked workers each mounting a scratch handle.
+        local $self->{_published} = 0;
         my ($mounts, $order, $nested, $revision, $stamp) =
             ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision}, $self->{_manifest_stamp});
         my $ret;
         my $ok = eval {
             $ret = $code->();
-            if ($self->{_changed}) {
+            if ($self->{_published}) {
                 $self->{_revision}++;
                 $self->_write_manifest;
             }
@@ -701,8 +718,9 @@ sub _mutate {
             # re-croak below would stringify it.
             die $err if ref $err;
             # $err already carries "at FILE line N."; re-croaking it appended a
-            # second copy. Strip it and let Carp add the caller's location once.
-            $err =~ s/\s*\bat .+ line \d+\.?\s*\z//s;
+            # second copy. Strip the last one only -- anchored at the front, or
+            # a message containing its own " at ..." loses everything after it.
+            $err =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s;
             Carp::croak($err . (length $cleanup ? " (rollback: $cleanup)" : ''));
         }
         $self->_invalidate_compiled if $self->{_changed};
@@ -837,6 +855,7 @@ sub _install_recipe {
     push @{ $self->{order} }, $name;
     $self->{_nested} = 1 if index($name, '/') >= 0;
     $self->{_changed} = 1;
+    $self->{_published} = 1 unless $recipe->{transient};
     return $composite ? Data::Shared::Node->new($self, [split m{/}, $name]) : $handle;
 }
 
@@ -847,14 +866,32 @@ sub mount {
 }
 
 sub unmount {
-    my ($self, $name) = @_;
-    return $self->_mutate(sub {
-        return 0 unless delete $self->{mounts}{$name};
+    my ($self, $name, %opt) = @_;
+    my @unknown = sort grep { $_ ne 'unlink' } keys %opt;
+    Carp::croak("Data::Shared: unknown unmount option '$unknown[0]'") if @unknown;
+    my $gone;
+    my $ret = $self->_mutate(sub {
+        $gone = delete $self->{mounts}{$name} or return 0;
         @{ $self->{order} } = grep { $_ ne $name } @{ $self->{order} };
         $self->{_nested} = (grep { index($_, '/') >= 0 } keys %{ $self->{mounts} }) ? 1 : 0;
         $self->{_changed} = 1;
+        $self->{_published} = 1 unless $gone->{transient};
         return 1;
     });
+    return $ret unless $ret && $gone;
+    # Only once the manifest no longer names it: unlinked first, a failed
+    # publish would roll the mount back onto storage that is already gone.
+    if ($opt{unlink}) {
+        my $handle = $gone->{handle};
+        $handle->unlink if $handle && $handle->can('unlink');
+    }
+    else {
+        # Retaining it is the documented behaviour, but unlink_all could not
+        # find it afterwards, so a later mount of the same name adopted it --
+        # data and all -- in a store the caller believed it had emptied.
+        push @{ $self->{_retained} }, @{ $gone->{storage_paths} || [] };
+    }
+    return $ret;
 }
 
 sub handle {
@@ -989,6 +1026,15 @@ sub unlink_all {
             # Counting it regardless credited a manifest this call did not
             # remove.
             elsif (!$!{ENOENT}) { Carp::croak("Data::Shared: cannot unlink manifest: $!") }
+        }
+        # Storage an unmount on this root retained, by the paths that mount
+        # itself recorded: left behind, the next same-named mount in a store
+        # the caller believed it had emptied adopted it, data and all, and a
+        # program that rotates mounts grew on disk without bound.
+        if (my $retained = delete $self->{_retained}) {
+            my $failed = _cleanup_paths($retained);
+            Carp::croak("Data::Shared: $failed") if length $failed;
+            $n += @$retained;
         }
         # Ours and empty once every composite is gone. The lock file stays: a
         # process still holding it would keep an fd to a deleted file while the
@@ -1194,7 +1240,12 @@ same native handle under another name to share it intentionally.
 
 =head2 $root->unmount($name), $root->mounts, $root->mount_info($name)
 
-Lifecycle and introspection for mounts.
+Lifecycle and introspection for mounts. C<unmount> retains the mount's
+storage, so a later mount of the same name adopts it;
+C<< unmount($name, unlink => 1) >> removes it instead, once the manifest no
+longer names it. A native C<unlink> or C<destroy> reached through
+C<shared_call> at a mount does the same, because leaving the manifest naming
+storage that is gone makes the store refuse to open at all.
 Manifest changes use a directory lock and revision. A root opened before
 another writer's topology change receives a C<stale manifest revision> error
 before constructors or factories run. Reopen the root and retry with the
@@ -1227,7 +1278,8 @@ success: either everything was already sealed, or no mount can be.
 C<frozen> tells those apart, and is what a producer should assert
 before shipping the directory. A mounted native handle is sealed with
 the rest, so the caller's own object becomes read-only. C<unlink_all>
-removes the mounts and the manifest but leaves F<.manifest.lock>, which
+removes the mounts, the manifest, and any storage this root's own
+C<unmount> retained, but leaves F<.manifest.lock>, which
 another process may still be holding, so the directory is not empty
 afterwards.
 
@@ -1249,15 +1301,19 @@ remainder with C</> so route-style keys work in string paths.
 =item * Set-like (Bloom family, BitSet, RoaringBitmap, SortedSet,
 DisjointSet): one member component.
 
-Map- and set-like mounts croak on a longer path rather than using the
-first component and discarding the rest, which addressed a record the
-path did not name. RadixTree, which joins, is unaffected.
+Map-, set- and queue-like mounts croak on a longer path rather than
+using the first component and discarding the rest, which addressed a
+record the path did not name. RadixTree, which joins, is unaffected.
 
 =item * Indexed (NDArray, Fenwick, Fenwick2D, SegmentTree, Graph):
 all remaining components are indices/coordinates.
 
-=item * Queue-, sketch- and sync-like: normally no remainder; use
-C<shared_push>/C<shared_pop>/C<shared_call>.
+=item * Queue-, sketch- and sync-like: no remainder; use
+C<shared_push>/C<shared_pop>/C<shared_call>. The value is an argument,
+not a path component, so through a cursor the node itself is C<< $node->push('',
+$value) >> -- the relative path comes first, as it does for every cursor
+verb. C<ringbuffer>'s C<get> is the one exception and reads one component,
+its sequence number.
 
 =back
 

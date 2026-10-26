@@ -101,12 +101,18 @@ subtest 'a queue path takes no key component' => sub {
     }
     # ringbuffer's get is the one verb in the family that does read a
     # component, so it is the boundary the limit must not cross.
-    if (eval { $root->mount('rb', 'ringbuffer', undef, 64); 1 }) {
+    my $rb_ok = eval { $root->mount('rb', 'ringbuffer', undef, 64); 1 };
+    my $rb_why = $@;
+    if ($rb_ok) {
         shared_push($root, '/rb', 11);
         is shared_get($root, '/rb/0'), 11, 'a ringbuffer get reads its sequence number';
         is sharedc_get($root, shared_compile('/rb/0')), 11, 'and through a compiled path';
         ok !eval { shared_get($root, '/rb/0/1'); 1 }, 'but two components are refused';
         ok !eval { shared_push($root, '/rb/5', 9); 1 }, 'and a keyed push is still refused';
+    }
+    else {
+        like $rb_why, qr/is not available/, 'the ringbuffer case needs an absent backend'
+            or diag $rb_why;
     }
 
     # The compiled tier resolves its path once, so it must refuse at bind time.
@@ -114,11 +120,20 @@ subtest 'a queue path takes no key component' => sub {
         'the compiled tier refuses it too';
 
     # A composite child address is not a remainder: it is consumed by the
-    # composite before the leaf ever sees it.
+    # composite before the leaf ever sees it. This is the guard against the
+    # limit breaking the composite path, so whether it ran is asserted rather
+    # than left to a bare "if" that would hide its absence.
     my $comp = Data::Shared->new;
-    if (eval { $comp->mount('q', ['hashmap:ss', 64, ['queue:int', 8]]); 1 }) {
+    my $composite_ok = eval { $comp->mount('q', ['hashmap:ss', 64, ['queue:int', 8]]); 1 };
+    my $why = $@;
+    if ($composite_ok) {
         ok eval { shared_push($comp, '/q/a', 42); 1 }, 'a push into a composite child still works';
         is shared_pop($comp, '/q/a'), 42, 'and pops back';
+    }
+    else {
+        # Only a missing backend may skip this; any other failure is a failure.
+        like $why, qr/is not available/, 'the composite case needs an absent backend'
+            or diag $why;
     }
 };
 

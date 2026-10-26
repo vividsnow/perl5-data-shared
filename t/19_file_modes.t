@@ -1,7 +1,8 @@
 use strict;
 use warnings;
 use Test::More;
-use File::Temp qw(tempdir);
+use File::Temp qw(tempdir tempfile);
+use Fcntl ();
 use Data::Shared;
 
 # The data files are owner-only, so the directory and the lock that guards every
@@ -47,24 +48,48 @@ is Data::Shared::shared_get($reopened, '/cache/7'), 42, 'reopen still works';
 {
     my $cdir = "$parent/comp";
     my $mask = umask 0;
-    my $comp = Data::Shared->new($cdir);
-    my $ok = eval { $comp->mount('u', ['hashmap:ss', 64, ['hashmap:ss', 8]]);
+    # The root construction belongs inside the eval too, or a die there leaks
+    # umask 0 into whatever is appended after this block.
+    my $comp;
+    my $ok = eval { $comp = Data::Shared->new($cdir);
+                    $comp->mount('u', ['hashmap:ss', 64, ['hashmap:ss', 8]]);
                     Data::Shared::shared_set($comp, '/u/a/k', 1); 1 };
+    my $why = $@;
     umask $mask;
+    # Asserted, not assumed: wrapped in a bare "if" the five checks below
+    # vanished silently and the file still passed, so a mode regression at the
+    # site they guard was invisible. hashmap is this file's own skip_all probe,
+    # so a failure here is a real failure.
+    ok $ok, 'a composite mounts and writes under umask 0' or diag $why;
     if ($ok) {
         for my $path ('.children', '.children/u', '.children/u/.lock') {
             is mode_of("$cdir/$path") & 077, 0, "$path is owner-only under umask 0"
                 or diag sprintf('%s is %04o', $path, mode_of("$cdir/$path"));
         }
         # And a lock nobody can write must not make the store unopenable: a
-        # section that mutates nothing needs no write access to it.
+        # section that only reads needs no write access to it. Where perl
+        # emulates flock with fcntl, an exclusive lock on a read-only
+        # descriptor cannot work at all, so probe before asserting it.
         undef $comp;
-        chmod 0444, "$cdir/.children/u/.lock";
-        my $ro = eval { Data::Shared->open($cdir) };
-        ok $ro, 'a store with a read-only composite lock still opens' or diag $@;
-        is eval { Data::Shared::shared_get($ro, '/u/a/k') }, 1, 'and reads through it'
-            if $ro;
-        chmod 0600, "$cdir/.children/u/.lock";
+        my $ro_lock_works = do {
+            my ($probe_fh, $probe) = File::Temp::tempfile(UNLINK => 1);
+            close $probe_fh;
+            open my $rfh, '<', $probe or die "probe: $!";
+            my $ok = flock $rfh, Fcntl::LOCK_EX();
+            flock $rfh, Fcntl::LOCK_UN() if $ok;
+            $ok;
+        };
+        if ($ro_lock_works) {
+            chmod 0444, "$cdir/.children/u/.lock";
+            my $ro = eval { Data::Shared->open($cdir) };
+            ok $ro, 'a store with a read-only composite lock still opens' or diag $@;
+            is eval { Data::Shared::shared_get($ro, '/u/a/k') }, 1, 'and reads through it'
+                if $ro;
+            chmod 0600, "$cdir/.children/u/.lock";
+        }
+        else {
+            ok 1, 'skipped: this perl cannot lock a read-only descriptor';
+        }
     }
 }
 

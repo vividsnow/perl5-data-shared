@@ -190,8 +190,33 @@ sub new {
             $self->_index_put('s:', $self->_count_addresses);
             $self->_index_remove('p:');
         }
-    });
+        # Nothing on disk recorded the child chain -- only the manifest, which
+        # a remount rewrites -- so mounting over a retained directory with a
+        # different child type was accepted, the children already there became
+        # unreadable, and freeze_all then died on the first of them, leaving a
+        # store that could never ship. A leaf is spared this because it
+        # validates its own file header.
+        my $chain = _chain_signature($node);
+        my $recorded = $index->get('k:');
+        if (defined $recorded && length $recorded) {
+            Carp::croak("Data::Shared: composite '$self->{name}' storage was created for"
+                . " [$recorded], not [$chain]")
+                if $recorded ne $chain;
+        }
+        elsif (!$self->{readonly} && !$self->{_cleanup} && !$self->_index_frozen) {
+            $self->_index_put('k:', $chain);
+        }
+    }, undef, $o{opening} ? 1 : 0);   # reopening tolerates an unwritable lock; creating does not
     return $self;
+}
+
+sub _chain_signature {
+    my ($node) = @_;
+    my @levels;
+    for (my $level = $node; $level; $level = $level->{child}) {
+        push @levels, $level->{resolved}{class} . '->' . ($level->{resolved}{ctor} || 'new');
+    }
+    return join ' ', @levels;
 }
 
 sub _root {
@@ -274,19 +299,21 @@ sub _key_int_bits_for {
 }
 
 sub _with_lock {
-    my ($self, $code, $mutating) = @_;
+    my ($self, $code, $mutating, $read_only) = @_;
     return $code->() if $self->{readonly} || $self->{_locked};
     my $fh;
     if (defined $self->{dir}) {
         my $lockfile = "$self->{dir}/.lock";
         Carp::croak("Data::Shared: missing composite directory '$self->{dir}'") unless -d $self->{dir};
         # 0600 and sysopen, as the manifest lock is opened, and with its
-        # fallback: a section that mutates nothing needs no write access, and
+        # fallback: a section that only reads needs no write access, and
         # without that one unwritable 0-byte lock file made the whole store
-        # unopenable. An exclusive lock genuinely needs it.
+        # unopenable. Stated by the caller, not derived from $mutating -- that
+        # flag only drives the interrupted-mutation marker, so keying on it let
+        # freeze and destroy, the two most destructive sections, through.
         unless (sysopen $fh, $lockfile, O_RDWR | O_APPEND | O_CREAT, 0600) {
             my $err = $!;
-            unless (!$mutating && -e $lockfile && CORE::open $fh, '<', $lockfile) {
+            unless ($read_only && -e $lockfile && CORE::open $fh, '<', $lockfile) {
                 $! = $err;
                 Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!");
             }
@@ -417,7 +444,7 @@ sub _child_count {
     my ($self) = @_;
     if (!$self->{_locked} && $self->{index}->get('p:')) {
         return $self->_count_addresses if $self->{readonly};
-        return $self->_with_lock(sub { $self->{index}->get('s:') });
+        return $self->_with_lock(sub { $self->{index}->get('s:') }, undef, 1);
     }
     my $count = $self->{index}->get('s:');
     return defined $count ? $count : $self->_count_addresses;
@@ -607,7 +634,7 @@ sub _existing_child {
         my $current = $self->_reg_id($addr);
         return undef unless defined $current && $self->_reg_constructed($addr, $current);
         return $self->_open_child($root, $addr, $current, 1);
-    });
+    }, undef, 1);       # opens an existing child, writes nothing
 }
 
 sub _ensure_child {
@@ -957,7 +984,11 @@ sub destroy {
 sub _rethrow {
     my ($err, $rollback) = @_;
     die $err if ref $err;
-    $err =~ s/\s*\bat .+ line \d+\.?\s*\z//s;
+    # Anchored at the front, not a bare greedy strip: a message of its own that
+    # contains " at ..." -- the create path's names the directory as "exists at
+    # '...'" -- was cut from there on, losing the only actionable part and
+    # still reading like a complete message once Carp appended a location.
+    $err =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s;
     Carp::croak($err . (defined $rollback && length $rollback ? " (rollback: $rollback)" : ''));
 }
 

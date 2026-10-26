@@ -112,7 +112,9 @@ returns a copy.
 
 =head2 get, set, delete, exists, incr, push, pop
 
-Relative-path forms of the generic verbs.
+Relative-path forms of the generic verbs: the relative path is always
+the first argument, so addressing the node itself means passing C<''>
+(C<< $node->push('', $value) >>, C<< $node->set('', $value) >>).
 
 =head2 call($method, @args), call_at($rel, $method, @args)
 

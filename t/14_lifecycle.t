@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use File::Path ();
 use Scalar::Util qw(weaken);
 use POSIX ();
 use Data::Shared qw(shared_compile sharedc_call);
@@ -142,7 +143,9 @@ subtest 'full class names use the declared loader and constructor' => sub {
     my $kid = fork();
     if (defined $kid) {
         if ($kid == 0) {
-            my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+            # _exit skips File::Temp's cleanup, so this one is removed by hand.
+            my $tmp = tempdir();
+            my $root = Data::Shared->new($tmp);
             my $accepted = eval {
                 $root->mount('outer', sub {
                     my ($r) = @_;
@@ -151,10 +154,15 @@ subtest 'full class names use the declared loader and constructor' => sub {
                 });
                 1;
             };
+            undef $root;
+            File::Path::remove_tree($tmp);
             POSIX::_exit($accepted ? 1 : 0);     # 0 = refused, which is correct
         }
+        # A deadline, not a fixed number of polls: on a loaded box a count
+        # turns a slow child into a reported deadlock.
         my $reaped = 0;
-        for (1 .. 100) {
+        my $deadline = time + 30;
+        while (time < $deadline) {
             last if $reaped = (waitpid($kid, POSIX::WNOHANG()) == $kid);
             select undef, undef, undef, 0.1;
         }
