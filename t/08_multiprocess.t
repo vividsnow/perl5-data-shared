@@ -42,4 +42,25 @@ my $reopened = Data::Shared->open($dir2);
 is_deeply [$reopened->mounts], ['cache'], 'transient mount excluded from manifest';
 ok !exists { map { $_ => 1 } $reopened->mounts }->{temp}, 'temp not replayed';
 
+# An anonymous root shares a composite index across a fork but has no file to
+# reopen, so a child created by the other process lists and exists while every
+# deeper access must fail. It used to fail naming the internal node role.
+{
+    my $anon = Data::Shared->new;
+    if (eval { $anon->mount('users', ['hashmap:ss', undef, 100, ['hashmap:ss', undef, 100]]); 1 }) {
+        shared_set($anon, '/users/alice/name', 'from-parent');
+        my $kid = fork();
+        if (defined $kid) {
+            if ($kid == 0) { shared_set($anon, '/users/bob/name', 'from-child'); exit 0 }
+            waitpid $kid, 0;
+            is_deeply [$anon->children('/users')], ['alice', 'bob'], 'forked child is listed';
+            ok !eval { shared_get($anon, '/users/bob/name'); 1 }, 'but cannot be reopened';
+            like $@, qr{child '/users/bob' exists in the shared index but belongs to another process},
+                'the croak names the path, not the internal node role';
+            like $@, qr/file-backed root/, 'and says what to do instead';
+            is shared_get($anon, '/users/alice/name'), 'from-parent', 'own children unaffected';
+        }
+    }
+}
+
 done_testing;

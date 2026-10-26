@@ -65,6 +65,7 @@ t/25_composite_capacity.t
 t/26_anon_mounts.t
 t/27_node_api.t
 t/28_ambient.t
+t/29_freeze_ship.t
 xt/eg_runs.t
 xt/kwalitee.t
 xt/manifest.t

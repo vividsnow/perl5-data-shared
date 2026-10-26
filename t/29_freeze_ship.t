@@ -1,0 +1,96 @@
+use strict;
+use warnings;
+use Test::More;
+use File::Temp qw(tempdir);
+use Data::Shared qw(shared_get shared_set);
+
+my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
+eval { $probe->mount('p', ['hashmap:ss', 64, ['hashmap:ss', 8], { max_children => 64 }]); 1 }
+    or plan skip_all => "composite backends unavailable: $@";
+
+sub store {
+    my (%o) = @_;
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('cache', 'hashmap:ii', undef, 64);
+    $root->mount('users', ['hashmap:ss', 256, ['hashmap:ss', 8],
+                           { max_children => 256, %{ $o{opts} || {} } }]);
+    shared_set($root, "/users/u$_/k", 1) for 1 .. ($o{children} || 1);
+    return ($root, $dir);
+}
+
+# A child outside the open-child cache has to be reopened to be frozen, and a
+# frozen file refuses the writable constructor. The walk used to croak on it,
+# leaving the store sealed in part: openable in neither mode.
+subtest 'freeze_all is idempotent past the child cache' => sub {
+    my ($root) = store(children => 40);                 # default cache_size 32
+    cmp_ok $root->freeze_all, '>=', 42, 'first pass seals children, parent and index';
+    is $root->freeze_all, 0, 'second pass seals nothing and does not croak';
+    is $root->freeze_all, 0, 'and stays idempotent';
+};
+
+subtest 'a child frozen directly does not block the walk' => sub {
+    my ($root, $dir) = store(children => 1, opts => { cache_size => 1 });
+    $root->node('/users/u1')->call('freeze');
+    shared_set($root, '/users/u2/k', 1);                # evicts u1
+    cmp_ok $root->freeze_all, '>=', 1, 'freeze_all completes over the frozen child';
+    ok $root->frozen, 'and reports the store sealed';
+    undef $root;
+    my $ro = Data::Shared->open_readonly($dir);
+    is shared_get($ro, '/users/u1/k'), 1, 'shipped store reads the frozen child';
+};
+
+subtest 'frozen reports whether the store can be shipped' => sub {
+    my ($root) = store(children => 2);
+    ok !$root->frozen, 'not frozen before';
+    $root->freeze_all;
+    ok $root->frozen, 'frozen after';
+
+    my $mixed = Data::Shared->new(tempdir(CLEANUP => 1));
+    $mixed->mount('cache', 'hashmap:ii', undef, 64);
+    if (eval { $mixed->mount('jobs', 'queue:int', undef, 8); 1 }) {
+        $mixed->freeze_all;
+        ok !$mixed->frozen, 'a store with an unfreezable mount is never shippable';
+    }
+    my $empty = Data::Shared->new(tempdir(CLEANUP => 1));
+    ok !$empty->frozen, 'an empty store is not shippable';
+};
+
+# Hash order made the set of sealed mounts differ from run to run, and a store
+# sealed in part opens in neither mode.
+subtest 'freeze_all seals in mount order' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount("m$_", 'hashmap:ii', undef, 16) for 1 .. 6;
+    shared_set($root, "/m$_/1", 1) for 1 .. 6;
+    my $target = $root->{mounts}{m4}{handle};
+    no warnings 'redefine';
+    my $orig = \&Data::HashMap::Shared::II::freeze;
+    local *Data::HashMap::Shared::II::freeze = sub {
+        die "injected failure\n" if $_[0] == $target;
+        $orig->(@_);
+    };
+    ok !eval { $root->freeze_all; 1 }, 'a failing mount aborts the pass';
+    my @state = map { $root->{mounts}{"m$_"}{handle}->frozen ? 1 : 0 } 1 .. 6;
+    is_deeply \@state, [1, 1, 1, 0, 0, 0], 'everything before it is sealed, nothing after';
+};
+
+# sync_all is documented as applying to every mount; for a composite that is
+# the whole subtree, not just the children that happen to be open.
+subtest 'sync covers every registered child' => sub {
+    my $calls = 0;
+    my $orig = \&Data::HashMap::Shared::SS::sync;
+    no warnings 'redefine';
+    local *Data::HashMap::Shared::SS::sync = sub { $calls++; $orig->(@_) };
+
+    my ($root) = store(children => 40);                 # default cache_size 32
+    my $stats = $root->stats->{users};
+    is $stats->{children}, 40, '40 children registered';
+    cmp_ok $stats->{open}, '<', 40, 'and fewer than that open';
+    $calls = 0;
+    my $n = $root->node('/users')->call('sync');
+    is $n, 42, 'sync reports children plus parent and index';
+    is $calls, 42, 'and really flushed that many';
+};
+
+done_testing;

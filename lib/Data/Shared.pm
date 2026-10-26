@@ -182,7 +182,7 @@ sub _construct_with {
     my ($dir, $readonly, $resolved, $name, $args, $mode) = @_;
     my $tmp = bless { dir => $dir, mounts => {}, readonly => $readonly ? 1 : 0,
         _opening => $mode->{opening}, strict_readonly => $mode->{strict_readonly},
-        _cleanup => $mode->{cleanup},
+        _cleanup => $mode->{cleanup}, _frozen_ok => $mode->{frozen_ok},
         _pending_paths => $mode->{pending_paths} }, __PACKAGE__;
     return $tmp->_construct($resolved, $name, @$args);
 }
@@ -544,16 +544,31 @@ sub _check_storage_paths {
     require Cwd;
     require File::Spec;
     for my $path (grep { defined $_ } @paths) {
-        my $abs = Cwd::abs_path($path) // File::Spec->rel2abs($path);
+        my $abs = $self->_abs_path($path);
         for my $mount (values %{ $self->{mounts} }) {
             for my $used (@{ $mount->{storage_paths} || [] }) {
-                my $used_abs = Cwd::abs_path($used) // File::Spec->rel2abs($used);
+                my $used_abs = $self->_abs_path($used);
                 Carp::croak("Data::Shared: backing path '$path' for mount '$name' is already used by mount '$mount->{name}'")
                     if $abs eq $used_abs || ($mount->{composite} && index($abs, "$used_abs/") == 0);
             }
         }
     }
     return;
+}
+
+# abs_path lstats every component, and the collision check walks every
+# installed path for every new one, so mount and open were quadratic in
+# syscalls. Only a resolved path is cached: one not created yet would cache
+# its unresolved form and stop a later symlink collision being seen.
+sub _abs_path {
+    my ($self, $path) = @_;
+    my $hit = $self->{_abs_cache}{$path};
+    return $hit if defined $hit;
+    require Cwd;
+    require File::Spec;
+    my $abs = Cwd::abs_path($path);
+    return $self->{_abs_cache}{$path} = $abs if defined $abs;
+    return File::Spec->rel2abs($path);
 }
 
 sub _track_paths {
@@ -877,18 +892,32 @@ sub freeze_all {
     return Data::Shared::Manifest::with_lock($self, 0, sub {
         $self->_assert_revision;
         my $n = 0;
-        for my $m (values %{ $self->{mounts} }) {
-            my $h = $m->{handle};
+        # Insertion order, not hash order: a croak part-way through leaves the
+        # store frozen in part, which opens in neither mode, and hash order
+        # made which mounts were sealed differ from run to run.
+        for my $name (@{ $self->{order} }) {
+            my $h = $self->{mounts}{$name}{handle};
             next unless $h->can('freeze');
             # Already frozen is the goal state, not an error: without this a
             # second freeze_all, or one after any leaf was frozen directly,
             # croaked from the backend and could never succeed again.
             next if $h->can('frozen') && $h->frozen;
-            $h->freeze;
-            $n++;
+            # A composite seals its parent, its index and every child, and
+            # reports how many; counting the mount instead under-reported it.
+            if ($h->isa('Data::Shared::Composite')) { $n += $h->freeze }
+            else { $h->freeze; $n++ }
         }
         return $n;
     });
+}
+
+sub frozen {
+    my ($self) = @_;
+    for my $name (@{ $self->{order} }) {
+        my $h = $self->{mounts}{$name}{handle};
+        return 0 unless $h->can('freeze') && $h->can('frozen') && $h->frozen;
+    }
+    return @{ $self->{order} } ? 1 : 0;
 }
 
 sub unlink_all {
@@ -1118,11 +1147,17 @@ file formats and generated filenames are preserved. Concurrent writers must
 all use the revised protocol. Mount topology is simplest to manage from one
 coordinator.
 
-=head2 $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats
+=head2 $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats, $root->frozen
 
-Proxies applied to every mount whose handle supports the method.
-C<stats> returns a hashref of per-mount stats (or class name where a
-leaf has no C<stats>).
+Proxies applied to every mount whose handle supports the method, in
+mount order. C<stats> returns a hashref of per-mount stats (or class
+name where a leaf has no C<stats>). A composite mount counts as its
+whole subtree: parent, child index and every registered child, open or
+not. C<freeze_all> returns the number of handles it sealed, so 0 means
+everything was already sealed -- test it with C<defined>, not truth.
+C<frozen> reports whether every mount is sealed, which is what a
+producer needs before shipping the directory. A mounted native handle
+is sealed with the rest, so the caller's own object becomes read-only.
 
 =head1 PATH FORMAT
 
@@ -1297,8 +1332,9 @@ leaf operations use the backend's own locking. An operation already in
 progress during deletion may complete against the old instance; an explicit
 native handle continues to refer to that instance after recreation.
 
-The shared child counter is rebuilt when opening a writable composite and
-when a lifecycle lock encounters an unfinished mutation marker. Process
+The shared child counter is maintained under the lifecycle lock, and is
+rebuilt only when an unfinished mutation marker is found: on opening a
+writable composite, or when a lifecycle lock encounters one. Process
 termination releases file locks; unpublished directories may remain and
 are retained for explicit recovery. A preexisting unpublished directory for
 a reserved child is reported as an error. This provides exception rollback
@@ -1341,6 +1377,8 @@ more doubles as the count doubles. On one idle host the average was about
 1.3 ms per mount at 25 mounts and 7.6 ms at 200, i.e. 1.5 s to create 200,
 with the 200th alone costing about 15 ms. Keys are not affected: writing
 10_000 keys into one flat mount took 32 ms and never touches the manifest.
+Opening such a root is superlinear too, and paid by every process that opens
+it: about 0.13 s to replay 400 mounts on the same host.
 A namespace with hundreds of B<mounts> belongs in a composite mount
 (L</DEEP PATHS (COMPOSITES)>) instead, where children are registered in the
 parent and the root manifest stays a single record.

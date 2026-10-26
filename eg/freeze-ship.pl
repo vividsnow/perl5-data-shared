@@ -8,14 +8,17 @@ use Data::Shared qw(shared_get shared_set shared_exists);
 
 my $dir = @ARGV ? $ARGV[0] : tempdir(CLEANUP => 1);
 print "dir: $dir\n";
-{
-    my $root = Data::Shared->new($dir);
-    $root->mount('seen', 'bloomfilter', undef, 10_000, 0.01) unless grep { $_ eq 'seen' } $root->mounts;
-    $root->mount('cache', 'hashmap:ii', undef, 1000) unless grep { $_ eq 'cache' } $root->mounts;
+# A frozen store cannot be opened writable, so a re-run skips the producer.
+if (my $root = eval { Data::Shared->new($dir) }) {
+    my %have = map { $_ => 1 } $root->mounts;
+    $root->mount('seen', 'bloomfilter', undef, 10_000, 0.01) unless $have{seen};
+    $root->mount('cache', 'hashmap:ii', undef, 1000) unless $have{cache};
     shared_set($root, '/seen/event-42', 1);
     shared_set($root, '/cache/42', 100);
     $root->freeze_all;
     print "producer: frozen and shipped\n";
+} else {
+    print "producer: already frozen, skipping\n";
 }
 {
     my $ro = Data::Shared->open_readonly($dir);

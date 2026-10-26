@@ -139,7 +139,7 @@ sub new {
     my $node = $o{node} or Carp::croak('Composite requires a node');
     my $self = bless { node => $node, dir => $o{dir}, path => [ @{ $o{path} || [] } ],
         name => $o{name}, readonly => $o{readonly} ? 1 : 0,
-        _cleanup => $o{cleanup} ? 1 : 0,
+        _cleanup => $o{cleanup} ? 1 : 0, _frozen_ok => $o{frozen_ok} ? 1 : 0,
         strict_readonly => $o{strict_readonly} ? 1 : 0,
         cache => {}, lru_prev => {}, lru_next => {}, gen => 0 }, $class;
     $self->{root_weak} = $o{root};
@@ -151,7 +151,8 @@ sub new {
     }
     $self->_with_lock(sub {
         my %mode = (opening => $o{opening}, strict_readonly => $self->{strict_readonly},
-            pending_paths => $o{pending_paths}, cleanup => $self->{_cleanup});
+            pending_paths => $o{pending_paths}, cleanup => $self->{_cleanup},
+            frozen_ok => $self->{_frozen_ok});
         my ($parent) = construct_node($self->{dir}, $self->{readonly}, $node->{resolved}, 'parent', $node->{args}, \%mode);
         $self->{parent_handle} = $parent;
         $self->{parent_record} = { handle => $parent, entry => $node->{resolved}{entry}, dt => {} };
@@ -159,8 +160,16 @@ sub new {
             _index_spec(), 'index', _index_args($node), \%mode);
         $self->{index} = $index;
         Carp::croak('Data::Shared: composite instance was deleted') if $index->get('x:') && !$self->{_cleanup};
-        $self->_index_put('s:', $self->_count_addresses) unless $self->{readonly} || $self->{_cleanup};
-        $self->_index_remove('p:') unless $self->{readonly} || $self->{_cleanup};
+        # Only after an interrupted mutation: 's:' is maintained inside every
+        # mutating lock section and 'p:' marks one that did not finish, so an
+        # unmarked counter is already correct. Recounting unconditionally made
+        # a cold open O(children) -- and every cache miss on a nested composite
+        # is a cold open -- while writing to the index on a pure read path.
+        if (!$self->{readonly} && !$self->{_cleanup}
+            && ($index->get('p:') || !defined $index->get('s:'))) {
+            $self->_index_put('s:', $self->_count_addresses);
+            $self->_index_remove('p:');
+        }
     });
     return $self;
 }
@@ -481,6 +490,13 @@ sub _open_child {
     }
     my $node = $self->{node}{child};
     my $dir = defined $self->{dir} ? "$self->{dir}/child-$id" : undef;
+    # An anonymous root shares the index across a fork but has no file to
+    # reopen, so the child is listed and exists while every deeper access
+    # failed naming the internal node role ('child') and no cause.
+    Carp::croak("Data::Shared: child '" . join('/', '', @{ $self->{path} }, $addr)
+        . "' exists in the shared index but belongs to another process; an anonymous"
+        . " root has no backing file to reopen it (mount a file-backed root)")
+        if $opening && !defined $dir;
     if (defined $dir) {
         Carp::croak("Data::Shared: missing composite child directory '$dir'") if $opening && !-d $dir;
         Carp::croak("Data::Shared: unpublished child storage exists at '$dir'; inspect it before retrying") if !$opening && -e $dir;
@@ -490,7 +506,8 @@ sub _open_child {
             File::Path::make_path($dir);
         }
     }
-    my %mode = (opening => $opening, strict_readonly => $self->{strict_readonly}, pending_paths => $pending, cleanup => $cleanup);
+    my %mode = (opening => $opening, strict_readonly => $self->{strict_readonly},
+        pending_paths => $pending, cleanup => $cleanup, frozen_ok => $self->{_frozen_ok});
     my $rt;
     if ($node->{child}) {
         my $comp = Data::Shared::Composite->new(root => $root, name => $addr, node => $node, dir => $dir,
@@ -502,7 +519,7 @@ sub _open_child {
             || { key => $node->{resolved}{class}, dist => 'unknown', path_class => 'map', verbs => {} }, dt => {} };
         $rt = { kind => 'leaf', record => $record, handle => $handle, id => $id, addr => $addr };
     }
-    return $rt if $cleanup;
+    return $rt if $cleanup || $self->{_frozen_ok};
     $self->{cache}{$id} = $rt;
     $self->_touch($id);
     $self->_evict;
@@ -688,6 +705,12 @@ sub dispatch_call {
         # root could not be reopened at all.
         return $self->$method(@args)
             if $LIFECYCLE_METHOD{$method} && $self->can($method);
+        # Not routed, so it would fall through and seal the parent leaf alone:
+        # a composite that still accepts writes to children it already has and
+        # answers anything else with a raw backend croak.
+        Carp::croak("Data::Shared: cannot freeze composite mount '$self->{name}' through call();"
+            . " sealing the subtree would seal its child index too. Use \$root->freeze_all")
+            if $method eq 'freeze';
         if ($self->{parent_handle} && $self->{parent_handle}->can($method)) {
             return $self->{parent_handle}->$method(@args);
         }
@@ -774,8 +797,11 @@ sub delete_subtree {
                 $self->_index_put('c:' . $addr, $marker) if defined $marker;
                 $self->_index_put('a:' . $addr, $id) if defined $id;
                 $self->_index_put('s:', $count);
+                # Only if the unregister actually removed it. Restoring a record
+                # that was never touched is the step that fails on a frozen
+                # parent, so a consistent delete reported a rollback failure.
                 Data::Shared::_dispatch_record('set', $self->{parent_record}, [$addr], $score)
-                    if $was_parent && !$self->_is_index_parent;
+                    if $was_parent && !$self->_is_index_parent && !$self->_parent_exists($addr);
                 1;
             };
             die $err . ($clean ? '' : " (rollback: $@)");
@@ -799,6 +825,10 @@ sub delete_subtree {
 sub destroy {
     my ($self) = @_;
     Carp::croak('Data::Shared: composite is read-only, cannot destroy') if $self->{readonly};
+    # Already gone is the goal state, as it is for a leaf: unlink_all after a
+    # native unlink at the mount croaked on the missing directory and left the
+    # manifest behind, so the root could not be reopened either.
+    return 0 if defined $self->{dir} && !-d $self->{dir};
     return $self->_with_lock(sub {
         my $frozen = $self->{index}->can('frozen') && $self->{index}->frozen;
         if (!$frozen) {
@@ -844,13 +874,32 @@ sub destroy {
 sub sync {
     my ($self) = @_;
     my $n = 0;
-    $n++ if $self->{parent_handle} && $self->{parent_handle}->can('sync') && $self->{parent_handle}->sync;
-    $n++ if $self->{index} && $self->{index}->can('sync') && $self->{index}->sync;
-    for my $rt (values %{ $self->{cache} }) {
+    # Every registered child, as freeze and destroy do, not just the open
+    # ones: a child evicted from the cache was silently never flushed, so
+    # sync_all did not mean what it says for a composite with more children
+    # than its cache. A frozen child has nothing dirty but must stay
+    # reachable, hence the tolerant open.
+    local $self->{_frozen_ok} = 1;
+    my $root = $self->{root_weak};
+    for my $addr ($self->children_at(undef, [])) {
+        my $rt = $self->_existing_child($root, $addr) or next;
         if ($rt->{kind} eq 'composite') { $n += $rt->{comp}->sync }
         elsif ($rt->{handle}->can('sync')) { $rt->{handle}->sync; $n++ }
     }
+    # Counted unconditionally: the backends' sync returns nothing, so gating
+    # on its value never counted the parent or the index at all.
+    for my $h ($self->{parent_handle}, $self->{index}) {
+        next unless $h && $h->can('sync');
+        $h->sync;
+        $n++;
+    }
     return $n;
+}
+
+# The index is frozen last, so a frozen index means the subtree is sealed.
+sub frozen {
+    my ($self) = @_;
+    return $self->{index} && $self->{index}->can('frozen') && $self->{index}->frozen ? 1 : 0;
 }
 
 sub freeze {
@@ -859,6 +908,11 @@ sub freeze {
     return $self->_with_lock(sub {
         my $root = $self->{root_weak};
         my $n = 0;
+        # A child frozen earlier (directly, or by an interrupted freeze) cannot
+        # be reopened writable, and an evicted one has to be reopened to be
+        # frozen. Without this the walk croaked on it and the store could end
+        # up frozen in part: readable neither writably nor read-only.
+        local $self->{_frozen_ok} = 1;
         for my $addr ($self->children_at(undef, [])) {
             my $rt = $self->_existing_child($root, $addr) or next;
             if ($rt->{kind} eq 'composite') { $n += $rt->{comp}->freeze }
@@ -912,10 +966,11 @@ section of L<Data::Shared>.
 
 Lifecycle mutations are serialized through allocation, construction,
 publication, and deletion. Exception rollback preserves existing scores and
-reservations. Shared counts and cache-order updates take constant time;
-opening a writable registry reconstructs its count once. Legacy readiness
-flags remain readable. Interrupted mutation markers trigger a count rebuild
-under the next writable lock. Unpublished files require explicit recovery;
+reservations. Shared counts and cache-order updates take constant time.
+Legacy readiness flags remain readable. An interrupted mutation leaves a
+marker, and the count is rebuilt from it on the next writable open or lock.
+Freezing and flushing walk every registered child, reopening an evicted one
+read-only where it is already sealed. Unpublished files require explicit recovery;
 the module does not implement a power-loss transaction journal.
 
 =cut

@@ -39,4 +39,36 @@ for my $len (126, 200, 254) {
     is $root->mount_info('t')->{composite}, 1, 'and it really is composite';
 }
 
+# Opening a composite must not recount its children: the counter is maintained
+# under the lock, so a recount per open made every cold access O(children) and
+# wrote to the index on a read path. The 'p:' marker is what calls for a recount.
+{
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $root = Data::Shared->new($dir);
+        $root->mount('u', ['hashmap:ss', 64, ['hashmap:ss', 8], { max_children => 64 }]);
+        shared_set($root, "/u/c$_/k", 1) for 1 .. 5;
+    }
+
+    my $counted = 0;
+    my $orig = \&Data::Shared::Composite::_count_addresses;
+    no warnings 'redefine';
+    local *Data::Shared::Composite::_count_addresses = sub { $counted++; $orig->(@_) };
+
+    my $root = Data::Shared->open($dir);
+    is $counted, 0, 'opening a settled composite does not recount';
+    is scalar(() = $root->children('/u')), 5, 'and the counter it kept is right';
+
+    my $index = $root->{mounts}{u}{composite}{index};
+    $index->put('s:', 99);
+    $index->put('p:', 1);
+    undef $root;
+
+    $counted = 0;
+    my $after = Data::Shared->open($dir);
+    is $counted, 1, 'an unfinished mutation marker does trigger the recount';
+    is scalar(() = $after->children('/u')), 5, 'and the bogus counter is repaired';
+    is $index->get('p:'), undef, 'the marker is cleared';
+}
+
 done_testing;

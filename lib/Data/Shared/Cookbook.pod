@@ -217,8 +217,15 @@ See the DEEP PATHS section of L<Data::Shared>.
 =head1 FREEZE AND SHIP
 
     $root->freeze_all;                               # where leaves support it
+    $root->frozen or die "not shippable";            # every mount sealed?
     my $ro = Data::Shared->open_readonly('/tmp/app.shared');
     shared_get($ro, '/cache/42');                    # lock-free reads
     # shared_set($ro, ...) croaks: root is read-only
+
+Shipping the directory read-only needs every mount to be freezable: a
+queue or sync mount cannot be, so a write-protected copy fails to open
+at all. C<< open_readonly($dir, strict => 1) >> rejects such a store up
+front, which a plain C<open_readonly> of a composite may not do until
+the first read deep enough to open the offending leaf.
 
 =cut

@@ -310,13 +310,25 @@ subtest 'nested deletion retires the shared instance before cleanup' => sub {
     $root->set('/users/a/b/key', 'saved');
     my $old = $root->{mounts}{users}{composite}{cache}{0}{comp};
     my $old_index = $old->{index};
-    $root->node('/users/a')->call('freeze');
     $root->set('/users/c/d/key', 'other');
     $root->delete('/users/a');
     is $old_index->get('x:'), 1, 'old mappings see retirement after cache eviction';
     ok !-d $root->dir . '/.children/users/child-0', 'old directory removed';
     $root->set('/users/a/b/key', 'new');
     is $root->get('/users/a/b/key'), 'new', 'fresh nested instance remains usable';
+};
+
+subtest 'freeze through call at a composite is refused, not half-applied' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    maps($root);
+    $root->set('/users/a/key', 'saved');
+    ok !eval { $root->node('/users')->call('freeze'); 1 }, 'call(freeze) at a composite croaks';
+    like $@, qr/cannot freeze composite mount 'users' through call\(\)/, 'and says why';
+    like $@, qr/freeze_all/, 'and points at the tool that does it';
+    # The point of refusing: the subtree must not be left half-sealed.
+    ok eval { $root->set('/users/b/key', 'new'); 1 }, 'a new child still works';
+    ok eval { $root->delete('/users/a'); 1 }, 'and delete still works';
+    is $root->freeze_all >= 1, 1, 'freeze_all is the way to seal it';
 };
 
 subtest 'frozen composite storage can be unlinked by its producer' => sub {

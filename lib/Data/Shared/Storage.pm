@@ -129,7 +129,9 @@ sub construct {
         $handle = $class->new_readonly($plan->{file});
     } else {
         my ($args) = Data::Shared::Manifest::snapshot($plan->{args});
-        if ($root->{_cleanup} && $class->can('new_readonly')) {
+        # frozen_ok: the freeze walk must reach children that are already
+        # frozen, and a frozen file refuses the writable constructor.
+        if (($root->{_cleanup} || $root->{_frozen_ok}) && $class->can('new_readonly')) {
             $handle = eval { $class->$ctor(@$args) };
             my $error = $@;
             if (!$handle) {

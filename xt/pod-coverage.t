@@ -15,7 +15,7 @@ pod_coverage_ok('Data::Shared::Node',
     'Node verbs documented as a group');
 pod_coverage_ok('Data::Shared::Composite',
     { also_private => [qr/^(?:parse_node|construct_node)$/],
-      trustme => [qr/^(?:new|dispatch_verb|dispatch_pushpop|dispatch_call|children_at|handle_at|delete_subtree|destroy|sync|freeze|unlink|stats)$/] },
+      trustme => [qr/^(?:new|dispatch_verb|dispatch_pushpop|dispatch_call|children_at|handle_at|delete_subtree|destroy|sync|freeze|frozen|unlink|stats)$/] },
     'Composite internal');
 for my $a (qw(Map Set Queue Indexed Sketch Sync)) {
     pod_coverage_ok("Data::Shared::Adapter::$a",
