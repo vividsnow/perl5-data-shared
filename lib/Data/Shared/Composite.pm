@@ -102,13 +102,21 @@ sub construct_node {
 
 sub _preflight {
     my ($root, $node, $dir, $opening) = @_;
-    # Every level, as a flat mount does. The child class used to be required
-    # only at the first deep write, so a composite whose child backend was
-    # absent, or below its minimum version, mounted and published and reopened
-    # without complaint and then failed in every process that wrote to it.
+    # Creating the mount checks every level, as a flat mount does: the child
+    # class used to be required only at the first deep write, so a composite
+    # whose child backend was absent, or below its minimum version, mounted and
+    # published without complaint and then failed in every process that wrote
+    # to it. A reopen checks only this level, because demanding the rest would
+    # refuse to open a store -- or to unlink it, or to read any other part of
+    # it read-only -- over a child nothing has touched.
     for (my $current = $node; $current; $current = $current->{child}) {
         Data::Shared::Storage::_load($current->{resolved});
-        Data::Shared::Storage::check_readonly($current->{resolved}) if $root->{strict_readonly};
+        last if $opening;
+    }
+    if ($root->{strict_readonly}) {
+        for (my $current = $node; $current; $current = $current->{child}) {
+            Data::Shared::Storage::check_readonly($current->{resolved});
+        }
     }
     return unless $opening;
     Carp::croak("Data::Shared: missing composite directory '" . ($dir // '') . "'") unless defined $dir && -d $dir;

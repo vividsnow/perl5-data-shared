@@ -45,6 +45,8 @@ sub snapshot {
 my $ENCODER;
 sub _encoder { return $ENCODER ||= JSON::PP->new->allow_nonref(1) }
 
+my $INFINITY = 9**9**9;
+
 # The manifest is a codec, and JSON is total over neither of these. Both the
 # backend constructor and the manifest see what this returns, so a path
 # recorded here is the one the file was created under.
@@ -71,6 +73,16 @@ sub _scalar_snapshot {
     # encode. A perfecthash build passes its whole key list through here.
     my $flags = B::svref_2object(\$value)->FLAGS;
     return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
+    # Inf and NaN by value, not by how the encoder spells them: JSON::PP has
+    # two code paths and the one selected by PERL_JSON_PP_USE_B quotes a real
+    # Inf that has been stringified, which let it through. A float that has
+    # never been an integer is the only shape either can be; a string numified
+    # once carries the integer flag too, so it stays a string.
+    if (($flags & (B::SVp_NOK() | B::SVp_IOK())) == B::SVp_NOK()) {
+        my $number = 0 + $value;
+        Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
+            if $number != $number || $number == $INFINITY || $number == -$INFINITY;
+    }
     # Which of the two it writes depends on flag history the caller cannot see,
     # so ask the encoder rather than the flags: a string used once in numeric
     # context carries numeric flags and is still quoted.

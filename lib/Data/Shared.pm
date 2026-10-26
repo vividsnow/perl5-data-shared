@@ -99,9 +99,16 @@ sub _check_components {
         Carp::croak("path component must be a defined string") unless $stringify;
         my $string = $stringify->($c, undef, '');
         # A handler handing back another stringifiable object is an ordinary
-        # wrapper, and interpolation resolved that before this check existed. A
-        # plain reference is the unstable address the check is here to refuse.
-        $string = "$string" if ref $string && overload::Method($string, '""');
+        # wrapper, resolved here by hand and to a bounded depth. Interpolating
+        # it instead hands the chain to perl, whose fallbacks are the address
+        # for a handler that returns its own object and the empty string for
+        # one that returns undef -- the two unstable addresses this check
+        # exists to refuse -- and whose recursion dies on a cycle.
+        for (my $depth = 0; ref $string; $depth++) {
+            my $inner = overload::Method($string, '""') or last;
+            Carp::croak("path component must be a defined string") if $depth >= 16;
+            $string = $inner->($string, undef, '');
+        }
         Carp::croak("path component must be a defined string")
             if !defined $string || ref $string;
         $c = $string;

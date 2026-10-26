@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use POSIX ();
 use Data::Shared qw(shared_get shared_set shared_exists shared_delete shared_incr
                     shareda_get shareda_set shared_compile);
 
@@ -144,6 +145,30 @@ subtest 'an object that stringifies is a usable component' => sub {
     is "$wrapper", 'alice', 'the wrapper interpolates to a plain string';
     ok eval { shareda_set($root, ['hs', $wrapper], 'w'); 1 }, 'and is accepted as a component';
     is shared_get($root, '/hs/alice'), 'w', 'addressing what it resolves to';
+
+    # Resolving that chain by interpolation instead falls back to the address
+    # for a handler returning its own object and to the empty string for one
+    # returning undef -- the unstable addresses this check exists to refuse.
+    for my $class (qw(SelfRef WrapUndef WrapRef)) {
+        my $obj = bless {}, "Data::Shared::Test::$class";
+        ok !eval { shareda_set($root, ['hs', $obj], 'x'); 1 }, "$class is refused";
+    }
+    is shareda_get($root, ['hs', '']), undef, 'nothing reached the empty-string key';
+
+    # A cycle makes perl recurse until it dies, so a regression here would
+    # take the test file down with it: run it where that cannot happen.
+    my $pid = fork;
+    if (defined $pid) {
+        if ($pid == 0) {
+            my $ok = eval {
+                shareda_set($root, ['hs', bless {}, 'Data::Shared::Test::CycleA'], 'x');
+                1;
+            };
+            POSIX::_exit($ok ? 1 : 0);          # 0 = refused, which is what we want
+        }
+        waitpid $pid, 0;
+        is $?, 0, 'a stringification cycle is refused, not followed';
+    }
 };
 
 # The leaf's own guard croaks from inside the lifecycle section, which leaves
@@ -168,3 +193,24 @@ use overload q("") => sub { 'alice' }, fallback => 1;
 
 package Data::Shared::Test::Wrapper;
 use overload q("") => sub { bless {}, 'Data::Shared::Test::Stringy' }, fallback => 1;
+
+package Data::Shared::Test::SelfRef;
+use overload q("") => sub { $_[0] }, fallback => 1;
+
+package Data::Shared::Test::UndefStr;
+use overload q("") => sub { undef }, fallback => 1;
+
+package Data::Shared::Test::WrapUndef;
+use overload q("") => sub { bless {}, 'Data::Shared::Test::UndefStr' }, fallback => 1;
+
+package Data::Shared::Test::PlainRef;
+use overload q("") => sub { {} }, fallback => 1;
+
+package Data::Shared::Test::WrapRef;
+use overload q("") => sub { bless {}, 'Data::Shared::Test::PlainRef' }, fallback => 1;
+
+package Data::Shared::Test::CycleA;
+use overload q("") => sub { bless {}, 'Data::Shared::Test::CycleB' }, fallback => 1;
+
+package Data::Shared::Test::CycleB;
+use overload q("") => sub { bless {}, 'Data::Shared::Test::CycleA' }, fallback => 1;
