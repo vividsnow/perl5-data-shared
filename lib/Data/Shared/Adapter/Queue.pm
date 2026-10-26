@@ -7,20 +7,36 @@ our $VERSION = '0.01';
 
 our @CARP_NOT = qw(Data::Shared);
 
+# Nothing in this family keys its push or pop, and only ringbuffer's get reads
+# a component, so a longer path is the caller's mistake and not an argument.
+# Forwarded as leading arguments, a push to '/jobs/5' inserted with priority 5
+# on a heap, and on the others it surfaced as the backend's own arity error,
+# blaming its API instead of the path. The map, set and sketch families refuse
+# the same shape.
+sub _limit {
+    my ($entry, $what, $rest, $max) = @_;
+    return unless $rest && @$rest > $max;
+    Carp::croak("path too long: $entry->{key} takes "
+        . ($max ? 'one path component' : "no path component for $what")
+        . "; pass the value as an argument");
+}
+
 sub make_verb {
     my ($class, $verb, $handle, $entry) = @_;
     my $verbs = $entry->{verbs} || {};
     return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
     my $spec = $verbs->{$verb};
     if (ref $spec eq 'CODE') {
-        return sub { my ($rest, @a) = @_; return $spec->($handle, @$rest, @a) };
+        return sub { my ($rest, @a) = @_; _limit($entry, $verb, $rest, 1);
+                     return $spec->($handle, @$rest, @a) };
     }
     my $method = $handle->can($spec);
     if (!$method) {
         my $msg = "$entry->{key}: handle does not support '$spec'";
         return sub { Carp::croak($msg) };
     }
-    return sub { my ($rest, @a) = @_; return $handle->$method(@$rest, @a) };
+    return sub { my ($rest, @a) = @_; _limit($entry, $verb, $rest, 1);
+                 return $handle->$method(@$rest, @a) };
 }
 
 
@@ -29,6 +45,7 @@ sub make_bound {
     my $verbs = $entry->{verbs} || {};
     return undef unless exists $verbs->{$verb} && defined $verbs->{$verb};
     my $spec = $verbs->{$verb};
+    _limit($entry, $verb, $rest, 1);
     my @idx = @$rest;
     if (ref $spec eq 'CODE') {
         return sub { my @a = @_; return $spec->($handle, @idx, @a) };
@@ -69,12 +86,13 @@ sub _make_pushpop {
         return sub { Carp::croak($msg) };
     }
     if (defined $rest) {
-        my @idx = @$rest;
+        _limit($entry, $field, $rest, 0);
         # Copy, as every other bound closure does: forwarding @_ uncopied would
         # pass the caller's own SVs to the backend.
-        return sub { my @a = @_; return $handle->$method(@idx, @a) };
+        return sub { my @a = @_; return $handle->$method(@a) };
     }
-    return sub { my ($rest, @a) = @_; return $handle->$method(@$rest, @a) };
+    return sub { my ($r, @a) = @_; _limit($entry, $field, $r, 0);
+                 return $handle->$method(@a) };
 }
 
 sub make_push { my ($class, $handle, $entry) = @_; return _make_pushpop($entry, $handle, 'push') }

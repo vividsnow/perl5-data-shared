@@ -860,11 +860,10 @@ sub unmount {
 sub handle {
     my ($self, $path) = @_;
     _check_root($self);
-    return $self if !defined $path || $path eq '' || $path eq '/';
-    my @components;
-    if (ref $path eq 'ARRAY') { @components = @{ _check_components([ @$path ]) } }
-    elsif (blessed($path) && $path->isa('Data::Shared::Compiled')) { @components = @{ $path->{components} } }
-    else { @components = @{ _parse_string_path($path) } }
+    return $self if !defined $path || (!ref $path && ($path eq '' || $path eq '/'));
+    # Through the one path parser, so a Node is a path here as it already is
+    # for node() and children(); this was the only entry point that refused it.
+    my @components = @{ $self->_path_components($path) };
     return $self unless @components;
     if (!ref $path && $self->{mounts}{$path} && !$self->{mounts}{$path}{composite}) {
         return $self->{mounts}{$path}{handle};

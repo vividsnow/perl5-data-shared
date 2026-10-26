@@ -3,6 +3,7 @@ use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
 use Scalar::Util qw(weaken);
+use POSIX ();
 use Data::Shared qw(shared_compile sharedc_call);
 
 {
@@ -133,5 +134,34 @@ subtest 'full class names use the declared loader and constructor' => sub {
     is Data::Shared::Registry::resolve_spec('Data::HashMap::Shared::II')->{variant}, 'ii',
         'full class retains canonical variant';
 };
+
+# A factory that mounts is a nested mount mutation, and the manifest lock is
+# not re-entrant: without the guard the process blocks on its own lock, so this
+# runs in a child with a bounded wait -- a regression must fail, not hang.
+{
+    my $kid = fork();
+    if (defined $kid) {
+        if ($kid == 0) {
+            my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+            my $accepted = eval {
+                $root->mount('outer', sub {
+                    my ($r) = @_;
+                    $r->mount('inner', 'Data::Shared::TestHandle', undef, 16);
+                    return Data::Shared::TestHandle->new(undef, 16);
+                });
+                1;
+            };
+            POSIX::_exit($accepted ? 1 : 0);     # 0 = refused, which is correct
+        }
+        my $reaped = 0;
+        for (1 .. 100) {
+            last if $reaped = (waitpid($kid, POSIX::WNOHANG()) == $kid);
+            select undef, undef, undef, 0.1;
+        }
+        if (!$reaped) { kill 9, $kid; waitpid $kid, 0 }
+        ok $reaped, 'a nested mount mutation does not deadlock';
+        is $?, 0, 'it is refused' if $reaped;
+    }
+}
 
 done_testing;

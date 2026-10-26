@@ -27,6 +27,10 @@ jobs:
         env:
           DS_ALL_BACKENDS: 1
 
+  # Deliberately without --with-recommends: this is the no-backend install that
+  # cpanm gives by default, where most of the suite skips. It proves the dist
+  # installs and tests clean there, not that the code is covered -- with no
+  # backends the composite runtime runs barely at all.
   test-alpine:
     runs-on: ubuntu-latest
     container: alpine:latest
@@ -37,6 +41,9 @@ jobs:
       - run: cpanm -n --installdeps .
       - run: perl Makefile.PL && make test
 
+  # With the backends: this is the only non-x86_64 row, and the family's
+  # alignment and atomics behave differently here, so it has to exercise the
+  # composite runtime rather than skip it.
   test-arm:
     runs-on: ubuntu-24.04-arm
     name: ARM64 / Linux
@@ -45,7 +52,7 @@ jobs:
       - uses: shogo82148/actions-setup-perl@v1
         with:
           perl-version: '5.40'
-      - run: cpanm -n --installdeps .
+      - run: cpanm -n --with-recommends --installdeps .
       - run: perl Makefile.PL && make test
 
   test-xt:

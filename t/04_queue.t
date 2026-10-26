@@ -1,7 +1,8 @@
 use strict;
 use warnings;
 use Test::More;
-use Data::Shared qw(shared_push shared_pop shared_call shared_get);
+use Data::Shared qw(shared_push shared_pop shared_call shared_get
+                    shared_compile sharedc_push);
 
 subtest 'queue Int' => sub {
     my $r = Data::Shared->new;
@@ -75,6 +76,40 @@ subtest 'pubsub publish' => sub {
     shared_push($r, '/ev', 42);
     is $sub->poll, 42, 'subscriber sees published value';
     ok !eval { shared_pop($r, '/ev'); 1 }, 'pubsub pop croaks (needs subscriber)';
+};
+
+# A remainder was forwarded into the native call as a leading argument, so a
+# push to '/jobs/5' inserted with priority 5 on a heap -- the wrong path
+# succeeded -- and on the others it surfaced as the backend's own arity error
+# blaming its API. The map, set and sketch families already refuse this shape.
+subtest 'a queue path takes no key component' => sub {
+    my $root = Data::Shared->new;
+    my @mounted;
+    for my $spec (['queue', 'queue:int', 1024], ['stack', 'stack:int', 1024],
+                  ['heap', 'heap', 1024], ['log', 'log', 1024]) {
+        my ($name, $type, @args) = @$spec;
+        next unless eval { $root->mount($name, $type, undef, @args); 1 };
+        push @mounted, [$name, $type];
+    }
+    plan skip_all => 'no queue-family backend available' unless @mounted;
+    for my $m (@mounted) {
+        my ($name, $type) = @$m;
+        ok !eval { shared_push($root, "/$name/5", 42); 1 }, "$type refuses a push with a component";
+        like $@, qr/\Qpath too long\E/, "$type says the path is too long";
+        ok !eval { shared_pop($root, "/$name/5"); 1 }, "$type refuses a pop with a component"
+            if $type ne 'log';
+    }
+    # The compiled tier resolves its path once, so it must refuse at bind time.
+    ok !eval { my $c = shared_compile("/$mounted[0][0]/5"); sharedc_push($root, $c, 42); 1 },
+        'the compiled tier refuses it too';
+
+    # A composite child address is not a remainder: it is consumed by the
+    # composite before the leaf ever sees it.
+    my $comp = Data::Shared->new;
+    if (eval { $comp->mount('q', ['hashmap:ss', 64, ['queue:int', 8]]); 1 }) {
+        ok eval { shared_push($comp, '/q/a', 42); 1 }, 'a push into a composite child still works';
+        is shared_pop($comp, '/q/a'), 42, 'and pops back';
+    }
 };
 
 done_testing;

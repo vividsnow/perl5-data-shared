@@ -41,4 +41,31 @@ undef $root;
 my $reopened = Data::Shared->open($dir);
 is Data::Shared::shared_get($reopened, '/cache/7'), 42, 'reopen still works';
 
+# The composite subtree was the only part of a store taking its mode from the
+# ambient umask, so under umask 0 its directories and its lock -- the one that
+# serialises every child create and delete -- were world-writable.
+{
+    my $cdir = "$parent/comp";
+    my $mask = umask 0;
+    my $comp = Data::Shared->new($cdir);
+    my $ok = eval { $comp->mount('u', ['hashmap:ss', 64, ['hashmap:ss', 8]]);
+                    Data::Shared::shared_set($comp, '/u/a/k', 1); 1 };
+    umask $mask;
+    if ($ok) {
+        for my $path ('.children', '.children/u', '.children/u/.lock') {
+            is mode_of("$cdir/$path") & 077, 0, "$path is owner-only under umask 0"
+                or diag sprintf('%s is %04o', $path, mode_of("$cdir/$path"));
+        }
+        # And a lock nobody can write must not make the store unopenable: a
+        # section that mutates nothing needs no write access to it.
+        undef $comp;
+        chmod 0444, "$cdir/.children/u/.lock";
+        my $ro = eval { Data::Shared->open($cdir) };
+        ok $ro, 'a store with a read-only composite lock still opens' or diag $@;
+        is eval { Data::Shared::shared_get($ro, '/u/a/k') }, 1, 'and reads through it'
+            if $ro;
+        chmod 0600, "$cdir/.children/u/.lock";
+    }
+}
+
 done_testing;

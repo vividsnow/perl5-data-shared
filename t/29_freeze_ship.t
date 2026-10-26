@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
-use Data::Shared qw(shared_get shared_set shared_exists);
+use Data::Shared qw(shared_get shared_set shared_exists shared_push);
 
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
 eval { $probe->mount('p', ['hashmap:ss', 64, ['hashmap:ss', 8], { max_children => 64 }]); 1 }
@@ -131,7 +131,7 @@ subtest 'the rebuild guard does not depend on shippability' => sub {
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));
     plan skip_all => 'queue backend unavailable'
         unless eval { $root->mount('q', ['hashmap:ss', 64, ['queue:int', 8]]); 1 };
-    $root->node('/q/a')->push(42);
+    shared_push($root, '/q/a', 42);     # not node->push(42): that reads 42 as a path
     my $comp = $root->{mounts}{q}{composite};
     $comp->{index}->put('p:', 1);
     $comp->{index}->freeze;

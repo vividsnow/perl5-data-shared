@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use Carp ();
 use Scalar::Util qw(weaken);
-use Fcntl qw(:flock);
+use Fcntl qw(:flock O_RDWR O_APPEND O_CREAT);
 use Errno ();
 
 our $VERSION = '0.01';
@@ -156,7 +156,10 @@ sub new {
     _preflight($self, $node, $self->{dir}, $o{opening});
     if (defined $self->{dir} && !$o{opening}) {
         require File::Path;
-        File::Path::make_path($self->{dir});
+        # 0700, as the root directory and every .shm are created: the composite
+        # subtree was the only part taking its mode from the ambient umask, so
+        # under umask 0 its directories and lock were world-writable.
+        File::Path::make_path($self->{dir}, { mode => 0700 });
     }
     $self->_with_lock(sub {
         # sealed_ok comes from _open_child, so a nested child composite reopened
@@ -277,7 +280,17 @@ sub _with_lock {
     if (defined $self->{dir}) {
         my $lockfile = "$self->{dir}/.lock";
         Carp::croak("Data::Shared: missing composite directory '$self->{dir}'") unless -d $self->{dir};
-        CORE::open $fh, '>>', $lockfile or Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!");
+        # 0600 and sysopen, as the manifest lock is opened, and with its
+        # fallback: a section that mutates nothing needs no write access, and
+        # without that one unwritable 0-byte lock file made the whole store
+        # unopenable. An exclusive lock genuinely needs it.
+        unless (sysopen $fh, $lockfile, O_RDWR | O_APPEND | O_CREAT, 0600) {
+            my $err = $!;
+            unless (!$mutating && -e $lockfile && CORE::open $fh, '<', $lockfile) {
+                $! = $err;
+                Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!");
+            }
+        }
         # Retry on EINTR, as Manifest::with_lock does: this lock is taken on
         # every child create, open-miss and delete, so a signal in a server
         # process made a hot path fail spuriously.
@@ -449,7 +462,7 @@ sub _register {
                 $self->_index_put('s:', $count);
                 1;
             };
-            die $err . ($clean ? '' : " (rollback: $@)");
+            _rethrow($err, $clean ? '' : $@);
         }
         $self->{gen}++;
         return $id;
@@ -553,7 +566,7 @@ sub _open_child {
         if (!$opening) {
             push @$pending, $dir if $pending;
             require File::Path;
-            File::Path::make_path($dir);
+            File::Path::make_path($dir, { mode => 0700 });
         }
     }
     # Reopening an existing child means its file may have been sealed, and a
@@ -639,7 +652,7 @@ sub _ensure_child {
             };
             my $rollback = $clean ? '' : $@;
             my $files = Data::Shared::_cleanup_paths(\@pending);
-            die $err . (length($rollback . $files) ? " (rollback: $rollback $files)" : '');
+            _rethrow($err, length($rollback . $files) ? "$rollback $files" : '');
         }
         $self->{gen}++;
         return $rt;
@@ -729,7 +742,7 @@ sub _verb_at_child {
                     else { $self->_parent_unregister($addr) }
                     1;
                 };
-                die $err . ($clean ? '' : " (rollback: $@)");
+                _rethrow($err, $clean ? '' : $@);
             }
             return $result;
         }, 1);
@@ -870,7 +883,7 @@ sub delete_subtree {
                     if $was_parent && !$self->_is_index_parent && !$self->_parent_exists($addr);
                 1;
             };
-            die $err . ($clean ? '' : " (rollback: $@)");
+            _rethrow($err, $clean ? '' : $@);
         }
         if (defined $id) {
             my $rt = $self->_forget($id) || $cleanup_rt;
@@ -935,6 +948,17 @@ sub destroy {
         }
         return 1;
     });
+}
+
+# The treatment _mutate gives a failed manifest write: an exception object must
+# reach the caller intact rather than being stringified into a message, and
+# $err already carries its own "at FILE line N.", so re-croaking it appended a
+# second copy.
+sub _rethrow {
+    my ($err, $rollback) = @_;
+    die $err if ref $err;
+    $err =~ s/\s*\bat .+ line \d+\.?\s*\z//s;
+    Carp::croak($err . (defined $rollback && length $rollback ? " (rollback: $rollback)" : ''));
 }
 
 sub _sync_once {
