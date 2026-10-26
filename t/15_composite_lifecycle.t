@@ -7,7 +7,7 @@ use Data::Shared;
 
 eval {
     require Data::HashMap::Shared::SS;
-    require Data::Sync::Shared::Semaphore;
+    require Data::Sync::Shared::RWLock;
     1;
 } or plan skip_all => "composite backends unavailable: $@";
 

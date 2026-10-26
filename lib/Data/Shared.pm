@@ -1378,8 +1378,10 @@ native handle continues to refer to that instance after recreation.
 
 The shared child counter is maintained under the lifecycle lock, and is
 rebuilt only when an unfinished mutation marker is found: on opening a
-writable composite, or when a lifecycle lock encounters one. Process
-termination releases file locks; unpublished directories may remain and
+writable composite, or when a lifecycle lock encounters one. A holder
+that dies mid-section releases the lock either way: the kernel releases
+a file-backed composite's file lock, and an anonymous composite's lock
+is recovered from the dead owner. Unpublished directories may remain and
 are retained for explicit recovery. A preexisting unpublished directory for
 a reserved child is reported as an error. This provides exception rollback
 and limited interruption recovery, without promising power-loss transactions

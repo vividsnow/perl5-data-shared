@@ -5,7 +5,7 @@ use File::Temp qw(tempdir);
 use POSIX qw(_exit);
 use Data::Shared qw(shared_compile sharedc_get);
 
-eval { require Data::HashMap::Shared::SS; require Data::Sync::Shared::Semaphore; 1 }
+eval { require Data::HashMap::Shared::SS; require Data::Sync::Shared::RWLock; 1 }
     or plan skip_all => "composite backends unavailable: $@";
 
 sub maps {

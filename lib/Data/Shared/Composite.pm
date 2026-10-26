@@ -257,10 +257,15 @@ sub _with_lock {
         }
     } else {
         unless ($self->{lock_handle}) {
-            Data::Shared::_require_class('Data::Sync::Shared::Semaphore');
-            $self->{lock_handle} = Data::Sync::Shared::Semaphore->new(undef, 1);
+            # RWLock, not Semaphore: a dead Semaphore holder's permit is never
+            # restored, so a worker killed inside a lifecycle section wedged
+            # every other process sharing an anonymous root, in a futex wait no
+            # Perl signal handler can break. RWLock recovers a dead owner's
+            # lock. Write-locked throughout; _locked already guards re-entry.
+            Data::Shared::_require_class('Data::Sync::Shared::RWLock');
+            $self->{lock_handle} = Data::Sync::Shared::RWLock->new(undef);
         }
-        $self->{lock_handle}->acquire;
+        $self->{lock_handle}->wrlock;
     }
     local $self->{_locked} = 1;
     my $want = wantarray;
@@ -283,7 +288,7 @@ sub _with_lock {
     };
     my $err = $@;
     if ($fh) { close $fh }
-    else { $self->{lock_handle}->release }
+    else { $self->{lock_handle}->wrunlock }
     die $err unless $ok;
     return $want ? @ret : $ret;
 }
