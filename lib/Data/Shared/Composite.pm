@@ -130,7 +130,7 @@ sub _validate_node {
     for my $option (qw(max_children cache_size)) {
         Carp::croak("Data::Shared: composite $option must be an integer >= 1")
             unless defined $node->{$option} && !ref $node->{$option}
-                && $node->{$option} =~ /\A[1-9]\d*\z/;
+                && $node->{$option} =~ /\A[1-9][0-9]*\z/;   # not \d: see Registry
     }
 }
 
@@ -402,7 +402,7 @@ sub _allocate_id {
     Carp::croak("Data::Shared: composite child limit exceeded (max_children=$self->{node}{max_children}) at $self->{name}")
         if $self->_child_count >= $self->{node}{max_children};
     my $id = $self->{index}->get('n:') // 0;
-    Carp::croak('Data::Shared: invalid composite child sequence') unless $id =~ /\A\d+\z/;
+    Carp::croak('Data::Shared: invalid composite child sequence') unless $id =~ /\A[0-9]+\z/;
     $self->_index_put('n:', $id + 1); # IDs are never rolled back or reused.
     return $id;
 }
@@ -685,7 +685,8 @@ sub _verb_at_child {
         # Before the lock: the leaf's own guard croaks from inside the section,
         # which leaves the interrupted-mutation marker set and costs the next
         # caller a rebuild, for what is only a missing argument.
-        Carp::croak("sortedset set needs a score") if $verb eq 'set' && !@args;
+        Carp::croak("sortedset $verb needs a " . ($verb eq 'set' ? 'score' : 'delta'))
+            unless @args;
         return $self->_with_lock(sub {
             my $old_id = $self->_reg_id($addr);
             my $was_parent = $self->_parent_exists($addr);

@@ -15,7 +15,7 @@ our @CARP_NOT = qw(Data::Shared Data::Shared::Manifest Data::Shared::Storage
 
 sub snapshot {
     my ($value, $active) = @_;
-    return ($value, 1) unless ref $value;
+    return (_scalar_snapshot($value), 1) unless ref $value;
     return ($value ? JSON::PP::true() : JSON::PP::false(), 1)
         if blessed($value) && $value->isa('JSON::PP::Boolean');
     return ($value, 0) unless ref $value eq 'ARRAY' || ref $value eq 'HASH';
@@ -40,6 +40,36 @@ sub snapshot {
         $serializable &&= $ok;
     }
     return (\%copy, $serializable);
+}
+
+# The manifest is a codec, and JSON is total over neither of these. Both the
+# backend constructor and the manifest see what this returns, so a path
+# recorded here is the one the file was created under.
+sub _scalar_snapshot {
+    my ($value) = @_;
+    return $value unless defined $value;
+    if (utf8::is_utf8($value)) {
+        # Encoded to JSON a lone surrogate, or a codepoint above the Unicode
+        # range, produces text JSON::PP cannot parse again: the mount
+        # succeeded and every later open croaked on a manifest only hand
+        # editing could repair.
+        Carp::croak('Data::Shared: mount argument is not representable in a manifest')
+            if $value =~ /[\x{D800}-\x{DFFF}]|[^\x{0}-\x{10FFFF}]/;
+        # A string of bytes and its character spelling are the same JSON once
+        # published, and the reader cannot tell them apart, so a byte path
+        # came back as characters and named a different file. Record the bytes
+        # the filesystem and the leaf's SvPV already see.
+        my $bytes = $value;
+        utf8::encode($bytes);
+        return $bytes;
+    }
+    # Inf and NaN are written verbatim, which is not JSON. Refuse while the
+    # caller is still there to be told, rather than publishing a manifest that
+    # kills the store at the next topology change.
+    Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
+        if (B::svref_2object(\$value)->FLAGS & (B::SVp_IOK() | B::SVp_NOK()))
+            && $value =~ /\A-?(?:inf|nan)/i;
+    return $value;
 }
 
 sub with_lock {
@@ -93,7 +123,7 @@ sub read {
     Carp::croak("Data::Shared: invalid manifest mounts in '$path'") unless ref $data->{mounts} eq 'ARRAY';
     $data->{revision} = 0 unless exists $data->{revision};
     Carp::croak("Data::Shared: invalid manifest revision in '$path'")
-        unless defined $data->{revision} && !ref $data->{revision} && $data->{revision} =~ /\A\d+\z/;
+        unless defined $data->{revision} && !ref $data->{revision} && $data->{revision} =~ /\A[0-9]+\z/;
     # Older JSON::PP treats numeric values inspected as strings as JSON strings.
     # Restore numeric header types so validation cannot change the fingerprint.
     $data->{version} = 1;
@@ -112,10 +142,14 @@ sub read {
     # from the mount name, so under -T a leaf with a taint guard refused to
     # reopen: a store was writable once and dead afterwards. The manifest is
     # declared trusted input and has just been validated field by field, so
-    # untaint it here. Numbers must stay numbers or the canonical JSON
-    # fingerprint changes and _assert_revision reports a stale revision.
+    # untaint it here. Numbers stay numbers because that is what the backend
+    # constructor is handed.
     _untaint($data);
-    return $data;
+    # The published text is the revision fingerprint. Re-encoding the parsed
+    # data is a second pipeline, and any value JSON::PP spells differently on
+    # the way back -- 1e+15 decodes to an integer -- then looked to the writing
+    # process like somebody else's write.
+    return wantarray ? ($data, $json) : $data;
 }
 
 sub _untaint {
@@ -130,6 +164,9 @@ sub _untaint_scalar {
     return _untaint($v) if ref $v;
     return $v unless defined $v;
     my ($clean) = "$v" =~ /\A(.*)\z/s;      # a capture is untainted
+    # Restore the bytes snapshot published: decoded back, a byte above 0x7F is
+    # a character whose PV is two bytes, so a path stopped naming its file.
+    utf8::downgrade($clean, 1);
     # JSON::PP gives numbers IOK/NOK and strings POK only, so this keeps "007"
     # a string while 1000 stays a number.
     my $flags = B::svref_2object(\$v)->FLAGS;
@@ -158,7 +195,7 @@ sub write {
         unlink $tmp;
         Carp::croak("Data::Shared: $err");
     }
-    return 1;
+    return "$json\n";       # what read() will slurp back, for the fingerprint
 }
 
 1;

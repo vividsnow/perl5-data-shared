@@ -67,6 +67,7 @@ t/27_node_api.t
 t/28_ambient.t
 t/29_freeze_ship.t
 t/30_values.t
+t/31_manifest_codec.t
 xt/eg_runs.t
 xt/kwalitee.t
 xt/manifest.t

@@ -85,14 +85,22 @@ sub _parse_array_path {
 # component got through unchecked, so undef addressed the empty-string key and
 # a reference addressed its own stringified address -- a different key every
 # run -- both reported as a successful write. An object that overloads
-# stringification does have a stable address, and the string tier accepts the
-# same spelling, so it is allowed.
+# stringification is allowed, since the string tier accepts the spelling it
+# produces, but it is resolved here and now: kept as a reference, a mutable
+# object addressed a different key on every use of the same compiled path, and
+# a handler returning undef addressed the empty-string key -- the very case
+# this check exists for. Every caller passes a fresh copy of the list, so
+# replacing the component in place cannot reach the caller's array.
 sub _check_components {
     my ($components) = @_;
     for my $c (@$components) {
         next if defined $c && !ref $c;
+        my $stringify = defined $c && overload::Method($c, '""');
+        Carp::croak("path component must be a defined string") unless $stringify;
+        my $string = $stringify->($c, undef, '');
         Carp::croak("path component must be a defined string")
-            if !defined $c || !overload::Method($c, '""');
+            if !defined $string || ref $string;
+        $c = $string;
     }
     return $components;
 }
@@ -631,8 +639,7 @@ sub _write_manifest {
     return unless defined $self->{dir};
     Carp::croak('Data::Shared: root is read-only, cannot write manifest') if $self->{readonly};
     my $data = $self->_manifest_data;
-    Data::Shared::Manifest::write($self->manifest_path, $data);
-    $self->{_manifest_stamp} = JSON::PP->new->canonical(1)->encode($data);
+    $self->{_manifest_stamp} = Data::Shared::Manifest::write($self->manifest_path, $data);
     return 1;
 }
 
@@ -643,8 +650,7 @@ sub _assert_revision {
     # reporting that it cannot be read reads as corruption.
     Carp::croak('Data::Shared: this store was unlinked; create or open a root again')
         if defined $self->{_manifest_stamp} && !-e $self->manifest_path;
-    my $current = Data::Shared::Manifest::read($self->manifest_path);
-    my $stamp = JSON::PP->new->canonical(1)->encode($current);
+    my ($current, $stamp) = Data::Shared::Manifest::read($self->manifest_path);
     Carp::croak('Data::Shared: stale manifest revision; reopen the root before changing mounts')
         unless $current->{revision} == $self->{_revision} && $stamp eq $self->{_manifest_stamp};
 }
@@ -757,7 +763,7 @@ sub _recipe {
 sub _replay_manifest {
     my ($self) = @_;
     my $path = $self->manifest_path;
-    my $data = Data::Shared::Manifest::read($path);
+    my ($data, $raw) = Data::Shared::Manifest::read($path);
     local $self->{_replaying} = 1;
     local $self->{_opening} = 1;
     local $self->{_abs_cache} = {};     # shared with $check by the copy below
@@ -775,7 +781,7 @@ sub _replay_manifest {
     my $ok = eval { $self->_install_recipe($_) for @recipes; 1 };
     Carp::croak("Data::Shared: failed to replay manifest '$path': $@") unless $ok;
     $self->{_revision} = $data->{revision};
-    $self->{_manifest_stamp} = JSON::PP->new->canonical(1)->encode($data);
+    $self->{_manifest_stamp} = $raw;
     $self->_invalidate_compiled;
     return 1;
 }
@@ -1182,6 +1188,12 @@ current configuration. Roots keep their own mount namespace until reopened;
 they do not refresh automatically. C<freeze_all> and C<unlink_all> also check
 the revision before operating on shared storage.
 
+A mount argument has to be representable in the manifest, since replaying it
+is how every later process reopens the store: C<Inf>, C<NaN> and a lone
+surrogate are refused at mount time rather than published as text nothing can
+parse back. Strings are recorded as bytes, so a backing path keeps naming its
+file whether you pass it as bytes or as characters.
+
 Version-one manifests without a revision are accepted as revision zero.
 New writers add a revision and a F<.manifest.lock> file; existing backend
 file formats and generated filenames are preserved. Concurrent writers must
@@ -1383,7 +1395,8 @@ rebuilt only when an unfinished mutation marker is found: on opening a
 writable composite, or when a lifecycle lock encounters one. A holder
 that dies mid-section releases the lock either way: the kernel releases
 a file-backed composite's file lock, and an anonymous composite's lock
-is recovered from the dead owner. Unpublished directories may remain and
+is recovered from the dead owner, at the cost of about 8 kB of mapping
+per anonymous composite instance. Unpublished directories may remain and
 are retained for explicit recovery: each holds its child's storage, no
 API reports them, and only C<unlink_all> reclaims them, so a long-running
 producer that is killed repeatedly accumulates them until the store is
