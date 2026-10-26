@@ -54,6 +54,13 @@ subtest 'frozen reports whether the store can be shipped' => sub {
     }
     my $empty = Data::Shared->new(tempdir(CLEANUP => 1));
     ok !$empty->frozen, 'an empty store is not shippable';
+
+    # freeze_all's 0 is ambiguous on its own: already sealed, or nothing
+    # sealable. frozen is what tells those apart.
+    my ($sealed) = store(children => 1);
+    $sealed->freeze_all;
+    is $sealed->freeze_all, 0, 'sealed store seals nothing more';
+    ok $sealed->frozen, 'and reports sealed';
 };
 
 # Hash order made the set of sealed mounts differ from run to run, and a store
@@ -73,6 +80,25 @@ subtest 'freeze_all seals in mount order' => sub {
     ok !eval { $root->freeze_all; 1 }, 'a failing mount aborts the pass';
     my @state = map { $root->{mounts}{"m$_"}{handle}->frozen ? 1 : 0 } 1 .. 6;
     is_deeply \@state, [1, 1, 1, 0, 0, 0], 'everything before it is sealed, nothing after';
+};
+
+# The counter rebuild must not run against a sealed index: it cannot take the
+# write, and a count is derived from the addresses when it is absent. Entering
+# the lifecycle lock clears a pending marker while the index is still writable,
+# so this state needs the index handle to reach.
+subtest 'a sealed index with a pending marker does not break the walk' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('org', ['hashmap:ss', 64, ['hashmap:ss', 64, ['hashmap:ss', 8]]]);
+    shared_set($root, '/org/a/b/k', 1);
+    my $inner = $root->{mounts}{org}{composite}{cache}{0}{comp};
+    $inner->{index}->put('p:', 1);
+    $inner->{index}->freeze;
+    cmp_ok $root->freeze_all, '>=', 1, 'freeze_all completes';
+    ok $root->frozen, 'and the store is sealed';
+    undef $root;
+    my $ro = Data::Shared->open_readonly($dir);
+    is shared_get($ro, '/org/a/b/k'), 1, 'and ships';
 };
 
 # sync_all is documented as applying to every mount; for a composite that is

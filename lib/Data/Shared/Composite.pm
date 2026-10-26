@@ -165,7 +165,7 @@ sub new {
         # unmarked counter is already correct. Recounting unconditionally made
         # a cold open O(children) -- and every cache miss on a nested composite
         # is a cold open -- while writing to the index on a pure read path.
-        if (!$self->{readonly} && !$self->{_cleanup}
+        if (!$self->{readonly} && !$self->{_cleanup} && !$self->frozen
             && ($index->get('p:') || !defined $index->get('s:'))) {
             $self->_index_put('s:', $self->_count_addresses);
             $self->_index_remove('p:');
@@ -212,20 +212,33 @@ sub _valid_address {
     # the index keys both strings. Only composite parents are checked; a plain
     # leaf mount keeps the backend's documented wrapping.
     if (my $bits = $self->_key_int_bits) {
-        my $max = (1 << ($bits - 1)) - 1;
-        return 0 if $addr > $max || $addr < -$max - 1;
+        my ($neg, $mag) = $addr =~ /\A(-?)([0-9]+)\z/;
+        my $limit = $bits == 64
+            ? ($neg ? '9223372036854775808' : '9223372036854775807')
+            : (1 << ($bits - 1)) - ($neg ? 0 : 1);
+        # Compared as strings: a canonical address has no leading zeros, so at
+        # equal length lexical order is numeric order, and the 64-bit limits do
+        # not survive a double (-9223372036854775809 rounds to the minimum and
+        # would pass a numeric test).
+        return 0 if length($mag) > length($limit)
+                 || (length($mag) == length($limit) && $mag gt $limit);
     }
     return 1;
 }
 
 sub _key_int_bits {
     my ($self) = @_;
+    # An id-parent keeps no mirror slot, so an id outside the range cannot
+    # collide with another address there.
+    return 0 if $self->_is_index_parent;
     my $resolved = $self->{node}{resolved};
     my $probe = defined $resolved->{variant} ? $resolved->{variant}
               : ($resolved->{class} =~ /::(\w+)\z/ ? lc $1 : '');
     return 16 if $probe =~ /\Ai16/;
     return 32 if $probe =~ /\Ai32/;
-    return 0;
+    # Any other int-keyed parent stores the key at IV width, and wraps there
+    # just as the narrow ones do: 2**63 and -2**63 shared one mirror slot.
+    return $self->_key_is_int ? 64 : 0;
 }
 
 sub _with_lock {
@@ -255,7 +268,10 @@ sub _with_lock {
     my $ok = eval {
         if ($self->{index}) {
             Carp::croak('Data::Shared: composite instance was deleted') if $self->{index}->get('x:') && !$self->{_cleanup};
-            if ($self->{index}->get('p:')) {
+            # A sealed index can never take the write, and a count is derived
+            # from the addresses when it is absent, so rebuilding it there
+            # could only croak.
+            if ($self->{index}->get('p:') && !$self->frozen) {
                 $self->_index_put('s:', $self->_count_addresses);
                 $self->_index_remove('p:');
             }
@@ -287,7 +303,7 @@ my $INDEX_ARENA_MAX       = 0xFFFFFFFF;
 # 'freeze' is deliberately NOT here: routing it to the composite freezes the
 # child index too, which blocks the retirement record a later delete must write.
 # Freezing a whole subtree is what $root->freeze_all is for.
-my %LIFECYCLE_METHOD = map { $_ => 1 } qw(stats sync unlink destroy);
+my %LIFECYCLE_METHOD = map { $_ => 1 } qw(stats sync unlink destroy frozen);
 
 # Already frozen is the goal state, not an error, so freeze stays idempotent
 # even if a leaf was frozen directly first.
@@ -636,6 +652,9 @@ sub _verb_at_child {
             return undef unless $self->_valid_address($addr) && $self->_parent_exists($addr);
             return Data::Shared::_dispatch_record('get', $self->{parent_record}, [$addr]);
         }
+        # As the exists and delete branches do: an address that cannot be
+        # registered needs no index lookup.
+        return undef unless $self->_valid_address($addr);
         return undef unless defined $self->_reg_id($addr);
         return $self->_node_for($root, $addr);
     }
@@ -871,6 +890,14 @@ sub destroy {
     });
 }
 
+sub _sync_once {
+    my ($rt) = @_;
+    return $rt->{comp}->sync if $rt->{kind} eq 'composite';
+    return 0 unless $rt->{handle}->can('sync');
+    $rt->{handle}->sync;
+    return 1;
+}
+
 sub sync {
     my ($self) = @_;
     my $n = 0;
@@ -881,10 +908,18 @@ sub sync {
     # reachable, hence the tolerant open.
     local $self->{_frozen_ok} = 1;
     my $root = $self->{root_weak};
-    for my $addr ($self->children_at(undef, [])) {
-        my $rt = $self->_existing_child($root, $addr) or next;
-        if ($rt->{kind} eq 'composite') { $n += $rt->{comp}->sync }
-        elsif ($rt->{handle}->can('sync')) { $rt->{handle}->sync; $n++ }
+    if (defined $self->{dir}) {
+        # One at a time: holding every child open at once would run a large
+        # composite out of descriptors.
+        for my $addr ($self->children_at(undef, [])) {
+            my $rt = $self->_existing_child($root, $addr) or next;
+            $n += _sync_once($rt);
+        }
+    } else {
+        # An anonymous composite has no file to flush, and a child another
+        # process created after a fork cannot be mapped here at all, so only
+        # the handles this process holds can be flushed.
+        $n += _sync_once($_) for values %{ $self->{cache} };
     }
     # Counted unconditionally: the backends' sync returns nothing, so gating
     # on its value never counted the parent or the index at all.
@@ -899,7 +934,14 @@ sub sync {
 # The index is frozen last, so a frozen index means the subtree is sealed.
 sub frozen {
     my ($self) = @_;
-    return $self->{index} && $self->{index}->can('frozen') && $self->{index}->frozen ? 1 : 0;
+    return 0 unless $self->{index} && $self->{index}->can('frozen') && $self->{index}->frozen;
+    # Sealed is not the same as shippable: a level whose backend cannot be
+    # opened read-only is what makes a shipped copy fail at the first read
+    # deep enough to open it.
+    for (my $node = $self->{node}; $node; $node = $node->{child}) {
+        return 0 unless eval { Data::Shared::Storage::check_readonly($node->{resolved}); 1 };
+    }
+    return 1;
 }
 
 sub freeze {

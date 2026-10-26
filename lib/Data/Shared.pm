@@ -77,7 +77,26 @@ sub _parse_array_path {
     my ($aref) = @_;
     Carp::croak("array path must be an ARRAY reference")
         unless ref $aref eq 'ARRAY';
+    # Checked inline rather than through _check_components: this is the hot
+    # entry point and the extra call cost about as much as the check.
+    for my $c (@$aref) {
+        Carp::croak("path component must be a defined string")
+            if !defined $c || ref $c;
+    }
     return [ @$aref ];
+}
+
+# The string tier refuses an undef or reference path outright. An array
+# component got through unchecked, so undef addressed the empty-string key and
+# a reference addressed its own stringified address -- a different key every
+# run -- both reported as a successful write.
+sub _check_components {
+    my ($components) = @_;
+    for my $c (@$components) {
+        Carp::croak("path component must be a defined string")
+            if !defined $c || ref $c;
+    }
+    return $components;
 }
 
 sub _check_root {
@@ -258,7 +277,7 @@ sub shared_compile {
     my ($path) = @_;
     my ($components, $is_array);
     if (ref $path eq 'ARRAY') {
-        $components = [ @$path ];
+        $components = _check_components([ @$path ]);
         $is_array = 1;
     } else {
         $components = _parse_string_path($path);
@@ -558,8 +577,9 @@ sub _check_storage_paths {
 
 # abs_path lstats every component, and the collision check walks every
 # installed path for every new one, so mount and open were quadratic in
-# syscalls. Only a resolved path is cached: one not created yet would cache
-# its unresolved form and stop a later symlink collision being seen.
+# syscalls. Cached for one manifest operation only: held longer, a symlink
+# retargeted between two mounts hid a real collision, and the store then
+# failed to reopen because replay resolves afresh.
 sub _abs_path {
     my ($self, $path) = @_;
     my $hit = $self->{_abs_cache}{$path};
@@ -619,6 +639,10 @@ sub _write_manifest {
 sub _assert_revision {
     my ($self) = @_;
     return unless defined $self->{dir};
+    # Say which it is: after unlink_all the manifest is gone on purpose, and
+    # reporting that it cannot be read reads as corruption.
+    Carp::croak('Data::Shared: this store was unlinked; create or open a root again')
+        if defined $self->{_manifest_stamp} && !-e $self->manifest_path;
     my $current = Data::Shared::Manifest::read($self->manifest_path);
     my $stamp = JSON::PP->new->canonical(1)->encode($current);
     Carp::croak('Data::Shared: stale manifest revision; reopen the root before changing mounts')
@@ -639,6 +663,7 @@ sub _mutate {
         $self->_assert_revision;
         local $self->{_mutating} = 1;
         local $self->{_pending_paths} = [];
+        local $self->{_abs_cache} = {};
         local $self->{_changed} = 0;
         my ($mounts, $order, $nested, $revision, $stamp) =
             ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision}, $self->{_manifest_stamp});
@@ -735,6 +760,7 @@ sub _replay_manifest {
     my $data = Data::Shared::Manifest::read($path);
     local $self->{_replaying} = 1;
     local $self->{_opening} = 1;
+    local $self->{_abs_cache} = {};     # shared with $check by the copy below
     my $check = bless { %$self, mounts => {} }, ref $self;
     my @recipes;
     for my $m (@{ $data->{mounts} }) {
@@ -819,7 +845,7 @@ sub handle {
     _check_root($self);
     return $self if !defined $path || $path eq '' || $path eq '/';
     my @components;
-    if (ref $path eq 'ARRAY') { @components = @$path }
+    if (ref $path eq 'ARRAY') { @components = @{ _check_components([ @$path ]) } }
     elsif (blessed($path) && $path->isa('Data::Shared::Compiled')) { @components = @{ $path->{components} } }
     else { @components = @{ _parse_string_path($path) } }
     return $self unless @components;
@@ -839,7 +865,7 @@ sub _path_components {
     my ($self, $path) = @_;
     return [] if !defined $path;
     return [ @{ $path->{components} } ] if blessed($path) && $path->isa('Data::Shared::Node');
-    return [ @$path ] if ref $path eq 'ARRAY';
+    return _check_components([ @$path ]) if ref $path eq 'ARRAY';
     return [ @{ $path->{components} } ] if blessed($path) && $path->isa('Data::Shared::Compiled');
     return _parse_string_path($path);
 }
@@ -914,8 +940,13 @@ sub freeze_all {
 sub frozen {
     my ($self) = @_;
     for my $name (@{ $self->{order} }) {
-        my $h = $self->{mounts}{$name}{handle};
-        return 0 unless $h->can('freeze') && $h->can('frozen') && $h->frozen;
+        my $mount = $self->{mounts}{$name};
+        my $handle = $mount->{handle};
+        if ($handle->can('frozen')) { return 0 unless $handle->frozen }
+        # A build-then-load backend needs no sealing. Anything else that
+        # cannot be sealed cannot be opened read-only either, so the
+        # directory would not ship whatever freeze_all did.
+        elsif (!($mount->{entry} && $mount->{entry}{immutable})) { return 0 }
     }
     return @{ $self->{order} } ? 1 : 0;
 }
@@ -924,13 +955,22 @@ sub unlink_all {
     my ($self) = @_;
     Carp::croak("Data::Shared: root is read-only, cannot unlink") if $self->{readonly};
     return Data::Shared::Manifest::with_lock($self, 1, sub {
-        $self->_assert_revision;
+        # Already unlinked is the goal state, as it is for freeze_all and for a
+        # composite destroy: a second call used to croak that the manifest
+        # could not be read.
+        my $published = !defined $self->{dir} || -e $self->manifest_path;
+        return 0 unless $published || @{ $self->{order} };
+        $self->_assert_revision if $published;
         my $n = 0;
-        for my $m (values %{ $self->{mounts} }) {
-            if ($m->{handle}->can('unlink')) { $m->{handle}->unlink; $n++ }
+        # Insertion order, not hash order: the last iteration over mounts that
+        # left a partial failure's surviving set up to the hash seed.
+        for my $name (@{ $self->{order} }) {
+            my $handle = $self->{mounts}{$name}{handle};
+            if ($handle->can('unlink')) { $handle->unlink; $n++ }
         }
-        if (defined $self->{dir}) {
-            CORE::unlink($self->manifest_path) or Carp::croak("Data::Shared: cannot unlink manifest: $!");
+        if ($published && defined $self->{dir}) {
+            CORE::unlink($self->manifest_path) or $!{ENOENT}
+                or Carp::croak("Data::Shared: cannot unlink manifest: $!");
             $n++;
         }
         $self->{mounts} = {};
@@ -1153,11 +1193,11 @@ Proxies applied to every mount whose handle supports the method, in
 mount order. C<stats> returns a hashref of per-mount stats (or class
 name where a leaf has no C<stats>). A composite mount counts as its
 whole subtree: parent, child index and every registered child, open or
-not. C<freeze_all> returns the number of handles it sealed, so 0 means
-everything was already sealed -- test it with C<defined>, not truth.
-C<frozen> reports whether every mount is sealed, which is what a
-producer needs before shipping the directory. A mounted native handle
-is sealed with the rest, so the caller's own object becomes read-only.
+not. C<freeze_all> returns the number of handles it sealed, so 0 is a
+success: either everything was already sealed, or no mount can be.
+C<frozen> tells those apart, and is what a producer should assert
+before shipping the directory. A mounted native handle is sealed with
+the rest, so the caller's own object becomes read-only.
 
 =head1 PATH FORMAT
 
@@ -1220,7 +1260,11 @@ larger C<arena> (C<sortedset:strings>) or third constructor argument
 (C<intern>) if your members are long, and check the return value. Keys cross into XS
 as bytes, so encode wide characters first: a character above U+00FF is
 accepted by the HashMap and SortedSet families and fatal in RadixTree,
-Intern and the filter family.
+Intern and the filter family. An integer-addressed leaf numifies a
+non-integer key, so C<'abc'> addresses element 0: C<buffer>, C<fenwick>,
+C<segmenttree> and C<disjointset> refuse it, but C<bitset>,
+C<roaringbitmap>, C<pool>, C<ndarray>, C<graph> and the integer
+C<hashmap> variants write to element 0 (with a warning under C<-w>).
 
 =head2 shared_call($root, $path, $method, @args)
 

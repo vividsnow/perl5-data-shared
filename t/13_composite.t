@@ -196,6 +196,17 @@ subtest 'fixed-width int parents reject aliasing addresses' => sub {
     is shared_get($r, '/m32/2147483647/name'), 'max', 'in-range i32 address works';
     ok !eval { shared_set($r, '/m32/2147483648/name', 'alias'); 1 }, 'i32 parent rejects 2147483648';
 
+    # A full-width int parent wraps at the IV boundary just as i16 does, so
+    # 2**63 and -2**63 shared one mirror slot. Compared as strings, since
+    # -9223372036854775809 rounds to the minimum as a double.
+    $r->mount('m64', ['hashmap:ii', 100, ['hashmap:ss', 100]]);
+    shared_set($r, '/m64/9223372036854775807/name', 'max');
+    shared_set($r, '/m64/-9223372036854775808/name', 'min');
+    is shared_get($r, '/m64/9223372036854775807/name'), 'max', 'IV_MAX address works';
+    for my $bad ('9223372036854775808', '-9223372036854775809', '18446744073709551615') {
+        ok !eval { shared_set($r, "/m64/$bad/name", 'alias'); 1 }, "ii parent rejects $bad";
+    }
+
     # A plain leaf mount keeps the backend's documented wrapping.
     $r->mount('leaf', 'hashmap:i16s', undef, 100);
     ok eval { shared_set($r, '/leaf/70000', 'wrapped'); 1 }, 'leaf mount still accepts a wrapping key';

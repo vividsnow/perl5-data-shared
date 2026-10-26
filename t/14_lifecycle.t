@@ -89,6 +89,24 @@ subtest 'backing path aliases fail before constructing another handle' => sub {
     }
 };
 
+# Resolved paths are memoised to keep the check off the syscall path, but only
+# within one mount operation: held longer, a symlink retargeted in between hid
+# a real collision and the store then would not reopen.
+subtest 'a retargeted symlink cannot hide a collision' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    mkdir "$dir/real1"; mkdir "$dir/real2";
+    plan skip_all => 'no symlinks here' unless eval { symlink "$dir/real1", "$dir/link" };
+    my $root = Data::Shared->new("$dir/store");
+    $root->mount('a', 'hashmap:ii', "$dir/link/x.shm", 16);
+    $root->mount('c', 'hashmap:ii', "$dir/real1/other.shm", 16);
+    unlink "$dir/link";
+    symlink "$dir/real2", "$dir/link" or die "symlink: $!";
+    ok !eval { $root->mount('b', 'hashmap:ii', "$dir/real2/x.shm", 16); 1 },
+        'the collision is still caught after the retarget';
+    like $@, qr/backing path.*already used/, 'and explains itself';
+    is scalar(keys %{ $root->{_abs_cache} || {} }), 0, 'no resolved paths outlive the operation';
+};
+
 subtest 'hashref specs preserve external constructor arguments on replay' => sub {
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));
     my $handle = $root->mount('x', { spec => 'Data::Shared::TestHandle' }, undef, 123);

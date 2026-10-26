@@ -59,6 +59,9 @@ ok !exists { map { $_ => 1 } $reopened->mounts }->{temp}, 'temp not replayed';
                 'the croak names the path, not the internal node role';
             like $@, qr/file-backed root/, 'and says what to do instead';
             is shared_get($anon, '/users/alice/name'), 'from-parent', 'own children unaffected';
+            # Nothing to flush for an anonymous store, so sync must not trip
+            # over a child it cannot map.
+            ok defined eval { $anon->sync_all }, 'sync_all still works over it';
         }
     }
 }

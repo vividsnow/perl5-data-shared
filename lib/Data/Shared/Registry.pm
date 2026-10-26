@@ -9,6 +9,25 @@ our @CARP_NOT = qw(Data::Shared Data::Shared::Adapter::Map
                    Data::Shared::Adapter::Set Data::Shared::Adapter::Indexed
                    Data::Shared::Adapter::Sketch);
 
+# The exists verbs below refuse a non-integer index. Without the same refusal
+# on their siblings, 'abc' numified to 0, so exists reported the address absent
+# while get read element 0 and set or delete overwrote it.
+sub _assert_index {
+    my ($key, $idx) = @_;
+    Carp::croak("$key: index must be an integer, not '" . (defined $idx ? $idx : 'undef') . "'")
+        unless defined $idx && $idx =~ /\A-?\d+\z/;
+    return $idx;
+}
+
+sub _int_verb {
+    my ($key, $method) = @_;
+    return sub {
+        my ($h, $idx, @rest) = @_;
+        _assert_index($key, $idx);
+        return $h->$method($idx, @rest);
+    };
+}
+
 sub _buf_exists {
     return sub {
         my ($h, $idx) = @_;
@@ -25,7 +44,12 @@ our %REGISTRY = (
         verbs => {
             get    => 'test',
             exists => 'test',
-            set    => sub { my ($h, $idx, $v) = @_; return $v ? $h->set($idx) : $h->clear($idx) },
+            # No value read as false and cleared the bit, reporting success.
+            # @_ < 3, not an undef test: an explicit undef still means the
+            # caller meant to pass something, as Node::delete reads it.
+            set    => sub { my ($h, $idx, $v) = @_;
+                Carp::croak("bitset set needs a value (1 to set, 0 to clear)") if @_ < 3;
+                return $v ? $h->set($idx) : $h->clear($idx) },
             delete => 'clear',
         },
     },
@@ -43,10 +67,10 @@ our %REGISTRY = (
         variants => { map { $_ => { class => "Data::Buffer::Shared::$_", load => "Data::Buffer::Shared::$_" } }
                       qw(I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Str) },
         verbs => {
-            get => 'get', set => 'set',
+            get => _int_verb('buffer', 'get'), set => _int_verb('buffer', 'set'),
             exists => _buf_exists(),
-            delete => sub { my ($h, $idx) = @_; return $h->set($idx, 0) },
-            incr => 'incr',
+            delete => sub { my ($h, $idx) = @_; _assert_index('buffer', $idx); return $h->set($idx, 0) },
+            incr => _int_verb('buffer', 'incr'),
         },
     },
     countingbloomfilter => {
@@ -95,7 +119,7 @@ our %REGISTRY = (
         key => 'disjointset', dist => 'Data-DisjointSet-Shared',
         class => 'Data::DisjointSet::Shared', path_class => 'set', freeze => 0,
         verbs => {
-            get => 'find',
+            get => _int_verb('disjointset', 'find'),
             exists => sub { my ($h, $m) = @_; return (defined $m && $m =~ /^-?\d+$/ && $m >= 0 && $m < $h->capacity) ? 1 : 0 },
             # Without the guard a missing second member numified to 0 and
             # unioned the member with element 0. DisjointSet has no split, so
@@ -112,9 +136,10 @@ our %REGISTRY = (
         key => 'fenwick', dist => 'Data-Fenwick-Shared',
         class => 'Data::Fenwick::Shared', path_class => 'indexed', freeze => 1,
         verbs => {
-            get => 'point', set => 'set', incr => 'update',
+            get => _int_verb('fenwick', 'point'), set => _int_verb('fenwick', 'set'),
+            incr => _int_verb('fenwick', 'update'),
             exists => sub { my ($h, $p) = @_; return (defined $p && $p =~ /^-?\d+$/ && $p >= 1 && $p <= $h->size) ? 1 : 0 },
-            delete => sub { my ($h, $p) = @_; return $h->set($p, 0) },
+            delete => sub { my ($h, $p) = @_; _assert_index('fenwick', $p); return $h->set($p, 0) },
         },
     },
     fenwick2d => {
@@ -232,7 +257,9 @@ our %REGISTRY = (
         key_join => '/',
         verbs => {
             get => 'lookup',
-            set => sub { my ($h, $k, $v) = @_; return $h->insert($k, $v) },
+            set => sub { my ($h, $k, $v) = @_;
+                Carp::croak("radixtree set needs a value") if @_ < 3;
+                return $h->insert($k, $v) },
             delete => 'delete', exists => 'exists',
         },
     },
@@ -278,12 +305,12 @@ our %REGISTRY = (
         key => 'segmenttree', dist => 'Data-SegmentTree-Shared',
         class => 'Data::SegmentTree::Shared', path_class => 'indexed', freeze => 0,
         verbs => {
-            get => sub { my ($h, $p) = @_; return $h->sum($p, $p) },
-            set => 'set', incr => 'add',
+            get => sub { my ($h, $p) = @_; _assert_index('segmenttree', $p); return $h->sum($p, $p) },
+            set => _int_verb('segmenttree', 'set'), incr => _int_verb('segmenttree', 'add'),
             # Without the shape check a non-numeric index numified to 0, which
             # is in range, so exists answered true for any member.
             exists => sub { my ($h, $p) = @_; return (defined $p && $p =~ /^-?\d+$/ && $p >= 0 && $p < $h->size) ? 1 : 0 },
-            delete => sub { my ($h, $p) = @_; return $h->set($p, 0) },
+            delete => sub { my ($h, $p) = @_; _assert_index('segmenttree', $p); return $h->set($p, 0) },
         },
     },
     sortedset => {
@@ -294,7 +321,9 @@ our %REGISTRY = (
         },
         verbs => {
             get => 'score', exists => 'exists',
-            set => sub { my ($h, $m, $score) = @_; return $h->add($m, $score) },
+            set => sub { my ($h, $m, $score) = @_;
+                Carp::croak("sortedset set needs a score") if @_ < 3;
+                return $h->add($m, $score) },
             delete => 'remove', incr => 'incr',
         },
     },
