@@ -98,6 +98,10 @@ sub _check_components {
         my $stringify = defined $c && overload::Method($c, '""');
         Carp::croak("path component must be a defined string") unless $stringify;
         my $string = $stringify->($c, undef, '');
+        # A handler handing back another stringifiable object is an ordinary
+        # wrapper, and interpolation resolved that before this check existed. A
+        # plain reference is the unstable address the check is here to refuse.
+        $string = "$string" if ref $string && overload::Method($string, '""');
         Carp::croak("path component must be a defined string")
             if !defined $string || ref $string;
         $c = $string;
@@ -1195,8 +1199,10 @@ the revision before operating on shared storage.
 A mount argument has to be representable in the manifest, since replaying it
 is how every later process reopens the store: C<Inf>, C<NaN> and a lone
 surrogate are refused at mount time rather than published as text nothing can
-parse back. Strings are recorded as bytes, so a backing path keeps naming its
-file whether you pass it as bytes or as characters.
+parse back. Strings are recorded as bytes, so a path spelled as characters
+above Latin-1 names the same file as its UTF-8 byte spelling. A character in
+U+0080..U+00FF is indistinguishable from a Latin-1 byte and names the
+one-byte file.
 
 Version-one manifests without a revision are accepted as revision zero.
 New writers add a revision and a F<.manifest.lock> file; existing backend
@@ -1402,8 +1408,8 @@ rebuilt only when an unfinished mutation marker is found: on opening a
 writable composite, or when a lifecycle lock encounters one. A holder
 that dies mid-section releases the lock either way: the kernel releases
 a file-backed composite's file lock, and an anonymous composite's lock
-is recovered from the dead owner, at the cost of about 8 kB of mapping
-per anonymous composite instance. Unpublished directories may remain and
+is recovered from the dead owner, at the cost of about 20 kB of shared
+mapping per anonymous composite instance. Unpublished directories may remain and
 are retained for explicit recovery: each holds its child's storage, no
 API reports them, and only C<unlink_all> reclaims them, so a long-running
 producer that is killed repeatedly accumulates them until the store is

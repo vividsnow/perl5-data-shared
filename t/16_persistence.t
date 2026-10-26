@@ -176,6 +176,9 @@ subtest 'concurrent manifest writers commit once and reject the stale update' =>
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $go_r, my $go_w or die $!;
+    # PERL_UNICODE puts a :utf8 layer on every new handle, and sysread and
+    # syswrite refuse one, so these barriers died under a smoker that sets it.
+    binmode $_, ':raw' for $ready_r, $ready_w, $go_r, $go_w;
     my @pids;
     for my $name (qw(a b)) {
         my $pid = fork(); die $! unless defined $pid;

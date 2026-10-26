@@ -66,9 +66,14 @@ sub _scalar_snapshot {
         utf8::encode($bytes);
         return $bytes;
     }
-    # Ask the encoder whether this will be written as a number: that depends on
-    # a scalar's flag history, so a string used once in numeric context looks
-    # like a number to a flag test and is still quoted by JSON::PP.
+    # A scalar with no numeric flags at all cannot be written as a number, and
+    # that is the common case -- a path, a key -- so settle it without an
+    # encode. A perfecthash build passes its whole key list through here.
+    my $flags = B::svref_2object(\$value)->FLAGS;
+    return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
+    # Which of the two it writes depends on flag history the caller cannot see,
+    # so ask the encoder rather than the flags: a string used once in numeric
+    # context carries numeric flags and is still quoted.
     my $written = _encoder()->encode($value);
     return $value if $written =~ /\A"/;
     # Inf and NaN are written verbatim, which is not JSON. Refuse while the
@@ -78,11 +83,16 @@ sub _scalar_snapshot {
         if $written =~ /\A-?(?:inf|nan)/i;
     # An exponent means %.15g, which drops the low digits of a whole number
     # that arrived as a float -- 2**50 is one, the same digits typed out are
-    # not -- so it came back short of what the store was built with. Recording
-    # it as an integer is exact.
-    return int($value)
-        if $written =~ /[eE]/ && $value == int($value)
-            && $value >= -9223372036854775808.0 && $value < 9223372036854775808.0;
+    # not -- so it came back short of what the store was built with.
+    if ($written =~ /[eE]/ && $value == int($value)) {
+        # Through the decimal spelling, not int(): int() hands back the same
+        # float at the integer bounds, so the conversion did nothing for
+        # exactly the values it was written for. Re-encoded to confirm, so a
+        # value no integer type holds is left alone rather than changed for
+        # nothing.
+        my $exact = sprintf('%.0f', $value) + 0;
+        return $exact if $exact == $value && _encoder()->encode($exact) !~ /[eE]/;
+    }
     return $value;
 }
 

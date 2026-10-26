@@ -137,6 +137,13 @@ subtest 'an object that stringifies is a usable component' => sub {
     ok !eval { shareda_set($root, ['hs', {}], 'v'); 1 }, 'a plain reference is still refused';
     ok !eval { $root->node('/hs')->node(['x', undef]); 1 },
         'a relative array component is validated too';
+
+    # A handler handing back another stringifiable object is an ordinary
+    # wrapper, and interpolation resolved it before the check existed.
+    my $wrapper = bless {}, 'Data::Shared::Test::Wrapper';
+    is "$wrapper", 'alice', 'the wrapper interpolates to a plain string';
+    ok eval { shareda_set($root, ['hs', $wrapper], 'w'); 1 }, 'and is accepted as a component';
+    is shared_get($root, '/hs/alice'), 'w', 'addressing what it resolves to';
 };
 
 # The leaf's own guard croaks from inside the lifecycle section, which leaves
@@ -158,3 +165,6 @@ done_testing;
 
 package Data::Shared::Test::Stringy;
 use overload q("") => sub { 'alice' }, fallback => 1;
+
+package Data::Shared::Test::Wrapper;
+use overload q("") => sub { bless {}, 'Data::Shared::Test::Stringy' }, fallback => 1;

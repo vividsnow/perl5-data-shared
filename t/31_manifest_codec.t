@@ -120,7 +120,11 @@ subtest 'only a real Inf or NaN is refused, not a string that looks like one' =>
 };
 
 subtest 'a numeric mount argument survives the round trip exactly' => sub {
-    for my $value (2**50, 2**53, 1e15, 1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300) {
+    # The bounds matter most: int() hands back the same float at IV_MIN and
+    # above IV_MAX, so a conversion written with it did nothing for exactly
+    # the values it was written for.
+    for my $value (2**50, 2**53, 2**62, -(2**63), 2**63, 1e15,
+                   1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300) {
         my ($stored) = Data::Shared::Manifest::snapshot($value);
         my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
         my $back = JSON::PP->new->decode($json)->[0];

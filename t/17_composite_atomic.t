@@ -122,6 +122,9 @@ subtest 'concurrent first writers publish one shared child' => sub {
     maps($root);
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $go_r, my $go_w or die $!;
+    # PERL_UNICODE puts a :utf8 layer on every new handle, and sysread and
+    # syswrite refuse one, so these barriers died under a smoker that sets it.
+    binmode $_, ':raw' for $ready_r, $ready_w, $go_r, $go_w;
     my @pids;
     for my $i (1 .. 6) {
         my $pid = fork(); die $! unless defined $pid;
@@ -190,6 +193,7 @@ subtest 'deletion waits for in-progress construction' => sub {
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $release_r, my $release_w or die $!;
     pipe my $deleted_r, my $deleted_w or die $!;
+    binmode $_, ':raw' for $ready_r, $ready_w, $release_r, $release_w, $deleted_r, $deleted_w;
     my $construct = \&Data::Shared::_construct;
     my $creator = fork(); die $! unless defined $creator;
     if (!$creator) {
@@ -244,6 +248,7 @@ subtest 'interrupted creation releases the lock and repairs the live counter' =>
     maps($root, max_children => 1);
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $wait_r, my $wait_w or die $!;
+    binmode $_, ':raw' for $ready_r, $ready_w, $wait_r, $wait_w;
     my $construct = \&Data::Shared::_construct;
     my $pid = fork(); die $! unless defined $pid;
     if (!$pid) {
