@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use Data::Shared qw(shared_push shared_pop shared_call shared_get
-                    shared_compile sharedc_push);
+                    shared_compile sharedc_push sharedc_get);
 
 subtest 'queue Int' => sub {
     my $r = Data::Shared->new;
@@ -99,6 +99,16 @@ subtest 'a queue path takes no key component' => sub {
         ok !eval { shared_pop($root, "/$name/5"); 1 }, "$type refuses a pop with a component"
             if $type ne 'log';
     }
+    # ringbuffer's get is the one verb in the family that does read a
+    # component, so it is the boundary the limit must not cross.
+    if (eval { $root->mount('rb', 'ringbuffer', undef, 64); 1 }) {
+        shared_push($root, '/rb', 11);
+        is shared_get($root, '/rb/0'), 11, 'a ringbuffer get reads its sequence number';
+        is sharedc_get($root, shared_compile('/rb/0')), 11, 'and through a compiled path';
+        ok !eval { shared_get($root, '/rb/0/1'); 1 }, 'but two components are refused';
+        ok !eval { shared_push($root, '/rb/5', 9); 1 }, 'and a keyed push is still refused';
+    }
+
     # The compiled tier resolves its path once, so it must refuse at bind time.
     ok !eval { my $c = shared_compile("/$mounted[0][0]/5"); sharedc_push($root, $c, 42); 1 },
         'the compiled tier refuses it too';
