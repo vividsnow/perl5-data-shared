@@ -32,7 +32,10 @@ sub _abs {
         Carp::croak('a Data::Shared::Node is an absolute cursor, not a relative path')
             if $rel->isa('Data::Shared::Node');
     }
-    return [ @{ $self->{components} }, @$rel ] if ref $rel eq 'ARRAY';
+    # Validated as $root->node([...]) already is, or a cursor built from an
+    # undef or reference component constructed silently and failed on use.
+    return [ @{ $self->{components} }, @{ Data::Shared::_check_components([ @$rel ]) } ]
+        if ref $rel eq 'ARRAY';
     return [ @{ $self->{components} }, @{ Data::Shared::_parse_string_path($rel) } ];
 }
 

@@ -165,7 +165,11 @@ sub new {
         # unmarked counter is already correct. Recounting unconditionally made
         # a cold open O(children) -- and every cache miss on a nested composite
         # is a cold open -- while writing to the index on a pure read path.
-        if (!$self->{readonly} && !$self->{_cleanup} && !$self->frozen
+        # _index_frozen, not frozen: the question here is whether the index can
+        # take the write, not whether the subtree is shippable. A composite
+        # with an unshippable level answers false to the latter, so the guard
+        # did not fire and the write hit the sealed index.
+        if (!$self->{readonly} && !$self->{_cleanup} && !$self->_index_frozen
             && ($index->get('p:') || !defined $index->get('s:'))) {
             $self->_index_put('s:', $self->_count_addresses);
             $self->_index_remove('p:');
@@ -182,7 +186,19 @@ sub _root {
     return $r;
 }
 
+# Both are pure functions of the resolved spec, which is fixed for the life of
+# the instance, and both sit on the address path of every child operation.
 sub _key_is_int {
+    my ($self) = @_;
+    return $self->{_key_is_int} //= _key_is_int_for($self);
+}
+
+sub _key_int_bits {
+    my ($self) = @_;
+    return $self->{_key_int_bits} //= _key_int_bits_for($self);
+}
+
+sub _key_is_int_for {
     my ($self) = @_;
     my $node = $self->{node};
     # kdtree and graph address a child per point/node id, so their keys are
@@ -226,7 +242,7 @@ sub _valid_address {
     return 1;
 }
 
-sub _key_int_bits {
+sub _key_int_bits_for {
     my ($self) = @_;
     # An id-parent keeps no mirror slot, so an id outside the range cannot
     # collide with another address there.
@@ -276,7 +292,7 @@ sub _with_lock {
             # A sealed index can never take the write, and a count is derived
             # from the addresses when it is absent, so rebuilding it there
             # could only croak.
-            if ($self->{index}->get('p:') && !$self->frozen) {
+            if ($self->{index}->get('p:') && !$self->_index_frozen) {
                 $self->_index_put('s:', $self->_count_addresses);
                 $self->_index_remove('p:');
             }
@@ -666,6 +682,10 @@ sub _verb_at_child {
     if ($verb eq 'set' || $verb eq 'incr') {
         Carp::croak("Data::Shared: cannot $verb a composite child of $self->{node}{spec}; $verb a path inside it")
             unless $key eq 'sortedset';
+        # Before the lock: the leaf's own guard croaks from inside the section,
+        # which leaves the interrupted-mutation marker set and costs the next
+        # caller a rebuild, for what is only a missing argument.
+        Carp::croak("sortedset set needs a score") if $verb eq 'set' && !@args;
         return $self->_with_lock(sub {
             my $old_id = $self->_reg_id($addr);
             my $was_parent = $self->_parent_exists($addr);
@@ -936,10 +956,15 @@ sub sync {
     return $n;
 }
 
+sub _index_frozen {
+    my ($self) = @_;
+    return $self->{index} && $self->{index}->can('frozen') && $self->{index}->frozen ? 1 : 0;
+}
+
 # The index is frozen last, so a frozen index means the subtree is sealed.
 sub frozen {
     my ($self) = @_;
-    return 0 unless $self->{index} && $self->{index}->can('frozen') && $self->{index}->frozen;
+    return 0 unless $self->_index_frozen;
     # Sealed is not the same as shippable: a level whose backend cannot be
     # opened read-only is what makes a shipped copy fail at the first read
     # deep enough to open it.

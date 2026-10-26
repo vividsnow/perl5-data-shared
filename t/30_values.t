@@ -105,4 +105,55 @@ subtest 'unlink_all is idempotent and says what happened' => sub {
     like $@, qr/this store was unlinked/, 'and the croak says why, not that a file is missing';
 };
 
+# \d matches non-ASCII digits, which numify to the element they look like, so
+# the first version of this guard was walked straight past. And the shape test
+# must be identical in exists and in its siblings, or one accepts what the
+# other refuses.
+subtest 'the index guard cannot be bypassed and agrees with exists' => sub {
+    my $root = root_with('buf', 'buffer:i64', 16);
+    plan skip_all => 'buffer backend unavailable' unless $root;
+    shared_set($root, '/buf/0', 7);
+    local $SIG{__WARN__} = sub {};
+    for my $bad ("\x{0661}", "7\n", '+3', 'abc') {
+        (my $show = $bad) =~ s/\n/\\n/;
+        $show = sprintf 'U+%04X', ord $bad if $bad =~ /\A[^\x00-\x7f]\z/;
+        ok !eval { shared_set($root, "/buf/$bad", 999); 1 }, "set refuses $show";
+        is shared_exists($root, "/buf/$bad"), 0, "and exists agrees for $show";
+    }
+    is shared_get($root, '/buf/0'), 7, 'element 0 was never touched';
+};
+
+# The string tier accepts the spelling an overloaded object produces, and that
+# address is stable, unlike a plain reference's.
+subtest 'an object that stringifies is a usable component' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    plan skip_all => 'hashmap backend unavailable'
+        unless eval { $root->mount('hs', 'hashmap:ss', undef, 100); 1 };
+    my $obj = bless {}, 'Data::Shared::Test::Stringy';
+    ok eval { shareda_set($root, ['hs', $obj], 'v'); 1 }, 'accepted as a component';
+    is shared_get($root, '/hs/alice'), 'v', 'and addresses what it stringifies to';
+    is $root->node(['hs', $obj])->path, '/hs/alice', 'a cursor built from it too';
+    ok !eval { shareda_set($root, ['hs', {}], 'v'); 1 }, 'a plain reference is still refused';
+    ok !eval { $root->node('/hs')->node(['x', undef]); 1 },
+        'a relative array component is validated too';
+};
+
+# The leaf's own guard croaks from inside the lifecycle section, which leaves
+# the interrupted-mutation marker set and costs the next caller a rebuild.
+subtest 'a missing score is refused before the lock is taken' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    plan skip_all => 'composite backends unavailable'
+        unless eval { $root->mount('b', ['sortedset', 1000, ['hashmap:ss', 8]]); 1 };
+    shared_set($root, '/b/42/k', 1);
+    shared_set($root, '/b/42', 1500);
+    my $index = $root->{mounts}{b}{composite}{index};
+    ok !eval { shared_set($root, '/b/99'); 1 }, 'a valueless score write croaks';
+    is $index->get('p:'), undef, 'and leaves no interrupted-mutation marker';
+    is shared_get($root, '/b/42'), 1500, 'the existing score is intact';
+    is shared_exists($root, '/b/99'), 0, 'and no child was registered';
+};
+
 done_testing;
+
+package Data::Shared::Test::Stringy;
+use overload q("") => sub { 'alice' }, fallback => 1;

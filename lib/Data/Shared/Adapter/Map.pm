@@ -10,13 +10,20 @@ our $VERSION = '0.01';
 our @CARP_NOT = qw(Data::Shared);
 
 sub _key {
-    my ($entry, $rest) = @_;
+    my ($entry, $rest, $verb) = @_;
     Carp::croak("path too short: mount has no key") unless @$rest;
     return join('/', @$rest) if $entry->{key_join};
     # Taking $rest->[0] and dropping the rest addressed a record the path did
     # not name, and coerced a non-numeric leftover on integer-keyed mounts.
     Carp::croak("path too long: $entry->{key} takes one key component")
         if @$rest > 1;
+    # An integer-addressed mount numified a non-integer key to element 0, so a
+    # garbage key read, overwrote or cleared it. Checked here, where a bound
+    # closure resolves its key once, rather than per call. exists is exempt:
+    # it is documented to answer 1 or 0 for any path, and its own verb
+    # already refuses the shape.
+    Data::Shared::Registry::_assert_index($entry->{key}, $rest->[0])
+        if $entry->{key_int} && (!defined $verb || $verb ne 'exists');
     return $rest->[0];
 }
 
@@ -25,7 +32,7 @@ sub make_verb {
     my $spec = $entry->{verbs}{$verb};
     return undef unless defined $spec;
     if (ref $spec eq 'CODE') {
-        return sub { my ($rest, @a) = @_; return $spec->($handle, _key($entry, $rest), @a) };
+        return sub { my ($rest, @a) = @_; return $spec->($handle, _key($entry, $rest, $verb), @a) };
     }
     my $method = $handle->can($spec);
     if (!$method) {
@@ -37,12 +44,12 @@ sub make_verb {
         my $by = $handle->can('incr_by');
         return sub {
             my ($rest, @a) = @_;
-            my $key = _key($entry, $rest);
+            my $key = _key($entry, $rest, $verb);
             return $handle->$by($key, $a[0]) if @a && $by;
             return $handle->$method($key, @a);
         };
     }
-    return sub { my ($rest, @a) = @_; return $handle->$method(_key($entry, $rest), @a) };
+    return sub { my ($rest, @a) = @_; return $handle->$method(_key($entry, $rest, $verb), @a) };
 }
 
 
@@ -50,7 +57,7 @@ sub make_bound {
     my ($class, $verb, $handle, $entry, $rest) = @_;
     my $spec = $entry->{verbs}{$verb};
     return undef unless defined $spec;
-    my $key = _key($entry, $rest);
+    my $key = _key($entry, $rest, $verb);
     if (ref $spec eq 'CODE') {
         return sub { my @a = @_; return $spec->($handle, $key, @a) };
     }

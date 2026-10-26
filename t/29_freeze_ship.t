@@ -101,6 +101,21 @@ subtest 'a sealed index with a pending marker does not break the walk' => sub {
     is shared_get($ro, '/org/a/b/k'), 1, 'and ships';
 };
 
+# The same guard, on a composite that is sealed but NOT shippable. The rebuild
+# must ask whether the index can take a write, which is not the same question
+# as whether the subtree can be shipped read-only.
+subtest 'the rebuild guard does not depend on shippability' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    plan skip_all => 'queue backend unavailable'
+        unless eval { $root->mount('q', ['hashmap:ss', 64, ['queue:int', 8]]); 1 };
+    $root->node('/q/a')->push(42);
+    my $comp = $root->{mounts}{q}{composite};
+    $comp->{index}->put('p:', 1);
+    $comp->{index}->freeze;
+    ok !$comp->frozen, 'the subtree is not shippable, because a level is not';
+    ok defined eval { $root->freeze_all }, 'but freeze_all still completes';
+};
+
 # sync_all is documented as applying to every mount; for a composite that is
 # the whole subtree, not just the children that happen to be open.
 subtest 'sync covers every registered child' => sub {

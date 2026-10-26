@@ -7,6 +7,17 @@ our $VERSION = '0.01';
 
 our @CARP_NOT = qw(Data::Shared);
 
+# Every component of an indexed path is an index. See Adapter::Map::_key for
+# why the check lives with the key handling: a bound closure resolves its
+# indices once, so the compiled tier pays nothing per call.
+sub _check_indices {
+    my ($entry, $rest, $verb) = @_;
+    Carp::croak("path too short: mount has no index") unless @$rest;
+    return unless $entry->{key_int} && (!defined $verb || $verb ne 'exists');
+    Data::Shared::Registry::_assert_index($entry->{key}, $_) for @$rest;
+    return;
+}
+
 sub make_verb {
     my ($class, $verb, $handle, $entry) = @_;
     my $verbs = $entry->{verbs} || {};
@@ -16,7 +27,7 @@ sub make_verb {
     if (ref $spec eq 'CODE') {
         return sub {
             my ($rest, @a) = @_;
-            Carp::croak("path too short: mount has no index") unless @$rest;
+            _check_indices($entry, $rest, $verb);
             return $spec->($handle, @$rest, @a);
         };
     }
@@ -29,13 +40,13 @@ sub make_verb {
     if ($verb eq 'set' || $verb eq 'incr') {
         return sub {
             my ($rest, @a) = @_;
-            Carp::croak("path too short: mount has no index") unless @$rest;
+            _check_indices($entry, $rest, $verb);
             return $handle->$method(@$rest, @a);
         };
     }
     return sub {
         my ($rest, @a) = @_;
-        Carp::croak("path too short: mount has no index") unless @$rest;
+        _check_indices($entry, $rest, $verb);
         return $handle->$method(@$rest);
     };
 }
@@ -47,7 +58,7 @@ sub make_bound {
     return undef unless exists $verbs->{$verb};
     my $spec = $verbs->{$verb};
     return undef unless defined $spec;
-    Carp::croak("path too short: mount has no index") unless @$rest;
+    _check_indices($entry, $rest, $verb);
     my @idx = @$rest;
     if (ref $spec eq 'CODE') {
         return sub { my @a = @_; return $spec->($handle, @idx, @a) };

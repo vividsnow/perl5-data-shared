@@ -9,29 +9,32 @@ our @CARP_NOT = qw(Data::Shared Data::Shared::Adapter::Map
                    Data::Shared::Adapter::Set Data::Shared::Adapter::Indexed
                    Data::Shared::Adapter::Sketch);
 
-# The exists verbs below refuse a non-integer index. Without the same refusal
-# on their siblings, 'abc' numified to 0, so exists reported the address absent
-# while get read element 0 and set or delete overwrote it.
+# One shape test for every integer-addressed entry, used by the exists verbs
+# here and by the adapters' key handling for the rest. Keeping two copies is
+# what let a trailing newline pass one and not the other. [0-9], not \d: \d
+# also matches non-ASCII digits, which numify to the element they look like,
+# so U+0661 walked past an earlier guard and overwrote element 0.
+# One compiled pattern, used directly by both, so neither pays a call for the
+# other and there is still only one definition to keep right.
+my $INDEX_SHAPE = qr/\A-?[0-9]+\z/;
+
+sub _index_shape_ok {
+    return defined $_[0] && $_[0] =~ $INDEX_SHAPE ? 1 : 0;
+}
+
+# Entries flagged key_int get this from the adapter, for every verb but
+# exists, which is documented to answer 1 or 0 for any path.
 sub _assert_index {
     my ($key, $idx) = @_;
     Carp::croak("$key: index must be an integer, not '" . (defined $idx ? $idx : 'undef') . "'")
-        unless defined $idx && $idx =~ /\A-?\d+\z/;
+        unless defined $idx && $idx =~ $INDEX_SHAPE;
     return $idx;
-}
-
-sub _int_verb {
-    my ($key, $method) = @_;
-    return sub {
-        my ($h, $idx, @rest) = @_;
-        _assert_index($key, $idx);
-        return $h->$method($idx, @rest);
-    };
 }
 
 sub _buf_exists {
     return sub {
         my ($h, $idx) = @_;
-        return 0 unless defined $idx && $idx =~ /^-?\d+$/;
+        return 0 unless _index_shape_ok($idx);
         return 0 if $idx < 0;
         return $idx < $h->capacity ? 1 : 0;
     };
@@ -64,13 +67,14 @@ our %REGISTRY = (
     buffer => {
         key => 'buffer', dist => 'Data-Buffer-Shared',
         class => 'Data::Buffer::Shared::I64', path_class => 'map', freeze => 0,
+        key_int => 1,
         variants => { map { $_ => { class => "Data::Buffer::Shared::$_", load => "Data::Buffer::Shared::$_" } }
                       qw(I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Str) },
         verbs => {
-            get => _int_verb('buffer', 'get'), set => _int_verb('buffer', 'set'),
+            get => 'get', set => 'set',
             exists => _buf_exists(),
-            delete => sub { my ($h, $idx) = @_; _assert_index('buffer', $idx); return $h->set($idx, 0) },
-            incr => _int_verb('buffer', 'incr'),
+            delete => sub { my ($h, $idx) = @_; return $h->set($idx, 0) },
+            incr => 'incr',
         },
     },
     countingbloomfilter => {
@@ -118,16 +122,18 @@ our %REGISTRY = (
     disjointset => {
         key => 'disjointset', dist => 'Data-DisjointSet-Shared',
         class => 'Data::DisjointSet::Shared', path_class => 'set', freeze => 0,
+        key_int => 1,
         verbs => {
-            get => _int_verb('disjointset', 'find'),
-            exists => sub { my ($h, $m) = @_; return (defined $m && $m =~ /^-?\d+$/ && $m >= 0 && $m < $h->capacity) ? 1 : 0 },
+            get => 'find',
+            exists => sub { my ($h, $m) = @_;
+                return (_index_shape_ok($m) && $m >= 0 && $m < $h->capacity) ? 1 : 0 },
             # Without the guard a missing second member numified to 0 and
             # unioned the member with element 0. DisjointSet has no split, so
             # that merge is permanent.
             set => sub {
                 my ($h, $m, $other) = @_;
                 Carp::croak("disjointset set needs a second member to union with")
-                    unless defined $other && $other =~ /^-?\d+$/;
+                    unless _index_shape_ok($other);
                 return $h->union($m, $other);
             },
         },
@@ -135,11 +141,12 @@ our %REGISTRY = (
     fenwick => {
         key => 'fenwick', dist => 'Data-Fenwick-Shared',
         class => 'Data::Fenwick::Shared', path_class => 'indexed', freeze => 1,
+        key_int => 1,
         verbs => {
-            get => _int_verb('fenwick', 'point'), set => _int_verb('fenwick', 'set'),
-            incr => _int_verb('fenwick', 'update'),
-            exists => sub { my ($h, $p) = @_; return (defined $p && $p =~ /^-?\d+$/ && $p >= 1 && $p <= $h->size) ? 1 : 0 },
-            delete => sub { my ($h, $p) = @_; _assert_index('fenwick', $p); return $h->set($p, 0) },
+            get => 'point', set => 'set', incr => 'update',
+            exists => sub { my ($h, $p) = @_;
+                return (_index_shape_ok($p) && $p >= 1 && $p <= $h->size) ? 1 : 0 },
+            delete => sub { my ($h, $p) = @_; return $h->set($p, 0) },
         },
     },
     fenwick2d => {
@@ -304,13 +311,15 @@ our %REGISTRY = (
     segmenttree => {
         key => 'segmenttree', dist => 'Data-SegmentTree-Shared',
         class => 'Data::SegmentTree::Shared', path_class => 'indexed', freeze => 0,
+        key_int => 1,
         verbs => {
-            get => sub { my ($h, $p) = @_; _assert_index('segmenttree', $p); return $h->sum($p, $p) },
-            set => _int_verb('segmenttree', 'set'), incr => _int_verb('segmenttree', 'add'),
+            get => sub { my ($h, $p) = @_; return $h->sum($p, $p) },
+            set => 'set', incr => 'add',
             # Without the shape check a non-numeric index numified to 0, which
             # is in range, so exists answered true for any member.
-            exists => sub { my ($h, $p) = @_; return (defined $p && $p =~ /^-?\d+$/ && $p >= 0 && $p < $h->size) ? 1 : 0 },
-            delete => sub { my ($h, $p) = @_; _assert_index('segmenttree', $p); return $h->set($p, 0) },
+            exists => sub { my ($h, $p) = @_;
+                return (_index_shape_ok($p) && $p >= 0 && $p < $h->size) ? 1 : 0 },
+            delete => sub { my ($h, $p) = @_; return $h->set($p, 0) },
         },
     },
     sortedset => {

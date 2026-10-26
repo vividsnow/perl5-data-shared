@@ -10,6 +10,7 @@ our @CARP_NOT = qw(Data::Shared Data::Shared::Manifest Data::Shared::Storage
                    Data::Shared::Composite);
 
 use Carp ();
+use overload ();
 use JSON::PP ();
 use Scalar::Util qw(blessed refaddr weaken);
 use parent 'Exporter';
@@ -77,24 +78,21 @@ sub _parse_array_path {
     my ($aref) = @_;
     Carp::croak("array path must be an ARRAY reference")
         unless ref $aref eq 'ARRAY';
-    # Checked inline rather than through _check_components: this is the hot
-    # entry point and the extra call cost about as much as the check.
-    for my $c (@$aref) {
-        Carp::croak("path component must be a defined string")
-            if !defined $c || ref $c;
-    }
-    return [ @$aref ];
+    return _check_components([ @$aref ]);
 }
 
 # The string tier refuses an undef or reference path outright. An array
 # component got through unchecked, so undef addressed the empty-string key and
 # a reference addressed its own stringified address -- a different key every
-# run -- both reported as a successful write.
+# run -- both reported as a successful write. An object that overloads
+# stringification does have a stable address, and the string tier accepts the
+# same spelling, so it is allowed.
 sub _check_components {
     my ($components) = @_;
     for my $c (@$components) {
+        next if defined $c && !ref $c;
         Carp::croak("path component must be a defined string")
-            if !defined $c || ref $c;
+            if !defined $c || !overload::Method($c, '""');
     }
     return $components;
 }
@@ -576,10 +574,12 @@ sub _check_storage_paths {
 }
 
 # abs_path lstats every component, and the collision check walks every
-# installed path for every new one, so mount and open were quadratic in
-# syscalls. Cached for one manifest operation only: held longer, a symlink
-# retargeted between two mounts hid a real collision, and the store then
-# failed to reopen because replay resolves afresh.
+# installed path for every new one. Cached for one manifest operation only:
+# held longer, a symlink retargeted between two mounts hid a real collision,
+# and the store then failed to reopen because replay resolves afresh. So a
+# replay resolves each path once, while mounting one at a time still re-resolves
+# the installed ones -- accepted, since republishing the manifest dominates
+# that path anyway (see the mount-count note under PERFORMANCE).
 sub _abs_path {
     my ($self, $path) = @_;
     my $hit = $self->{_abs_cache}{$path};
@@ -969,9 +969,10 @@ sub unlink_all {
             if ($handle->can('unlink')) { $handle->unlink; $n++ }
         }
         if ($published && defined $self->{dir}) {
-            CORE::unlink($self->manifest_path) or $!{ENOENT}
-                or Carp::croak("Data::Shared: cannot unlink manifest: $!");
-            $n++;
+            if (CORE::unlink($self->manifest_path)) { $n++ }
+            # Counting it regardless credited a manifest this call did not
+            # remove.
+            elsif (!$!{ENOENT}) { Carp::croak("Data::Shared: cannot unlink manifest: $!") }
         }
         $self->{mounts} = {};
         $self->{order} = [];
@@ -1263,8 +1264,9 @@ accepted by the HashMap and SortedSet families and fatal in RadixTree,
 Intern and the filter family. An integer-addressed leaf numifies a
 non-integer key, so C<'abc'> addresses element 0: C<buffer>, C<fenwick>,
 C<segmenttree> and C<disjointset> refuse it, but C<bitset>,
-C<roaringbitmap>, C<pool>, C<ndarray>, C<graph> and the integer
-C<hashmap> variants write to element 0 (with a warning under C<-w>).
+C<roaringbitmap>, C<pool>, C<ndarray>, C<graph>, C<fenwick2d>,
+C<ringbuffer>'s C<get> and the integer C<hashmap> variants read or write
+element 0 (with a warning under C<-w>).
 
 =head2 shared_call($root, $path, $method, @args)
 
@@ -1382,7 +1384,10 @@ writable composite, or when a lifecycle lock encounters one. A holder
 that dies mid-section releases the lock either way: the kernel releases
 a file-backed composite's file lock, and an anonymous composite's lock
 is recovered from the dead owner. Unpublished directories may remain and
-are retained for explicit recovery. A preexisting unpublished directory for
+are retained for explicit recovery: each holds its child's storage, no
+API reports them, and only C<unlink_all> reclaims them, so a long-running
+producer that is killed repeatedly accumulates them until the store is
+torn down. A preexisting unpublished directory for
 a reserved child is reported as an error. This provides exception rollback
 and limited interruption recovery, without promising power-loss transactions
 or automatic orphan cleanup.
