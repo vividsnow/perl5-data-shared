@@ -106,6 +106,18 @@ subtest 'three levels: hashmap of kdtree of hashmap' => sub {
     is shared_get($r, '/atlas/europe/42/name'), undef, 'mid subtree delete clears deep';
 };
 
+# A flat mount croaks at mount time when its backend is missing. A composite
+# required the child class only at the first deep write, so it mounted,
+# published and reopened, and then failed in every process that wrote to it.
+subtest 'a composite checks its child backend at mount time' => sub {
+    my $r = Data::Shared->new(tempdir(CLEANUP => 1));
+    ok !eval { $r->mount('c', ['hashmap:ss', 64, ['Data::Shared::NoSuchBackend', 8]]); 1 },
+        'an unloadable child class is refused at mount';
+    is_deeply [$r->mounts], [], 'and nothing is published';
+    ok !eval { $r->mount('f', 'Data::Shared::NoSuchBackend', undef, 8); 1 },
+        'as a flat mount already was';
+};
+
 subtest 'invalid composite parents rejected' => sub {
     my $r = Data::Shared->new;
     ok !eval { $r->mount('bad1', ['bloomfilter', 1000, 0.01, ['hashmap:ss', 100]]); 1 }, 'bloom parent croaks';

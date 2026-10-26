@@ -96,12 +96,14 @@ subtest 'a retargeted symlink cannot hide a collision' => sub {
     my $dir = tempdir(CLEANUP => 1);
     mkdir "$dir/real1"; mkdir "$dir/real2";
     plan skip_all => 'no symlinks here' unless eval { symlink "$dir/real1", "$dir/link" };
+    # The check under test is _check_storage_paths, which needs no backend, so
+    # this must not depend on a recommended leaf being installed.
     my $root = Data::Shared->new("$dir/store");
-    $root->mount('a', 'hashmap:ii', "$dir/link/x.shm", 16);
-    $root->mount('c', 'hashmap:ii', "$dir/real1/other.shm", 16);
+    $root->mount('a', 'Data::Shared::TestHandle', "$dir/link/x.shm", 16);
+    $root->mount('c', 'Data::Shared::TestHandle', "$dir/real1/other.shm", 16);
     unlink "$dir/link";
     symlink "$dir/real2", "$dir/link" or die "symlink: $!";
-    ok !eval { $root->mount('b', 'hashmap:ii', "$dir/real2/x.shm", 16); 1 },
+    ok !eval { $root->mount('b', 'Data::Shared::TestHandle', "$dir/real2/x.shm", 16); 1 },
         'the collision is still caught after the retarget';
     like $@, qr/backing path.*already used/, 'and explains itself';
     is scalar(keys %{ $root->{_abs_cache} || {} }), 0, 'no resolved paths outlive the operation';

@@ -102,12 +102,13 @@ sub construct_node {
 
 sub _preflight {
     my ($root, $node, $dir, $opening) = @_;
-    if ($root->{strict_readonly}) {
-        my $current = $node;
-        while ($current) {
-            Data::Shared::Storage::check_readonly($current->{resolved});
-            $current = $current->{child};
-        }
+    # Every level, as a flat mount does. The child class used to be required
+    # only at the first deep write, so a composite whose child backend was
+    # absent, or below its minimum version, mounted and published and reopened
+    # without complaint and then failed in every process that wrote to it.
+    for (my $current = $node; $current; $current = $current->{child}) {
+        Data::Shared::Storage::_load($current->{resolved});
+        Data::Shared::Storage::check_readonly($current->{resolved}) if $root->{strict_readonly};
     }
     return unless $opening;
     Carp::croak("Data::Shared: missing composite directory '" . ($dir // '') . "'") unless defined $dir && -d $dir;
@@ -150,9 +151,13 @@ sub new {
         File::Path::make_path($self->{dir});
     }
     $self->_with_lock(sub {
+        # sealed_ok comes from _open_child, so a nested child composite reopened
+        # after a freeze tolerates its sealed files. A top-level mount is never
+        # given it, which is what keeps a writable reopen of a frozen root
+        # refused rather than half-opened.
         my %mode = (opening => $o{opening}, strict_readonly => $self->{strict_readonly},
             pending_paths => $o{pending_paths}, cleanup => $self->{_cleanup},
-            frozen_ok => $self->{_frozen_ok});
+            frozen_ok => ($self->{_frozen_ok} || $o{sealed_ok}) ? 1 : 0);
         my ($parent) = construct_node($self->{dir}, $self->{readonly}, $node->{resolved}, 'parent', $node->{args}, \%mode);
         $self->{parent_handle} = $parent;
         $self->{parent_record} = { handle => $parent, entry => $node->{resolved}{entry}, dt => {} };
@@ -543,15 +548,23 @@ sub _open_child {
             File::Path::make_path($dir);
         }
     }
+    # Reopening an existing child means its file may have been sealed, and a
+    # sealed file refuses the writable constructor: a read through the sealing
+    # root croaked for every child that had fallen out of the cache, and which
+    # ones those were depended on the cache's state when freeze_all ran.
+    # Separate from frozen_ok, which also keeps a walk's transient instances
+    # out of the cache.
     my %mode = (opening => $opening, strict_readonly => $self->{strict_readonly},
-        pending_paths => $pending, cleanup => $cleanup, frozen_ok => $self->{_frozen_ok});
+        pending_paths => $pending, cleanup => $cleanup, frozen_ok => $self->{_frozen_ok},
+        sealed_ok => $opening ? 1 : 0);
     my $rt;
     if ($node->{child}) {
         my $comp = Data::Shared::Composite->new(root => $root, name => $addr, node => $node, dir => $dir,
             path => [ @{ $self->{path} }, $addr ], readonly => $self->{readonly}, %mode);
         $rt = { kind => 'composite', comp => $comp, id => $id, addr => $addr };
     } else {
-        my ($handle) = construct_node($dir, $self->{readonly}, $node->{resolved}, 'child', $node->{args}, \%mode);
+        my ($handle) = construct_node($dir, $self->{readonly}, $node->{resolved}, 'child', $node->{args},
+            { %mode, frozen_ok => $mode{frozen_ok} || $mode{sealed_ok} });
         my $record = { name => $addr, handle => $handle, entry => $node->{resolved}{entry}
             || { key => $node->{resolved}{class}, dist => 'unknown', path_class => 'map', verbs => {} }, dt => {} };
         $rt = { kind => 'leaf', record => $record, handle => $handle, id => $id, addr => $addr };

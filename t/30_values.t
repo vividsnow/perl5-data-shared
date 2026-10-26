@@ -101,6 +101,7 @@ subtest 'unlink_all is idempotent and says what happened' => sub {
     is $root->unlink_all, 0, 'and stays idempotent';
     ok !-e "$dir/manifest.json", 'manifest gone';
     ok !-e "$dir/a.shm", 'backing file gone';
+    ok !-d "$dir/.children", 'and the composite directory with it';
     ok !eval { $root->mount('z', 'hashmap:ii', undef, 16); 1 }, 'the root is not reusable';
     like $@, qr/this store was unlinked/, 'and the croak says why, not that a file is missing';
 };

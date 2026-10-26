@@ -980,6 +980,10 @@ sub unlink_all {
             # remove.
             elsif (!$!{ENOENT}) { Carp::croak("Data::Shared: cannot unlink manifest: $!") }
         }
+        # Ours and empty once every composite is gone. The lock file stays: a
+        # process still holding it would keep an fd to a deleted file while the
+        # next one created a fresh lock, and the two would not serialise.
+        rmdir "$self->{dir}/.children" if defined $self->{dir};
         $self->{mounts} = {};
         $self->{order} = [];
         $self->{_nested} = 0;
@@ -1210,7 +1214,10 @@ not. C<freeze_all> returns the number of handles it sealed, so 0 is a
 success: either everything was already sealed, or no mount can be.
 C<frozen> tells those apart, and is what a producer should assert
 before shipping the directory. A mounted native handle is sealed with
-the rest, so the caller's own object becomes read-only.
+the rest, so the caller's own object becomes read-only. C<unlink_all>
+removes the mounts and the manifest but leaves F<.manifest.lock>, which
+another process may still be holding, so the directory is not empty
+afterwards.
 
 =head1 PATH FORMAT
 

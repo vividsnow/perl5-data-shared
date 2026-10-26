@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
-use Data::Shared qw(shared_get shared_set);
+use Data::Shared qw(shared_get shared_set shared_exists);
 
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
 eval { $probe->mount('p', ['hashmap:ss', 64, ['hashmap:ss', 8], { max_children => 64 }]); 1 }
@@ -38,6 +38,29 @@ subtest 'a child frozen directly does not block the walk' => sub {
     undef $root;
     my $ro = Data::Shared->open_readonly($dir);
     is shared_get($ro, '/users/u1/k'), 1, 'shipped store reads the frozen child';
+};
+
+# Sealing does not stop the producer reading its own store. A child that had
+# fallen out of the open-child cache was reopened with the writable
+# constructor, which a sealed file refuses, so a read croaked -- and which
+# children did depended on what the cache happened to hold when freeze_all ran.
+subtest 'the sealing root can still read every child' => sub {
+    my ($root) = store(children => 5, opts => { cache_size => 2 });
+    $root->freeze_all;
+    for my $i (1 .. 5) {
+        is shared_get($root, "/users/u$i/k"), 1, "u$i reads after sealing";
+        is shared_exists($root, "/users/u$i/k"), 1, "u$i exists answers 1, not a croak";
+    }
+    # And the contract that keeps this scoped to children.
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $producer = Data::Shared->new($dir);
+        $producer->mount('u', ['hashmap:ss', 64, ['hashmap:ss', 8]]);
+        shared_set($producer, '/u/a/k', 1);
+        $producer->freeze_all;
+    }
+    ok !eval { Data::Shared->open($dir); 1 }, 'a writable reopen of a sealed store is still refused';
+    ok eval { Data::Shared->open_readonly($dir); 1 }, 'and a read-only one works';
 };
 
 subtest 'frozen reports whether the store can be shipped' => sub {

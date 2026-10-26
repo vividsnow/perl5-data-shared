@@ -60,6 +60,9 @@ WriteMakefile(
             'Data::Shared::Composite' => { file => 'lib/Data/Shared/Composite.pm', version => $version },
             'Data::Shared::Manifest' => { file => 'lib/Data/Shared/Manifest.pm', version => $version },
             'Data::Shared::Storage' => { file => 'lib/Data/Shared/Storage.pm', version => $version },
+            map { ("Data::Shared::Adapter::$_" =>
+                   { file => "lib/Data/Shared/Adapter/$_.pm", version => $version }) }
+                qw(Indexed Map Queue Set Sketch Sync),
         },
     },
     clean => { FILES => 'MANIFEST.bak' },
