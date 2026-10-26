@@ -42,6 +42,9 @@ sub snapshot {
     return (\%copy, $serializable);
 }
 
+my $ENCODER;
+sub _encoder { return $ENCODER ||= JSON::PP->new->allow_nonref(1) }
+
 # The manifest is a codec, and JSON is total over neither of these. Both the
 # backend constructor and the manifest see what this returns, so a path
 # recorded here is the one the file was created under.
@@ -63,18 +66,22 @@ sub _scalar_snapshot {
         utf8::encode($bytes);
         return $bytes;
     }
-    my $flags = B::svref_2object(\$value)->FLAGS;
-    return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
+    # Ask the encoder whether this will be written as a number: that depends on
+    # a scalar's flag history, so a string used once in numeric context looks
+    # like a number to a flag test and is still quoted by JSON::PP.
+    my $written = _encoder()->encode($value);
+    return $value if $written =~ /\A"/;
     # Inf and NaN are written verbatim, which is not JSON. Refuse while the
     # caller is still there to be told, rather than publishing a manifest that
     # kills the store at the next topology change.
     Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
-        if $value =~ /\A-?(?:inf|nan)/i;
-    # A float is written with %.15g, so a whole number that arrived as one --
-    # 2**50 is a float, the same digits typed out are not -- came back short of
-    # what the store was built with. Recording it as an integer is exact.
+        if $written =~ /\A-?(?:inf|nan)/i;
+    # An exponent means %.15g, which drops the low digits of a whole number
+    # that arrived as a float -- 2**50 is one, the same digits typed out are
+    # not -- so it came back short of what the store was built with. Recording
+    # it as an integer is exact.
     return int($value)
-        if !($flags & B::SVp_IOK) && $value == int($value)
+        if $written =~ /[eE]/ && $value == int($value)
             && $value >= -9223372036854775808.0 && $value < 9223372036854775808.0;
     return $value;
 }

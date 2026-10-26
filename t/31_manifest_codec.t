@@ -100,6 +100,25 @@ subtest 'a float argument does not fake a stale revision' => sub {
 # A float is written with %.15g, so a whole number that arrived as a float --
 # 2**50 is one, the same digits typed out are not -- was replayed several short
 # of the value the store was built with.
+# Whether a scalar is written as a number depends on flag history the caller
+# cannot see: a string used once in numeric context carries numeric flags and
+# is still quoted, so a flag test refused a legitimate string argument.
+subtest 'only a real Inf or NaN is refused, not a string that looks like one' => sub {
+    my $looks_numeric = 'inf';
+    my $forced = $looks_numeric + 0;
+    my ($kept) = Data::Shared::Manifest::snapshot($looks_numeric);
+    is $kept, 'inf', 'a string used numerically is kept as a string';
+    for my $label ('nan', 'NaN.shm', 'Infinity.shm', '-inf') {
+        my ($keep) = Data::Shared::Manifest::snapshot($label);
+        is $keep, $label, "the string '$label' is kept";
+    }
+    my $real_inf = 'Inf' + 0;
+    my $stringified = "$real_inf";
+    ok !eval { Data::Shared::Manifest::snapshot($real_inf); 1 },
+        'a real Inf is refused even after being stringified';
+    ok !eval { Data::Shared::Manifest::snapshot('NaN' + 0); 1 }, 'and a real NaN';
+};
+
 subtest 'a numeric mount argument survives the round trip exactly' => sub {
     for my $value (2**50, 2**53, 1e15, 1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300) {
         my ($stored) = Data::Shared::Manifest::snapshot($value);
