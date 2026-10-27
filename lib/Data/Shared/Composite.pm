@@ -175,6 +175,13 @@ sub new {
         my ($index) = Data::Shared::_construct_with($self->{dir}, $self->{readonly},
             _index_spec(), 'index', _index_args($node), \%mode);
         $self->{index} = $index;
+        # Which index file this object is attached to. The deletion marker
+        # below lives IN the index, so a process holding an old mapping reads
+        # its own copy and learns nothing; and a destroy on a frozen index
+        # cannot write the marker at all. The file's identity is the one thing
+        # that still distinguishes incarnations from outside the mapping.
+        @{$self}{qw(_index_dev _index_ino)} = (stat _index_file($self))[0, 1]
+            if defined $self->{dir};
         Carp::croak('Data::Shared: composite instance was deleted') if $index->get('x:') && !$self->{_cleanup};
         # Only after an interrupted mutation: 's:' is maintained inside every
         # mutating lock section and 'p:' marks one that did not finish, so an
@@ -208,6 +215,23 @@ sub new {
         }
     }, undef, $o{opening} ? 1 : 0);   # reopening tolerates an unwritable lock; creating does not
     return $self;
+}
+
+sub _index_file { my ($self) = @_; return "$self->{dir}/index.shm" }
+
+# A store torn down and recreated at the same directory allocates child ids
+# from zero again, so child-0 of the new incarnation sits where child-0 of the
+# old one did. A process still holding the old index read its own registrations
+# as valid, reopened that directory, and then served the NEW store's data for
+# addresses that do not exist in it -- and wrote into it. The marker in the
+# index cannot catch this: the stale process reads its own copy, and a destroy
+# on a frozen index never got to write one.
+sub _index_replaced {
+    my ($self) = @_;
+    return 0 unless defined $self->{dir} && defined $self->{_index_ino};
+    my ($dev, $ino) = (stat _index_file($self))[0, 1];
+    return 0 unless defined $ino;       # gone, not replaced: the marker's job
+    return ($dev == $self->{_index_dev} && $ino == $self->{_index_ino}) ? 0 : 1;
 }
 
 sub _chain_signature {
@@ -341,7 +365,8 @@ sub _with_lock {
     my (@ret, $ret);
     my $ok = eval {
         if ($self->{index}) {
-            Carp::croak('Data::Shared: composite instance was deleted') if $self->{index}->get('x:') && !$self->{_cleanup};
+            Carp::croak('Data::Shared: composite instance was deleted')
+                if !$self->{_cleanup} && ($self->{index}->get('x:') || $self->_index_replaced);
             # A sealed index can never take the write, and a count is derived
             # from the addresses when it is absent, so rebuilding it there
             # could only croak.

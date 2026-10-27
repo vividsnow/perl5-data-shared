@@ -27,10 +27,24 @@ jobs:
         env:
           DS_ALL_BACKENDS: 1
 
-  # Deliberately without --with-recommends: this is the no-backend install that
-  # cpanm gives by default, where most of the suite skips. It proves the dist
-  # installs and tests clean there, not that the code is covered -- with no
-  # backends the composite runtime runs barely at all.
+  # The no-backend install `cpanm Data::Shared` gives by default, on the
+  # platform the rest of the matrix uses. test-alpine covers the same contract
+  # on musl, but it is a container job whose runner-injected node is a known
+  # failure mode there, and this contract is too load-bearing to be covered
+  # only by the job most likely not to start. 268 of the 483 tests run here.
+  test-no-backends:
+    runs-on: ubuntu-latest
+    name: no backends (default install)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+      - run: cpanm -n --installdeps .
+      - run: perl Makefile.PL && make test
+
+  # The same contract on musl, which this family's alignment and atomics care
+  # about. Deliberately without --with-recommends.
   test-alpine:
     runs-on: ubuntu-latest
     container: alpine:latest

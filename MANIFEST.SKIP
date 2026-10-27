@@ -4,6 +4,7 @@
 (^|/)blib/
 ^pm_to_blib$
 ^\.git/
+^\.pcg/
 ^REVIEW\.md$
 ^Data-Shared-.*\.tar\.gz$
 ^Data-Shared-\d

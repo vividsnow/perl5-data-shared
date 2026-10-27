@@ -14,10 +14,18 @@ subtest 'native readonly backend rejects writes through every entry point' => su
     $root->freeze_all;
     my $ro = Data::Shared->open_readonly($root->dir, strict => 1);
     is $ro->get('/map/key'), 'saved', 'strict read works';
+    # Each croak is matched, not merely counted: a bare ok !eval passes on an
+    # arity error from the backend just as well as on the guard, so removing
+    # the guard while the test passed wrong arguments would stay green.
     ok !eval { $ro->call('/map', 'put', 'bad', 'value'); 1 }, 'native mutator rejected';
-    ok !eval { sharedc_call($ro, shared_compile('/map'), 'put', 'bad', 'value'); 1 }, 'compiled native mutator rejected';
+    like $@, qr/read-only|frozen/, 'by the read-only guard';
+    ok !eval { sharedc_call($ro, shared_compile('/map'), 'put', 'bad', 'value'); 1 },
+        'compiled native mutator rejected';
+    like $@, qr/read-only|frozen/, 'by the same guard on the compiled tier';
     ok !eval { $ro->handle('/map')->put('bad', 'value'); 1 }, 'raw native handle rejects data writes';
+    like $@, qr/read-only|frozen/, 'at the backend, which is sealed';
     ok !eval { $ro->call('/map', 'unlink'); 1 }, 'native lifecycle escape blocked';
+    like $@, qr/read-only|frozen/, 'by the lifecycle guard';
     ok -f $root->dir . '/map.shm', 'file retained';
 };
 

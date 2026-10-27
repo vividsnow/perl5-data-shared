@@ -113,9 +113,11 @@ subtest 'a composite checks its child backend at mount time' => sub {
     my $r = Data::Shared->new(tempdir(CLEANUP => 1));
     ok !eval { $r->mount('c', ['hashmap:ss', 64, ['Data::Shared::NoSuchBackend', 8]]); 1 },
         'an unloadable child class is refused at mount';
+    like $@, qr/NoSuchBackend is not available/, 'naming the class it could not load';
     is_deeply [$r->mounts], [], 'and nothing is published';
     ok !eval { $r->mount('f', 'Data::Shared::NoSuchBackend', undef, 8); 1 },
         'as a flat mount already was';
+    like $@, qr/NoSuchBackend is not available/, 'with the same message';
 };
 
 subtest 'invalid composite parents rejected' => sub {
@@ -123,9 +125,13 @@ subtest 'invalid composite parents rejected' => sub {
     ok !eval { $r->mount('bad1', ['bloomfilter', 1000, 0.01, ['hashmap:ss', 100]]); 1 }, 'bloom parent croaks';
     like $@, qr/cannot be a composite parent/, 'bloom parent error';
     ok !eval { $r->mount('bad2', ['queue:int', 100, ['hashmap:ss', 100]]); 1 }, 'queue parent croaks';
+    like $@, qr/cannot be a composite parent/, 'queue parent error';
     ok !eval { $r->mount('bad3', ['hashmap:ss', 100, ['nosuchthing', 100]]); 1 }, 'unknown child croaks';
+    like $@, qr/unknown mount spec/, 'unknown child error';
     ok !eval { $r->mount('bad4', ['hashmap:ss', 100, ['bloomfilter', 1000, 0.01], { max_children => 0 }]); 1 }, 'max_children 0 croaks on write or mount';
+    like $@, qr/max_children must be an integer/, 'max_children error';
     ok !eval { $r->children('/users'); 1 }, 'children on missing mount croaks';
+    like $@, qr/no mount matches path/, 'missing mount error';
     my $r2 = Data::Shared->new;
     SKIP: {
         my $handle = eval { $r2->mount('plain', 'hashmap:ii', undef, 100) };

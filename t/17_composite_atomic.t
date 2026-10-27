@@ -232,7 +232,12 @@ subtest 'deletion waits for in-progress construction' => sub {
     close $deleted_w;
     my $readable = '';
     vec($readable, fileno($deleted_r), 1) = 1;
-    is select($readable, undef, undef, 0.1), 0, 'deletion has not completed while constructor holds the lock';
+    # Generous on purpose: this asserts the ABSENCE of a completion, so the
+    # window has to be long enough that a deleter which ignored the lock would
+    # certainly have finished within it. At 0.1s a loaded box gave the same
+    # answer whether or not the lock was taken.
+    is select($readable, undef, undef, 2), 0,
+        'deletion has not completed while constructor holds the lock';
     syswrite($release_w, 'g') == 1 or die $!;
     close $release_w;
     for my $pid ($creator, $deleter) { waitpid $pid, 0; is $?, 0, 'coordinated process succeeded' }
@@ -344,6 +349,44 @@ subtest 'frozen composite storage can be unlinked by its producer' => sub {
     ok $root->unlink_all >= 1, 'producer unlinked frozen root';
     ok !-e $root->dir . '/manifest.json', 'manifest removed';
     ok !-d $root->dir . '/.children/users', 'frozen composite directory removed';
+};
+
+# A store recreated at the same directory allocates child ids from zero again,
+# so the old incarnation's child-0 path belongs to the new one. The deletion
+# marker cannot catch a process that still holds the old index -- it reads its
+# own copy -- and a destroy on a frozen index never writes one at all. Without
+# the identity check this stale read returned the NEW store's data and the
+# write landed in it.
+subtest 'a stale composite cannot attach to a recreated store' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $spec = { spec => 'hashmap:ss', args => [100],
+                 child => { spec => 'hashmap:ss', args => [100] }, cache_size => 1 };
+    {
+        my $maker = Data::Shared->new($dir);
+        eval { $maker->mount('users', $spec); 1 } or plan skip_all => "composite unavailable: $@";
+        $maker->set('/users/alice/k', 'alice-original');
+        $maker->set('/users/carol/k', 'carol-original');
+    }
+    my $stale = Data::Shared->open($dir);
+    is $stale->get('/users/alice/k'), 'alice-original', 'the worker reads the original store';
+    is $stale->get('/users/carol/k'), 'carol-original', 'and evicts the first child';
+
+    {   # the documented producer sequence, then a fresh store at the same path
+        my $coord = Data::Shared->open($dir);
+        $coord->freeze_all;
+        $coord->unlink_all;
+        my $fresh = Data::Shared->new($dir);
+        $fresh->mount('users', $spec);
+        $fresh->set('/users/dave/k', 'dave-new-store');
+    }
+
+    ok !eval { $stale->get('/users/alice/k'); 1 }, 'the stale worker is refused, not served';
+    like $@, qr/composite instance was deleted/, 'and told why';
+    ok !eval { $stale->set('/users/alice/k', 'from-stale'); 1 }, 'and cannot write either';
+
+    my $check = Data::Shared->open($dir);
+    is $check->get('/users/dave/k'), 'dave-new-store', "the new store's data is untouched";
+    is_deeply [$check->children('/users')], ['dave'], 'and it has only its own child';
 };
 
 done_testing;

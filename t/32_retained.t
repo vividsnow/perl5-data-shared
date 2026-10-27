@@ -70,6 +70,9 @@ subtest 'a transient mount does not publish a revision' => sub {
     my $root = Data::Shared->new($dir);
     $root->mount('shared', 'hashmap:ii', undef, 100);
     my $revision = $root->{_revision};
+    # Without this the assertions below compare undef with undef, which passes,
+    # so the whole subtest would survive the counter being renamed away.
+    ok defined $revision, 'the revision counter exists';
     my $before = do { open my $f, '<', "$dir/manifest.json" or die $!; local $/; <$f> };
 
     my $handle = Data::HashMap::Shared::II->new(undef, 16);
@@ -189,31 +192,38 @@ subtest 'storage shared with another mount is not unlinked' => sub {
 subtest 'storage is removed while the topology lock is held' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my $stamp = "$dir/removed-at";
+    # A barrier, not a sleep: the child is released the moment the removal
+    # BEGINS, which is the moment the lock is either held or already gone. A
+    # sleep on either side proved nothing -- late scheduling made the ordering
+    # come out right whether or not the lock was held.
+    pipe my $entered_r, my $entered_w or die "pipe: $!";
     my $root = Data::Shared->new($dir);
     $root->mount('keep', 'hashmap:ii', undef, 16);
-    $root->mount('scratch', SlowUnlink->new($stamp));
+    $root->mount('scratch', SlowUnlink->new($stamp, $entered_w));
 
     my $pid = fork;
     plan skip_all => 'cannot fork' unless defined $pid;
     unless ($pid) {
-        select undef, undef, undef, 0.2;        # land inside the removal
+        close $entered_w;
+        my $go = <$entered_r>;                  # the removal has started
         my $other = eval { Data::Shared->open($dir) };
         $other->mount('sibling', 'hashmap:ii', undef, 16) if $other;
         if (open my $fh, '>', "$dir/locked-at") {
             print $fh Time::HiRes::time();
             close $fh;
         }
-        POSIX::_exit(0);
+        POSIX::_exit(defined $go && $go =~ /removing/ ? 0 : 1);
     }
+    close $entered_r;
     $root->unmount('scratch', unlink => 1);
     waitpid $pid, 0;
+    is $?, 0, 'the child was released by the removal, not by a timer';
 
-    my $removed = -e $stamp ? do { open my $f, '<', $stamp; local $/; <$f> } : undef;
-    my $locked = -e "$dir/locked-at" ? do { open my $f, '<', "$dir/locked-at"; local $/; <$f> } : undef;
-    ok defined $removed && length $removed, 'the removal ran';
-    ok defined $locked && length $locked, 'the sibling changed topology';
-    cmp_ok $locked, '>', $removed, 'only after the storage was gone'
-        if defined $removed && defined $locked && length $removed && length $locked;
+    my $removed = -e $stamp ? do { open my $f, '<', $stamp; local $/; <$f> } : '';
+    my $locked = -e "$dir/locked-at" ? do { open my $f, '<', "$dir/locked-at"; local $/; <$f> } : '';
+    ok length $removed, 'the removal ran';
+    ok length $locked, 'the sibling changed topology';
+    cmp_ok $locked, '>', $removed, 'only after the storage was gone';
 };
 
 # The ledger is published and read by another process, so a root opened as a
@@ -232,7 +242,13 @@ subtest 'retained paths are recorded absolute' => sub {
     }
     my $manifest = do { open my $fh, '<', "$base/state/manifest.json" or die $!; local $/; <$fh> };
     chdir $elsewhere or die $!;
-    like $manifest, qr{"retained"\s*:\s*\[\s*"/}, 'the ledger holds an absolute path';
+    # The requirement is that an entry does not depend on the working
+    # directory of whoever reads it, which an entry relative to the root
+    # satisfies and one relative to the caller does not.
+    my ($entry) = $manifest =~ /"retained"\s*:\s*\[\s*"([^"]+)"/;
+    ok defined $entry, 'the ledger records the retained storage';
+    my $resolved = (defined $entry && $entry =~ m{\A/}) ? $entry : "$base/state/" . ($entry // '');
+    ok -e $resolved, 'and it resolves against the root, not the caller';
     # The next process opens it by absolute path from a different directory: a
     # relative entry resolved against this cwd instead, removing whatever sat
     # there and leaving the store's own storage behind.
@@ -281,13 +297,61 @@ subtest 'a failed retained cleanup can be retried' => sub {
     ok !-e "$hold/ext.shm", 'and the storage is gone';
 };
 
+# Recorded absolute, tearing down an archived copy of a store removed whatever
+# now sat at the path it had been created under -- a live root's storage -- and
+# left its own behind.
+subtest 'an archived root reclaims its own storage, not its successor' => sub {
+    my $base = tempdir(CLEANUP => 1);
+    my $live = "$base/state";
+    {
+        my $old = Data::Shared->new($live);
+        $old->mount('cache', 'hashmap:ii', undef, 64);
+        shared_set($old, '/cache/1', 1);
+        $old->unmount('cache');
+    }
+    rename $live, "$base/state.old" or die "rename: $!";
+    my $new = Data::Shared->new($live);
+    $new->mount('cache', 'hashmap:ii', undef, 64);
+    shared_set($new, '/cache/1', 42);
+
+    Data::Shared->open("$base/state.old")->unlink_all;
+    ok -e "$live/cache.shm", "the live root's storage is untouched";
+    ok !-e "$base/state.old/cache.shm", "the archived root's own storage is gone";
+    is shared_get($new, '/cache/1'), 42, 'the live root still reads';
+    undef $new;
+    ok eval { Data::Shared->open($live) }, 'and still opens' or diag $@;
+};
+
+# A composite records its whole directory and its children's files live below
+# it, so an equality test on storage paths let a mounted child handle unlink a
+# file the parent index still named.
+subtest 'a mounted composite child handle cannot unlink its storage' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+    shared_set($root, '/users/alice/1', 42);
+    my $child = $root->handle('/users/alice');
+    ok $child, 'the documented child handle';
+    $root->mount('alias', $child);
+    ok !eval { $root->unmount('alias', unlink => 1); 1 }, 'retiring it with unlink is refused';
+    like $@, qr/shares its storage with 'users'/, 'naming the composite that owns it';
+    ok $root->exists('/users/alice'), 'the child is still registered';
+    undef $root; undef $child;
+    my $re = Data::Shared->open($dir);
+    is $re->get('/users/alice/1'), 42, 'and another process can still read it';
+};
+
 done_testing;
 
 package SlowUnlink;
-sub new { my ($class, $stamp) = @_; return bless { stamp => $stamp }, $class }
+sub new {
+    my ($class, $stamp, $signal) = @_;
+    return bless { stamp => $stamp, signal => $signal }, $class;
+}
 sub unlink {
     my ($self) = @_;
-    select undef, undef, undef, 0.6;
+    syswrite $self->{signal}, "removing\n";     # releases the sibling
+    select undef, undef, undef, 0.6;            # a window, not a synchroniser
     open my $fh, '>', $self->{stamp} or die $!;
     print $fh Time::HiRes::time();
     close $fh or die $!;

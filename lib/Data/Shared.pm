@@ -883,10 +883,10 @@ sub _install_recipe {
     $self->{_changed} = 1;
     $self->{_published} = 1 unless $recipe->{transient};
     # A mount adopting retained storage owns it again, so the manifest must
-    # stop offering it to unlink_all as loose storage. Matched absolute, as the
-    # ledger records them.
+    # stop offering it to unlink_all as loose storage. Matched in the same form
+    # the ledger records.
     if (@{ $self->{_retained} } && @{ $recipe->{storage_paths} }) {
-        my %adopted = map { $_ => 1 } map { $self->_abs_path($_) } @{ $recipe->{storage_paths} };
+        my %adopted = map { $_ => 1 } map { $self->_ledger_form($_) } @{ $recipe->{storage_paths} };
         my $before = @{ $self->{_retained} };
         @{ $self->{_retained} } = grep { !$adopted{$_} } @{ $self->{_retained} };
         $self->{_published} = 1 if @{ $self->{_retained} } != $before;
@@ -951,17 +951,30 @@ sub _check_unlinkable {
     my $handle = $mount->{handle};
     return unless blessed($handle);
     my $addr = refaddr($handle);
-    my %mine = map { $_ => 1 } _storage_of($mount);
+    # Canonicalised, as _check_storage_paths compares them, because two
+    # spellings of one file are one file; and by containment, because a
+    # composite records its whole directory while its children's files live
+    # below it, so a mounted child handle passed an equality test.
+    my @mine = map { $self->_abs_path($_) } _storage_of($mount);
     for my $other (@{ $self->{order} }) {
         next if $other eq $name;
         my $sibling = $self->{mounts}{$other};
         my $shared = blessed($sibling->{handle}) && refaddr($sibling->{handle}) == $addr;
-        $shared ||= grep { $mine{$_} } _storage_of($sibling);
+        unless ($shared) {
+            my @theirs = map { $self->_abs_path($_) } _storage_of($sibling);
+            $shared = grep { my $m = $_; grep { _covers($m, $_) || _covers($_, $m) } @theirs } @mine;
+        }
         next unless $shared;
         Carp::croak("Data::Shared: mount '$name' shares its storage with '$other';"
             . " unmount '$other' as well, or unmount '$name' without unlink");
     }
     return;
+}
+
+sub _covers {
+    my ($outer, $inner) = @_;
+    return 1 if $outer eq $inner;
+    return index($inner, "$outer/") == 0 ? 1 : 0;
 }
 
 # A transient mount records no storage paths, because the caller built the
@@ -997,15 +1010,31 @@ sub _retire_storage {
 # Deduplicated, because a mount rotated under one name retains the same path
 # every cycle: the duplicates grew the manifest and the root without bound and
 # made unlink_all report a removal per cycle instead of per file.
+# Storage inside the root is recorded relative to it, and anything outside it
+# absolutely. Absolute throughout, a directory that was renamed or archived
+# cleaned up whatever now sat at the path it had been created under -- another
+# live root's storage -- and left its own behind. Relative to the caller's
+# working directory instead, the next process resolved it against its own.
+sub _ledger_form {
+    my ($self, $path) = @_;
+    my $abs = $self->_abs_path($path);
+    return $abs unless defined $self->{dir} && length $self->{dir};
+    my $dir = $self->_abs_path($self->{dir});
+    return $abs unless defined $dir && length $dir && index($abs, "$dir/") == 0;
+    return substr $abs, length($dir) + 1;
+}
+
+sub _ledger_resolve {
+    my ($self, $entry) = @_;
+    return $entry if $entry =~ m{\A/};
+    return defined $self->{dir} ? "$self->{dir}/$entry" : $entry;
+}
+
 sub _record_retained {
     my ($self, $paths) = @_;
     return unless $paths && @$paths;
-    # Absolute, because this list is published and read back by another
-    # process: a root opened as a relative path recorded a relative one, which
-    # the next process resolved against its own working directory and removed
-    # whatever happened to sit there.
     my %have = map { $_ => 1 } @{ $self->{_retained} };
-    my @new = grep { !$have{$_}++ } map { $self->_abs_path($_) } @$paths;
+    my @new = grep { !$have{$_}++ } map { $self->_ledger_form($_) } @$paths;
     return unless @new;
     push @{ $self->{_retained} }, @new;
     $self->{_published} = 1;
@@ -1148,8 +1177,18 @@ sub unlink_all {
         # Insertion order, not hash order: the last iteration over mounts that
         # left a partial failure's surviving set up to the hash seed.
         for my $name (@{ $self->{order} }) {
-            my $handle = $self->{mounts}{$name}{handle};
-            if ($handle->can('unlink')) { $handle->unlink; $n++ }
+            my $mount = $self->{mounts}{$name};
+            my $handle = $mount->{handle};
+            next unless $handle->can('unlink');
+            # Counted by what left the filesystem, because the leaves cannot
+            # say: unlink returns undef on success in the bitset, queue and
+            # stack families and the handle itself in the bloom, roaring and
+            # radix ones. Counting the attempt credited a second process's
+            # teardown with removals the first one had already made.
+            my @paths = grep { length } @{ $mount->{storage_paths} || [] };
+            my $before = grep { -e } @paths;
+            $handle->unlink;
+            $n += @paths ? $before - grep { -e } @paths : 1;
         }
         if ($published && defined $self->{dir}) {
             if (CORE::unlink($self->manifest_path)) { $n++ }
@@ -1163,10 +1202,11 @@ sub unlink_all {
         # for a retry: deleting the list first left paths nothing could name.
         if (@{ $self->{_retained} }) {
             my %seen;
-            my @paths = grep { !$seen{$_}++ } @{ $self->{_retained} };
-            my $existed = grep { -e } @paths;
-            my $failed = _cleanup_paths(\@paths);
-            my @left = grep { -e } @paths;
+            my @entries = grep { !$seen{$_}++ } @{ $self->{_retained} };
+            my %path = map { $_ => $self->_ledger_resolve($_) } @entries;
+            my $existed = grep { -e $path{$_} } @entries;
+            my $failed = _cleanup_paths([ map { $path{$_} } @entries ]);
+            my @left = grep { -e $path{$_} } @entries;
             $n += $existed - @left;
             @{ $self->{_retained} } = @left;
             Carp::croak("Data::Shared: $failed") if length $failed;

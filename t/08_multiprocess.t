@@ -48,7 +48,15 @@ ok !exists { map { $_ => 1 } $reopened->mounts }->{temp}, 'temp not replayed';
 # deeper access must fail. It used to fail naming the internal node role.
 {
     my $anon = Data::Shared->new;
-    if (eval { $anon->mount('users', ['hashmap:ss', undef, 100, ['hashmap:ss', undef, 100]]); 1 }) {
+    # A bare `if (eval { mount })` ran zero tests and said nothing when the
+    # mount failed, so the names below read as coverage that was not there.
+    my $mounted = eval { $anon->mount('users', ['hashmap:ss', undef, 100, ['hashmap:ss', undef, 100]]); 1 };
+    my $why = $@;
+    note 'anonymous composite unavailable, fork checks skipped: ' . $why
+        if !$mounted && $why =~ /is not available; install the|Can't locate \S+\.pm/;
+    fail "mounting an anonymous composite failed: $why"
+        if !$mounted && $why !~ /is not available; install the|Can't locate \S+\.pm/;
+    if ($mounted) {
         shared_set($anon, '/users/alice/name', 'from-parent');
         my $kid = fork();
         if (defined $kid) {
@@ -75,7 +83,13 @@ ok !exists { map { $_ => 1 } $reopened->mounts }->{temp}, 'temp not replayed';
 # regression would hang the suite instead of failing it.
 {
     my $anon = Data::Shared->new;
-    if (eval { $anon->mount('u', ['hashmap:ss', undef, 100, ['hashmap:ss', undef, 8]]); 1 }) {
+    my $mounted = eval { $anon->mount('u', ['hashmap:ss', undef, 100, ['hashmap:ss', undef, 8]]); 1 };
+    my $why = $@;
+    note 'anonymous composite unavailable, dead-holder check skipped: ' . $why
+        if !$mounted && $why =~ /is not available; install the|Can't locate \S+\.pm/;
+    fail "mounting an anonymous composite failed: $why"
+        if !$mounted && $why !~ /is not available; install the|Can't locate \S+\.pm/;
+    if ($mounted) {
         shared_set($anon, '/u/alice/k', 'a');
         my $holder = fork();
         if (defined $holder) {

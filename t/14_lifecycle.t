@@ -141,6 +141,9 @@ subtest 'full class names use the declared loader and constructor' => sub {
 # runs in a child with a bounded wait -- a regression must fail, not hang.
 {
     my $kid = fork();
+    # A failed fork used to leave this block with no assertions at all, so the
+    # suite reported the re-entrancy guard as covered either way.
+    fail 'cannot fork to test the nested-mutation guard' unless defined $kid;
     if (defined $kid) {
         if ($kid == 0) {
             # _exit skips File::Temp's cleanup, so this one is removed by hand.

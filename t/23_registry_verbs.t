@@ -1,5 +1,19 @@
 use strict; use warnings; use Test::More;
 use Data::Shared qw(shared_get shared_set shared_exists shared_incr shared_call);
+
+# A mount that fails because its dist is absent is a skip; one that fails for
+# any other reason is the regression this file exists to catch. `next unless
+# eval { mount }` swallowed both the same way, so a broken mount produced no
+# tests for that backend and the suite stayed green.
+sub mounted {
+    my ($root, $name, @spec) = @_;
+    return 1 if eval { $root->mount($name, @spec); 1 };
+    my $err = $@;
+    return 0 if $err =~ /is not available; install the|Can't locate \S+\.pm/;
+    fail "mounting '$spec[0]' failed for a reason other than a missing backend";
+    diag $err;
+    return 0;
+}
 my $root = Data::Shared->new;
 eval { $root->mount('ds', 'disjointset', undef, 100); 1 }
     or plan skip_all => "backend unavailable: $@";
@@ -21,7 +35,7 @@ subtest 'exists is bounded for every integer leaf' => sub {
                     fenwick => [64], segmenttree => [64], disjointset => [64]);
     for my $key (sort keys %capacity) {
         my $r = Data::Shared->new;
-        next unless eval { $r->mount('x', $key, undef, @{ $capacity{$key} }); 1 };
+        next unless mounted($r, 'x', $key, undef, @{ $capacity{$key} });
         my $cap = $capacity{$key}[0];
         for my $idx (0, $cap, $cap + 1_000_000) {
             my $got = eval { shared_exists($r, "/x/$idx") };
@@ -43,7 +57,7 @@ subtest 'every indexed leaf refuses a non-integer index' => sub {
     for my $case (@cases) {
         my ($key, $args, $dims, $verb) = @$case;
         my $r = Data::Shared->new;
-        next unless eval { $r->mount('x', $key, undef, @$args); 1 };
+        next unless mounted($r, 'x', $key, undef, @$args);
         $tested++;
         my $call = $verb eq 'set' ? sub { shared_set($r, $_[0], 7) } : sub { shared_get($r, $_[0]) };
         my @warnings;
@@ -53,11 +67,21 @@ subtest 'every indexed leaf refuses a non-integer index' => sub {
         like $@, qr/index must be an integer/, "$key: by the index guard";
         is scalar @warnings, 0, "$key: and does not warn its way through"
             or diag join '', @warnings;
-        # An ordinary index reaches the backend: it may still fail there (graph
-        # has no node 1 yet), but never on the shape of the index.
+        # An ordinary index must work, not merely get past the guard: asserting
+        # only that the guard did not fire let a backend that had stopped
+        # accepting ordinary indices pass just as well.
         my $ok = '/x/' . join('/', (1) x $dims);
-        eval { $call->($ok); 1 };
-        unlike $@, qr/index must be an integer/, "$key: an ordinary index passes the guard";
+        my $went = eval { $call->($ok); 1 };
+        my $err = $@;
+        if ($key eq 'graph') {
+            # graph's get is the one case with nothing to read yet, so here the
+            # backend is expected to object -- but about the node, not the index.
+            ok !$went, 'graph: reading a node that was never added fails';
+            like $err, qr/does not exist/, 'graph: at the backend, not the guard';
+        }
+        else {
+            ok $went, "$key: an ordinary index works" or diag $err;
+        }
     }
     plan skip_all => 'no indexed backend available' unless $tested;
 };
@@ -70,7 +94,7 @@ subtest 'sortedset incr requires a delta' => sub {
     for my $spec ('sortedset', 'sortedset:strings') {
         my $r = Data::Shared->new;
         my @args = $spec eq 'sortedset' ? (undef, 100) : ({ max => 100 });
-        next unless eval { $r->mount('s', $spec, @args); 1 };
+        next unless mounted($r, 's', $spec, @args);
         $tested++;
         my $member = $spec eq 'sortedset' ? 1 : 'a';
         shared_set($r, "/s/$member", 10);
@@ -93,11 +117,14 @@ subtest 'pool incr works with and without a delta' => sub {
     my $tested = 0;
     for my $variant (qw(i64 i32 f64 str)) {
         my $r = Data::Shared->new;
-        next unless eval { $r->mount('p', "pool:$variant", undef, 100, 8); 1 };
+        next unless mounted($r, 'p', "pool:$variant", undef, 100, 8);
         $tested++;
         my $slot = shared_call($r, '/p', 'alloc');
         my $handle = $r->handle('/p');
-        next unless eval { shared_set($r, "/p/$slot", 10); 1 };
+        # Asserted, not skipped past: a set that stopped working took the incr
+        # checks for that variant with it and left the suite green.
+        ok eval { shared_set($r, "/p/$slot", 10); 1 }, "pool:$variant: the fixture writes"
+            or do { diag $@; next };
         if ($handle->can('incr')) {
             my $bare = eval { shared_incr($r, "/p/$slot"); 1 };
             ok $bare, "pool:$variant: a bare incr works" or diag $@;

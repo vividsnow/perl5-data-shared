@@ -57,7 +57,13 @@ subtest 'registry retains both records for every budgeted child' => sub {
     is scalar(@children), 128, 'all children registered';
     is_deeply [map { $root->get("/users/$_/name") } 1 .. 128],
         [map { "name$_" } 1 .. 128], 'no construction markers lost before budget';
-    cmp_ok $root->stats->{users}{open}, '<=', 1, 'file-backed cache stays bounded';
+    # undef numifies to 0, so cmp_ok alone passed if stats ever stopped
+    # reporting the counter at all -- the one thing that would hide an
+    # unbounded cache.
+    my $open = $root->stats->{users}{open};
+    ok defined $open, 'the open-child counter is reported';
+    cmp_ok $open, '<=', 1, 'file-backed cache stays bounded';
+    cmp_ok $open, '>=', 1, 'and the counter is live, not absent';
     ok !eval { $root->set('/users/129/name', 'extra'); 1 }, 'budget enforced';
     like $@, qr/child limit exceeded/, 'budget error';
     my $again = Data::Shared->open($root->dir);

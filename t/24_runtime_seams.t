@@ -33,13 +33,25 @@ is ref($@) && $@->{code}, 42, 'its payload is intact';
 SKIP: {
     my $dir = tempdir(CLEANUP => 1);
     my $app = Data::Shared->new($dir);
-    eval { $app->mount('u', ['hashmap:ii', 64, ['hashmap:ss', 16]]); 1 }
-        or skip 'composite backends unavailable', 4;
+    unless (eval { $app->mount('u', ['hashmap:ii', 64, ['hashmap:ss', 16]]); 1 }) {
+        # Only a missing backend is a skip. Any other mount failure is the
+        # regression these four tests exist to catch, and skipping on it made
+        # them vanish silently.
+        my $err = $@;
+        skip 'composite backends unavailable', 7
+            if $err =~ /is not available; install the|Can't locate \S+\.pm/;
+        fail "mounting the composite failed: $err";
+        last SKIP;
+    }
     shared_set($app, '/u/7/name', 'seven');
     for my $addr ('007', '-0', "7\n") {
         my $shown = $addr; $shown =~ s/\n/\\n/;
         ok !eval { shared_set($app, "/u/$addr/name", 'twin'); 1 },
             "non-canonical int address rejected: '$shown'";
+        # Without this any croak passed, including one from a typo in the path
+        # this test builds for itself.
+        like $@, qr/canonical|composite address/,
+            "'$shown' refused for its spelling, not by accident";
     }
     is_deeply [$app->children('/u')], ['7'], 'only the canonical child exists';
 }

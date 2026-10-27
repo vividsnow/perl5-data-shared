@@ -3,10 +3,16 @@ use warnings;
 use ExtUtils::MakeMaker;
 use Config;
 use lib 'lib';
-use Data::Shared::Registry ();
 
+# MIN_PERL_VERSION below is metadata: ExtUtils::MakeMaker only warns when the
+# running perl is older and writes the Makefile anyway, so a smoker on an
+# older perl got through configure and reported FAIL for syntax it could not
+# parse, where this reports NA. Gated before this dist's own modules load,
+# which is why the line below is a require and not a use.
+if ($] < 5.022) { print "Perl 5.22 or later required\n"; exit 0 }
 unless ($^O eq 'linux') { print "OS unsupported: requires Linux\n"; exit 0 }
 if ($Config{ivsize} < 8) { print "OS unsupported: requires 64-bit Perl\n"; exit 0 }
+require Data::Shared::Registry;
 
 my $version = MM->parse_version('lib/Data/Shared.pm');
 my %backends = map {
