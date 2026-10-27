@@ -88,7 +88,13 @@ subtest 'a queue path takes no key component' => sub {
     for my $spec (['queue', 'queue:int', 1024], ['stack', 'stack:int', 1024],
                   ['heap', 'heap', 1024], ['log', 'log', 1024]) {
         my ($name, $type, @args) = @$spec;
-        next unless eval { $root->mount($name, $type, undef, @args); 1 };
+        unless (eval { $root->mount($name, $type, undef, @args); 1 }) {
+            # One survivor used to satisfy the skip below, so the path limit
+            # could break for three of the four families with nothing failing.
+            fail "mounting '$type' failed: $@"
+                unless $@ =~ /is not available; install the|Can't locate \S+\.pm/;
+            next;
+        }
         push @mounted, [$name, $type];
     }
     plan skip_all => 'no queue-family backend available' unless @mounted;
@@ -116,8 +122,13 @@ subtest 'a queue path takes no key component' => sub {
     }
 
     # The compiled tier resolves its path once, so it must refuse at bind time.
-    ok !eval { my $c = shared_compile("/$mounted[0][0]/5"); sharedc_push($root, $c, 42); 1 },
-        'the compiled tier refuses it too';
+    # Split: one eval around both calls passed when the refusal came from the
+    # push instead, which is the regression this is here to catch.
+    my $compiled = shared_compile("/$mounted[0][0]/5");
+    ok $compiled, 'compiling an over-long queue path is allowed';
+    ok !eval { sharedc_push($root, $compiled, 42); 1 },
+        'the compiled tier refuses it at bind time';
+    like $@, qr/\Qpath too long\E/, 'with the same reason as the string tier';
 
     # A composite child address is not a remainder: it is consumed by the
     # composite before the leaf ever sees it. This is the guard against the

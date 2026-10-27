@@ -9,7 +9,12 @@ use Data::Shared qw(shared_get shared_set shared_exists shared_delete shared_inc
 sub root_with {
     my ($name, $spec, @args) = @_;
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    return eval { $root->mount($name, $spec, undef, @args); $root };
+    my $made = eval { $root->mount($name, $spec, undef, @args); $root };
+    # Only a missing dist is a reason to go on without the mount. Returning
+    # undef for every failure let callers report `pass "$spec unavailable"`,
+    # so the regression a subtest was written for scored as a pass.
+    die $@ if !$made && $@ !~ /is not available; install the|Can't locate \S+\.pm/;
+    return $made;
 }
 
 # A verb that consumes a value treated "no value" as a false value, so the
@@ -25,7 +30,7 @@ subtest 'a valueless set is refused, not taken as false' => sub {
     for my $case (@cases) {
         my ($spec, $args, $path, $value, $what) = @$case;
         my $root = root_with('m', $spec, @$args);
-        unless ($root) { pass "$spec unavailable"; next }
+        unless ($root) { note "$spec unavailable, not covered here"; next }
         shared_set($root, $path, $value);
         ok !eval { shared_set($root, $path); 1 }, "$spec set with no value croaks";
         like $@, qr/needs a (?:value|score)/, "and says a $what is needed";
@@ -158,6 +163,7 @@ subtest 'an object that stringifies is a usable component' => sub {
     # A cycle makes perl recurse until it dies, so a regression here would
     # take the test file down with it: run it where that cannot happen.
     my $pid = fork;
+    fail "cannot fork to test cycle refusal: $!" unless defined $pid;
     if (defined $pid) {
         if ($pid == 0) {
             my $ok = eval {

@@ -61,7 +61,9 @@ sub pop    { my ($s, $rel, @a) = @_; return Data::Shared::shareda_pop($s->{root}
 
 sub call {
     my ($self, $method, @args) = @_;
-    Carp::croak("node call requires a method name") unless defined $method;
+    # length too: an empty string passed this guard and the croak the caller
+    # then saw named a function they had not called.
+    Carp::croak("node call requires a method name") unless defined $method && length $method;
     return Data::Shared::shareda_call($self->{root}, $self->_abs(undef), $method, @args);
 }
 

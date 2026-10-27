@@ -18,7 +18,18 @@ subtest 'bloomfilter' => sub {
 subtest 'counting bloom and cuckoo delete' => sub {
     my $r = Data::Shared->new;
     my $ok1 = eval { $r->mount('cbf', 'countingbloomfilter', undef, 10000, 0.01); 1 };
+    my $why1 = $@;
     my $ok2 = eval { $r->mount('cf', 'cuckoofilter', undef, 10000); 1 };
+    my $why2 = $@;
+    # Each branch is the only coverage for its backend, so a mount that fails
+    # for any reason other than a missing dist has to say so: wrapped in a bare
+    # `if` it ran zero assertions and the subtest still passed.
+    for my $probe ([$ok1, $why1, 'countingbloomfilter'], [$ok2, $why2, 'cuckoofilter']) {
+        my ($ok, $why, $what) = @$probe;
+        next if $ok;
+        fail "$what mount failed: $why"
+            if $why !~ /is not available; install the|Can't locate \S+\.pm/;
+    }
     if (!$ok1 && !$ok2) { plan skip_all => "backends unavailable"; return }
     if ($ok1) {
         shared_set($r, '/cbf/x', 1); shared_set($r, '/cbf/x', 1);

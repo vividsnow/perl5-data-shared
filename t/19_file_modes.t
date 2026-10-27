@@ -24,15 +24,20 @@ sub mode_of {
     return $st[2] & 07777;
 }
 
-is mode_of($dir) & 077, 0, 'root directory is not group- or world-accessible'
-    or diag sprintf('directory mode is %04o', mode_of($dir));
+# A path that does not exist used to satisfy every check here: mode_of returns
+# undef and `undef & 077` is 0, so absence read as owner-only -- on the one
+# assertion in this file that is about security.
+sub is_owner_only {
+    my ($path, $label) = @_;
+    my $mode = mode_of($path);
+    ok defined $mode, "$label exists" or return;
+    is $mode & 077, 0, "$label is owner-only"
+        or diag sprintf('%s mode is %04o', $label, $mode);
+}
 
-ok -e "$dir/.manifest.lock", 'manifest lock exists';
-is mode_of("$dir/.manifest.lock") & 077, 0, 'manifest lock is owner-only'
-    or diag sprintf('lock mode is %04o', mode_of("$dir/.manifest.lock"));
-
-is mode_of("$dir/manifest.json") & 077, 0, 'manifest is owner-only'
-    or diag sprintf('manifest mode is %04o', mode_of("$dir/manifest.json"));
+is_owner_only($dir, 'root directory');
+is_owner_only("$dir/.manifest.lock", 'manifest lock');
+is_owner_only("$dir/manifest.json", 'manifest');
 
 # The root must still work normally after the tightening.
 Data::Shared::shared_set($root, '/cache/7', 42);
@@ -63,8 +68,7 @@ is Data::Shared::shared_get($reopened, '/cache/7'), 42, 'reopen still works';
     ok $ok, 'a composite mounts and writes under umask 0' or diag $why;
     if ($ok) {
         for my $path ('.children', '.children/u', '.children/u/.lock') {
-            is mode_of("$cdir/$path") & 077, 0, "$path is owner-only under umask 0"
-                or diag sprintf('%s is %04o', $path, mode_of("$cdir/$path"));
+            is_owner_only("$cdir/$path", "$path under umask 0");
         }
         # And a lock nobody can write must not make the store unopenable: a
         # section that only reads needs no write access to it. Where perl
@@ -88,7 +92,8 @@ is Data::Shared::shared_get($reopened, '/cache/7'), 42, 'reopen still works';
             chmod 0600, "$cdir/.children/u/.lock";
         }
         else {
-            ok 1, 'skipped: this perl cannot lock a read-only descriptor';
+            # Not `ok 1`: a tautology counted the uncovered platform as a pass.
+            note 'this perl cannot lock a read-only descriptor; that case is not covered here';
         }
     }
 }

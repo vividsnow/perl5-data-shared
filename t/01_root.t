@@ -28,7 +28,14 @@ subtest 'nested mounts longest prefix' => sub {
     is shared_get($r, '/cache/sessions/1'), 99, 'longest prefix wins';
     is $r->handle('/cache/sessions'), $h2, 'handle exact mount';
     ok !eval { $r->handle('/cache/sessions/1'); 1 }, 'handle with extra components croaks';
-    is_deeply [$r->mounts], ['cache', 'cache/sessions'], 'mounts listed sorted';
+    # Mounted out of order on purpose: with only cache and cache/sessions the
+    # insertion order already equals the sorted order, so the claim held for
+    # an implementation that sorted nothing.
+    eval { $r->mount('alpha', 'hashmap:ii', undef, 16); 1 }
+        or plan skip_all => "hashmap unavailable: $@";
+    is_deeply [$r->mounts], ['alpha', 'cache', 'cache/sessions'],
+        'mounts listed sorted, not in insertion order';
+    ok $r->unmount('alpha'), 'and the extra mount goes away again';
     my $info = $r->mount_info('cache');
     is $info->{key}, 'hashmap', 'mount_info key';
     is $info->{class}, 'Data::HashMap::Shared::II', 'mount_info class';

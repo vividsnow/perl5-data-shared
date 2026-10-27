@@ -258,9 +258,13 @@ sub _dispatch_pushpop {
 sub _dispatch_call {
     my ($root, $components, $method, @args) = @_;
     _check_root($root);
-    Carp::croak("shared_call requires a method name") unless defined $method && length $method;
+    # Named for the operation, not for one spelling of it: the array, compiled
+    # and cursor tiers share this path, and each told its caller about
+    # shared_call, which is not the function they had called.
+    Carp::croak("Data::Shared: a call requires a method name")
+        unless defined $method && length $method;
     _check_native_call($root, $method);
-    Carp::croak("shared_call path must name a mount") unless @$components;
+    Carp::croak("Data::Shared: a call path must name a mount") unless @$components;
     my ($name, $mount, $rest) = _resolve($root, $components);
     # Retiring a mount's storage retires the mount with it: removing the files
     # while the manifest still named them left a store that no later new,
@@ -503,7 +507,7 @@ sub sharedc_call {
     my ($r, $cp, $m, @a) = @_;
     _check_root($r);
     _check_compiled($cp);
-    Carp::croak("shared_call requires a method name") unless defined $m && length $m;
+    Carp::croak("Data::Shared: a call requires a method name") unless defined $m && length $m;
     _check_native_call($r, $m);
     # As the string tier does: the manifest must stop naming storage that is
     # being removed, or no process can open the store again.
@@ -947,6 +951,10 @@ sub unmount {
 # unlink a file the manifest still named.
 sub _check_unlinkable {
     my ($self, $name) = @_;
+    # A cache of its own: this runs before _mutate localizes the real one, so
+    # resolving a retiring mount's paths here left an entry per retired path in
+    # the root for its lifetime, growing without bound as a rotation ran.
+    local $self->{_abs_cache} = {};
     my $mount = $self->{mounts}{$name} or return;
     my $handle = $mount->{handle};
     return unless blessed($handle);
@@ -1027,7 +1035,15 @@ sub _ledger_form {
 sub _ledger_resolve {
     my ($self, $entry) = @_;
     return $entry if $entry =~ m{\A/};
-    return defined $self->{dir} ? "$self->{dir}/$entry" : $entry;
+    return $entry unless defined $self->{dir};
+    # Both halves as bytes. Cwd gives back bytes, so an entry recorded from a
+    # root whose directory the caller held as characters was concatenated with
+    # a character string: perl upgraded the entry's bytes and the result named
+    # a file that does not exist, so unlink_all skipped the storage and then
+    # dropped its own record of it.
+    my $dir = $self->{dir};
+    utf8::encode($dir) if utf8::is_utf8($dir);
+    return "$dir/$entry";
 }
 
 sub _record_retained {

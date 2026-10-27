@@ -69,9 +69,12 @@ check_adapter('Data::Shared::Adapter::Queue', { key => 'mock', verbs => { get =>
 for my $a (qw(Map Set Indexed Queue Sketch Sync)) {
     my $adapter = "Data::Shared::Adapter::$a";
     my $entry = { key => 'mock', verbs => {} };
-    ok !$adapter->make_verb('get', MockHandle->new, $entry), "$a unknown verb undef";
+    # !defined, not !: the contract is undef, and a 0 or an empty string would
+    # have satisfied a bare negation while meaning something else.
+    ok !defined $adapter->make_verb('get', MockHandle->new, $entry), "$a unknown verb undef";
     ok !eval { $adapter->perform('get', MockHandle->new, $entry, ['k']); 1 }, "$a perform unknown croaks";
-    ok !$adapter->make_bound('get', MockHandle->new, $entry, ['k']), "$a unknown bound undef";
+    like $@, qr/not supported|no method|does not support/, "$a perform says the verb is unsupported";
+    ok !defined $adapter->make_bound('get', MockHandle->new, $entry, ['k']), "$a unknown bound undef";
 }
 
 {

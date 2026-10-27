@@ -3,6 +3,19 @@ use warnings;
 use Test::More;
 use Data::Shared qw(shared_get shared_set shared_exists shared_call);
 
+# Where two backends each get their own `if` branch, that branch is the only
+# coverage for it, so a mount that failed for any reason other than a missing
+# dist has to say so: in a bare `if` the branch ran zero assertions and the
+# subtest passed on the other backend alone.
+sub mounted_or_fail {
+    my ($root, $name, @spec) = @_;
+    return 1 if eval { $root->mount($name, @spec); 1 };
+    my $err = $@;
+    fail "mounting '$spec[0]' failed: $err"
+        unless $err =~ /is not available; install the|Can't locate \S+\.pm/;
+    return 0;
+}
+
 subtest 'hyperloglog call only' => sub {
     my $r = Data::Shared->new;
     eval { $r->mount('visitors', 'hyperloglog', undef, 14) };
@@ -24,6 +37,10 @@ subtest 'countminsketch keyed verbs' => sub {
     shared_set($r, '/freq/bob');
     cmp_ok shared_get($r, '/freq/alice'), '>=', 5, 'estimate at least true';
     ok shared_exists($r, '/freq/alice'), 'exists';
+    # The valueless write was never read back, so dropping the key or storing
+    # zero would have passed as long as the call did not die.
+    cmp_ok shared_get($r, '/freq/bob'), '>=', 1, 'a valueless set counts one';
+    ok shared_exists($r, '/freq/bob'), 'and the key is there';
 };
 
 subtest 'topk keyed verbs' => sub {
@@ -39,8 +56,8 @@ subtest 'topk keyed verbs' => sub {
 
 subtest 'ddsketch and histogram call only' => sub {
     my $r = Data::Shared->new;
-    my $ok1 = eval { $r->mount('dd', 'ddsketch', undef, 0.01); 1 };
-    my $ok2 = eval { $r->mount('hist', 'histogram', undef, 1, 3600000000, 3); 1 };
+    my $ok1 = mounted_or_fail($r, 'dd', 'ddsketch', undef, 0.01);
+    my $ok2 = mounted_or_fail($r, 'hist', 'histogram', undef, 1, 3600000000, 3);
     if (!$ok1 && !$ok2) { plan skip_all => "backends unavailable"; return }
     if ($ok1) {
         shared_call($r, '/dd', 'add', $_) for (10, 20, 30);
@@ -54,8 +71,8 @@ subtest 'ddsketch and histogram call only' => sub {
 
 subtest 'minhash and reservoir call only' => sub {
     my $r = Data::Shared->new;
-    my $ok1 = eval { $r->mount('mh', 'minhash', undef, 256); 1 };
-    my $ok2 = eval { $r->mount('rsv', 'reservoir', undef, 100); 1 };
+    my $ok1 = mounted_or_fail($r, 'mh', 'minhash', undef, 256);
+    my $ok2 = mounted_or_fail($r, 'rsv', 'reservoir', undef, 100);
     if (!$ok1 && !$ok2) { plan skip_all => "backends unavailable"; return }
     if ($ok1) {
         shared_call($r, '/mh', 'add', 'a');

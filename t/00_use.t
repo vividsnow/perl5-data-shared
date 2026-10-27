@@ -30,6 +30,7 @@ is $r3->{entry}{key}, 'hashmap', 'full class maps to entry';
 
 is Data::Shared::Registry::resolve_spec('hashmap:II')->{variant}, 'ii', 'mixed case resolves to lowercase canonical';
 
-ok(!Data::Shared::Registry::resolve_spec('nosuchthing'), 'unknown short spec is undef');
+ok(!defined Data::Shared::Registry::resolve_spec('nosuchthing'),
+    'unknown short spec is undef');
 
 done_testing;

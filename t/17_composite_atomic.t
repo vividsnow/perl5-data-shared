@@ -389,4 +389,37 @@ subtest 'a stale composite cannot attach to a recreated store' => sub {
     is_deeply [$check->children('/users')], ['dave'], 'and it has only its own child';
 };
 
+# A read-only root takes no composite lock, so checking identity only inside
+# the locked section left exactly the readers of a shipped store -- which
+# cannot write, and so cannot be warned by anything else -- being served
+# another incarnation's data under their own addresses.
+subtest 'a stale read-only composite cannot attach to a recreated store' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $spec = { spec => 'hashmap:ss', args => [100],
+                 child => { spec => 'hashmap:ss', args => [100] }, cache_size => 1 };
+    my $maker = Data::Shared->new($dir);
+    eval { $maker->mount('users', $spec); 1 } or plan skip_all => "composite unavailable: $@";
+    $maker->set('/users/alice/k', 'alice-original');
+    $maker->set('/users/carol/k', 'carol-original');
+    $maker->freeze_all;
+
+    my $ro = Data::Shared->open_readonly($dir, strict => 1);
+    is $ro->get('/users/alice/k'), 'alice-original', 'the shipped store reads';
+    is $ro->get('/users/carol/k'), 'carol-original', 'and the first child is evicted';
+
+    $maker->unlink_all;                         # the producer tears its own store down
+    my $fresh = Data::Shared->new($dir);
+    $fresh->mount('users', $spec);
+    $fresh->set('/users/dave/k', 'dave-new-store');
+    $fresh->freeze_all;
+
+    ok !eval { $ro->get('/users/alice/k'); 1 }, 'the stale reader is refused';
+    like $@, qr/composite instance was deleted/, 'and told why';
+    # Parenthesised: `is Data::Shared->...` parses as a method call on the
+    # class name, not as a call to is().
+    my $fresh_reader = Data::Shared->open_readonly($dir);
+    is $fresh_reader->get('/users/dave/k'), 'dave-new-store',
+        'a fresh reader still sees the new store';
+};
+
 done_testing;

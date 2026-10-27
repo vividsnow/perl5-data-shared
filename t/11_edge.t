@@ -58,7 +58,10 @@ subtest 'invalid inputs' => sub {
     is $r->dir, undef, 'anonymous dir undef';
     is $r->manifest_path, undef, 'anonymous manifest undef';
     ok !$r->readonly, 'rw root not readonly';
-    is_deeply [$r->mount_names], [$r->mounts], 'mount_names alias';
+    # Against a literal, not against the other accessor: comparing two values
+    # from the code under test passed just as well when both were wrong.
+    is_deeply [$r->mount_names], ['cache'], 'mount_names lists the mount';
+    is_deeply [$r->mounts], ['cache'], 'and mounts agrees with it';
     my $reg = Data::Shared->registry;
     is $reg->{hashmap}{key}, 'hashmap', 'registry method';
     is Data::Shared::Registry::entry_for_key('HASHMAP')->{key}, 'hashmap', 'entry_for_key lc';
@@ -256,6 +259,26 @@ subtest 'adapter error branches' => sub {
     ok !eval { shared_get($r, '/sem'); 1 }, 'sync get via fallback croaks';
     ok !eval { sharedc_get($r, shared_compile('/lat')); 1 }, 'compiled indexed without index croaks';
     ok !eval { sharedc_get($r, shared_compile('/freq')); 1 }, 'compiled sketch without key croaks';
+};
+
+# Every tier shares one dispatch path, and each told its caller about
+# shared_call -- a function they had not called. A cursor's own guard also let
+# an empty method name through to that message.
+subtest 'a call error names the operation, not one tier' => sub {
+    my $r = Data::Shared->new;
+    mount_or_skip($r, 'cache', 'hashmap:ii', undef, 64);
+    for my $case (['string', sub { shared_call($r, '/cache', undef) }],
+                  ['array', sub { Data::Shared::shareda_call($r, ['cache'], undef) }],
+                  ['compiled', sub { sharedc_call($r, shared_compile('/cache'), undef) }]) {
+        my ($tier, $call) = @$case;
+        ok !eval { $call->(); 1 }, "$tier: a missing method name is refused";
+        like $@, qr/a call requires a method name/, "$tier: without naming another tier";
+        unlike $@, qr/shared_call|shareda_call|sharedc_call/, "$tier: or any one spelling";
+    }
+    ok !eval { shared_call($r, '/', 'stats'); 1 }, 'the root is not a call target';
+    like $@, qr/a call path must name a mount/, 'and says so in the same terms';
+    ok !eval { $r->node('/cache')->call(''); 1 }, 'a cursor refuses an empty method name';
+    like $@, qr/node call requires a method name/, 'by its own guard';
 };
 
 done_testing;

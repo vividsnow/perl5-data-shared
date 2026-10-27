@@ -341,6 +341,23 @@ subtest 'a mounted composite child handle cannot unlink its storage' => sub {
     is $re->get('/users/alice/1'), 42, 'and another process can still read it';
 };
 
+# Cwd returns bytes, so an entry recorded from a root whose directory the
+# caller held as characters was resolved against a character string: the name
+# that came out did not exist, unlink_all skipped the storage and then dropped
+# its own record of it, leaving the file unreclaimable.
+subtest 'a retained entry resolves against a wide-character root' => sub {
+    my $base = tempdir(CLEANUP => 1);
+    my $dir = "$base/\x{3b1}root";
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('m', 'hashmap:ii', "$dir/\x{3b2}store.shm", 64); 1 }
+        or plan skip_all => "wide-character paths unavailable: $@";
+    shared_set($root, '/m/1', 7);
+    $root->unmount('m');
+    is scalar(() = glob "$dir/*.shm"), 1, 'the retained file is on disk';
+    ok $root->unlink_all, 'unlink_all succeeds';
+    is scalar(() = glob "$dir/*.shm"), 0, 'and the retained file is really gone';
+};
+
 done_testing;
 
 package SlowUnlink;

@@ -230,8 +230,21 @@ sub _index_replaced {
     my ($self) = @_;
     return 0 unless defined $self->{dir} && defined $self->{_index_ino};
     my ($dev, $ino) = (stat _index_file($self))[0, 1];
-    return 0 unless defined $ino;       # gone, not replaced: the marker's job
+    # Absent counts as retired too, not just replaced. Leaving that to the
+    # marker assumed the marker exists, and a destroy on a frozen index never
+    # writes one: a process that acquired the removed lock file in that window
+    # found no index to compare against, passed, and then attached to the
+    # replacement that appeared a moment later.
+    return 1 unless defined $ino;
     return ($dev == $self->{_index_dev} && $ino == $self->{_index_ino}) ? 0 : 1;
+}
+
+sub _assert_live_instance {
+    my ($self) = @_;
+    return if $self->{_cleanup};
+    Carp::croak('Data::Shared: composite instance was deleted')
+        if $self->{index}->get('x:') || $self->_index_replaced;
+    return;
 }
 
 sub _chain_signature {
@@ -324,6 +337,11 @@ sub _key_int_bits_for {
 
 sub _with_lock {
     my ($self, $code, $mutating, $read_only) = @_;
+    # Before the shortcut, not after it: a read-only root takes no lock at all,
+    # so checking identity only inside the locked section left exactly the
+    # readers of a shipped store -- the ones that cannot write and so cannot be
+    # warned by anything else -- served another incarnation's data.
+    $self->_assert_live_instance if $self->{index};
     return $code->() if $self->{readonly} || $self->{_locked};
     my $fh;
     if (defined $self->{dir}) {
@@ -365,8 +383,7 @@ sub _with_lock {
     my (@ret, $ret);
     my $ok = eval {
         if ($self->{index}) {
-            Carp::croak('Data::Shared: composite instance was deleted')
-                if !$self->{_cleanup} && ($self->{index}->get('x:') || $self->_index_replaced);
+            $self->_assert_live_instance;
             # A sealed index can never take the write, and a count is derived
             # from the addresses when it is absent, so rebuilding it there
             # could only croak.
@@ -516,7 +533,6 @@ sub _register {
             };
             _rethrow($err, $clean ? '' : $@);
         }
-        $self->{gen}++;
         return $id;
     }, 1);
 }
@@ -706,7 +722,6 @@ sub _ensure_child {
             my $files = Data::Shared::_cleanup_paths(\@pending);
             _rethrow($err, length($rollback . $files) ? "$rollback $files" : '');
         }
-        $self->{gen}++;
         return $rt;
     }, 1);
 }
@@ -964,7 +979,6 @@ sub delete_subtree {
                 Carp::croak("Data::Shared: subtree detached but cleanup failed: $cleanup") if length $cleanup;
             }
         }
-        $self->{gen}++;
         return 1;
     }, 1);
 }
