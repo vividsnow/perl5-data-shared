@@ -530,6 +530,7 @@ sub _empty_root {
     my ($class, $dir, %opt) = @_;
     return bless { dir => $dir, mounts => {}, order => [], readonly => $opt{readonly} ? 1 : 0,
         strict_readonly => $opt{strict} ? 1 : 0, gen => 0, _nested => 0,
+        _frozen_ok => $opt{frozen_ok} ? 1 : 0,
         _revision => 0, _compiled => {}, _retained => [] }, $class;
 }
 
@@ -561,6 +562,14 @@ sub _open_root {
 }
 
 sub open { my ($class, $dir) = @_; return _open_root($class, $dir) }
+
+# A frozen leaf refuses the writable constructor, so once the process that
+# froze a store exits, open() can never succeed again -- and unlink_all, the
+# only verb that reclaims the storage, croaks on a read-only root. The
+# documented lifecycle had no last step for exactly the stores the ship
+# workflow produces. This attaches the sealed leaves read-only so the
+# lifecycle can finish.
+sub open_sealed { my ($class, $dir) = @_; return _open_root($class, $dir, frozen_ok => 1) }
 
 sub open_readonly {
     my ($class, $dir, %opt) = @_;
@@ -655,19 +664,46 @@ sub _track_paths {
 sub _lock_composite_dirs {
     my ($paths) = @_;
     my @held;
+    require Fcntl;
     for my $path (@$paths) {
-        next unless -d $path && !-l $path;
-        my $lockfile = "$path/.lock";
-        next unless -e $lockfile;
-        require Fcntl;
-        # CORE::open, because this package defines an open of its own.
-        CORE::open(my $fh, '+<', $lockfile) or next;
-        until (flock $fh, Fcntl::LOCK_EX()) {
-            last unless $!{EINTR};
+        # Every lock beneath it, not just its own: a nested composite has a
+        # lock of its own, and a worker part-way through a deep read holds
+        # that one while the outer directory is what gets removed.
+        for my $lockfile (_composite_locks_under($path)) {
+            # '<' as a fallback, because a lock file may be read-only and
+            # Linux takes an exclusive flock on a read-only descriptor; and
+            # loud rather than silent, because proceeding without the lock is
+            # the race this whole helper exists to stop.
+            my $fh;
+            CORE::open($fh, '+<', $lockfile)
+                or CORE::open($fh, '<', $lockfile)
+                or Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!");
+            until (flock $fh, Fcntl::LOCK_EX()) {
+                next if $!{EINTR};
+                Carp::croak("Data::Shared: cannot lock composite '$lockfile': $!");
+            }
+            push @held, $fh;
         }
-        push @held, $fh;
     }
     return \@held;
+}
+
+sub _composite_locks_under {
+    my ($path) = @_;
+    return () unless -d $path && !-l $path;
+    my @locks;
+    my @queue = ($path);
+    while (my $dir = shift @queue) {
+        push @locks, "$dir/.lock" if -e "$dir/.lock";
+        opendir my $dh, $dir or next;
+        for my $entry (readdir $dh) {
+            next if $entry eq '.' || $entry eq '..';
+            my $child = "$dir/$entry";
+            push @queue, $child if -d $child && !-l $child;
+        }
+        closedir $dh;
+    }
+    return @locks;
 }
 
 sub _cleanup_paths {
@@ -901,7 +937,7 @@ sub _install_recipe {
         $composite = Data::Shared::Composite->new(root => $self, name => $name,
             node => $recipe->{node}, dir => $recipe->{dir}, path => [split m{/}, $name],
             readonly => $self->{readonly}, strict_readonly => $self->{strict_readonly},
-            pending_paths => $self->{_pending_paths},
+            pending_paths => $self->{_pending_paths}, frozen_ok => $self->{_frozen_ok},
             opening => $self->{_opening} || (defined $recipe->{dir} && -e $recipe->{dir}));
         $handle = $composite;
         $file = $recipe->{dir};
@@ -1385,18 +1421,13 @@ operation:
     /lat/0/5         mount "lat", indices 0, 5 (NDArray)
     /visitors        mount "visitors" (used with shared_call)
 
-This is a deliberate departure from L<Data::Path::XS>: there is nothing
-to walk inside an opaque shared-memory handle, so a plain mount
-resolves in two levels (mount resolution, then adapter dispatch)
-rather than by walking nested hashes and arrays; composite mounts
-(L</DEEP PATHS (COMPOSITES)>) walk one child address per level. The
-three API tiers (string, array, compiled) and their syntax otherwise
-mirror L<Data::Path::XS>.
-
-The facade is pure Perl. All hot operations still execute in the
-underlying XS of each leaf. The keyword syntax of L<Data::Path::XS>
-(C<pathget>/C<pathset>) is not provided; requesting C<:keywords>
-croaks (see L</PERFORMANCE> for why dispatch stays in Perl).
+A path resolves in two levels, not by walking: there is nothing to walk
+inside an opaque shared-memory handle, so the components select a mount
+and the rest is the adapter's business. Composite mounts
+(L</DEEP PATHS (COMPOSITES)>) add one child address per level. The three
+tiers (string, array, compiled) otherwise mirror L<Data::Path::XS>,
+except that its keyword syntax is not provided: requesting
+C<:keywords> croaks. L</PERFORMANCE> says why dispatch stays in Perl.
 
 B<Linux only, 64-bit Perl>, matching every leaf. Handles are never
 cloned into ithreads (C<CLONE_SKIP>).
@@ -1428,26 +1459,34 @@ Missing storage is an error; opening never recreates an empty backing file.
 Composite descendant files are checked when the child is opened lazily.
 Native backends validate their own file headers.
 
+=head2 Data::Shared->open_sealed($dir)
+
+Opens a store whose leaves have been frozen, attaching each sealed leaf
+read-only so the replay succeeds. C<open> cannot do this -- a frozen
+file refuses the writable constructor -- and C<open_readonly> gives a
+root whose lifecycle verbs croak, so without this a store had no
+reachable teardown once the process that froze it exited. Reads work;
+data writes are refused by the leaves themselves; the reason to open a
+store this way is C<unlink_all>.
+
 =head2 Data::Shared->open_readonly($dir, strict => 1)
 
-Replays the manifest opening each leaf with C<new_readonly> where the
-leaf supports it. Generic mutating verbs (C<set>, C<delete>, C<incr>,
-C<push>, C<pop>) and root lifecycle writes (C<mount>, C<unmount>,
-C<unlink_all>) croak on a read-only root. For leaves without
-C<new_readonly>, the facade falls back to the normal constructor;
-native methods reached via C<shared_call> or C<handle> retain that
-leaf's own permissions. The root flag alone does not enforce
-read-only access through native methods.
+Replays the manifest, opening each leaf with C<new_readonly> where the
+leaf supports it and with the normal constructor where it does not.
+The generic mutating verbs (C<set>, C<delete>, C<incr>, C<push>,
+C<pop>), every root lifecycle write (C<mount>, C<unmount>,
+C<freeze_all>, C<unlink_all>) and native C<unlink>, C<destroy> and
+C<freeze> croak on any read-only root. Other native methods, reached through
+C<shared_call> or C<handle>, keep whatever permissions that leaf's own
+file gives them: the root flag by itself does not make them read-only.
 
-With C<strict =E<gt> 1>, every backend in the declared tree must provide
-C<new_readonly> or be immutable (PerfectHash). Unsupported leaves are
-rejected before opening handles, including lazy composite leaves. The
-producer must freeze backends that require frozen files. Without C<strict>,
-the compatibility fallback described above remains available. Strict mode
-enforces native data-write guards; raw handles still expose their backend
-API and direct filesystem operations remain subject to filesystem permissions.
-Native C<unlink>, C<destroy>, and C<freeze> calls through the facade are
-blocked on every read-only root.
+C<< strict => 1 >> closes that gap by refusing the store instead.
+Every backend in the declared tree, lazy composite leaves included,
+must provide C<new_readonly> or be immutable (PerfectHash), and is
+rejected before any handle is opened, so the producer has to freeze
+whatever needs a frozen file first. Raw handles still expose their
+backend's own API, and the filesystem still decides what a process may
+write directly.
 
 =head2 $root->mount($name, $spec, @ctor_args)
 
@@ -1492,6 +1531,14 @@ removes backing paths created by that attempt. Existing files are retained.
 Factories manage their own external side effects. Nested mount mutations
 inside a factory are rejected.
 
+Every argument has to survive the manifest, because replaying it is how
+each later process reopens the store. C<Inf>, C<NaN> and a lone surrogate
+are refused at mount time rather than published as text nothing can parse
+back. Strings are recorded as bytes, and a string held as characters is
+encoded to its UTF-8 bytes first, uniformly from U+0080 up: the character
+C<"\x{e9}"> and the single byte C<"\xe9"> are therefore two different
+paths naming two different files.
+
 Special cases: C<perfecthash> mounts need a built file path, a
 C<< { build_int => \@keys, path => $file } >> /
 C<build_str> hashref, a factory, or a loaded handle (it is an
@@ -1506,78 +1553,79 @@ same native handle under another name to share it intentionally; an
 C<unmount> that would unlink storage another mount still names is
 refused, so retire the aliases first.
 
-Mount names are matched by longest prefix over the joined path, so a
-nested name wins over the same string reached through a shorter mount:
-with C<users> and C<users/sales> mounted, C</users/sales/eu> addresses
-the C<users/sales> mount, not the C<sales> record or composite child of
-C<users>. That holds for array paths too, where a component containing
-C</> joins like any other, so do not give a nested mount a name that
-spells out an address its parent also serves.
 
 =head2 $root->unmount($name), $root->mounts, $root->mount_info($name)
 
 Lifecycle and introspection for mounts. Names are canonicalized as
 C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
-C<unmount> retains the mount's storage, so a later mount of the same
-name adopts it, and the manifest records what was retained: any process
-that opens the root afterwards reclaims it with C<unlink_all>. One ledger
-entry per retained store survives until then, and every topology change
-republishes it, so a long-running program that rotates mounts under fresh
-names should pass C<< unlink => 1 >> rather than accumulate them.
-C<< unmount($name, unlink => 1) >> removes it instead, under the same
-directory lock that published its removal, so a sibling process cannot
-mount the name onto storage that is about to go. A native C<unlink> or
-C<destroy> reached through C<shared_call> at a mount does the same,
-because leaving the manifest naming storage that is gone makes the store
-refuse to open at all.
-Manifest changes use a directory lock and revision. A root opened before
-another writer's topology change receives a C<stale manifest revision> error
-before constructors or factories run. Reopen the root and retry with the
-current configuration. Roots keep their own mount namespace until reopened;
-they do not refresh automatically. A composite child already open in a root
-is part of that namespace: if another process destroys and recreates the
-store, this root goes on reading the child it holds, and C<exists> and
-C<children> still report it, until something makes it take the composite
-lock again and the instance check fires. Such a root never crosses into the
-new store's storage, but it is answering for the old one, so a worker that
-must notice a teardown should reopen rather than wait to be told. C<freeze_all> and C<unlink_all> also check
-the revision before operating on shared storage.
 
-A mount argument has to be representable in the manifest, since replaying it
-is how every later process reopens the store: C<Inf>, C<NaN> and a lone
-surrogate are refused at mount time rather than published as text nothing can
-parse back. Strings are recorded as bytes: a path held as characters is encoded to
-its UTF-8 bytes, so it names the same file as that byte spelling. The
-rule is uniform across U+0080 and above, which means a character
-C<"\x{e9}"> and the single byte C<"\xe9"> are two different paths
-naming two different files.
-
-Version-one manifests without a revision are accepted as revision zero.
-New writers add a revision and a F<.manifest.lock> file; existing backend
-file formats and generated filenames are preserved. Concurrent writers must
-all use the revised protocol. Mount topology is simplest to manage from one
-coordinator.
+C<unmount> keeps the mount's storage and records it in the manifest, so
+a later mount of the same name adopts it and any process that opens the
+root can reclaim it with C<unlink_all>. That record costs one manifest
+entry per retained store until something reclaims it, and every topology
+change republishes the manifest, so a program that rotates mounts under
+fresh names should pass C<< unlink => 1 >> rather than accumulate them.
+C<< unmount($name, unlink => 1) >> removes the storage instead, under
+the same directory lock that published its removal, and a native
+C<unlink> or C<destroy> reached through C<shared_call> at a mount does
+the same -- a manifest naming storage that is gone makes the store
+refuse to open at all. See L</SHARING A ROOT> for what another process
+sees while this happens.
 
 =head2 $root->dir, $root->readonly, $root->manifest_path
 
-Accessors: the root's directory (C<undef> when anonymous), whether it
-was opened read-only, and the path of its manifest.
+Accessors: the root's directory, whether it was opened read-only, and
+the path of its manifest. The directory and the manifest path are both
+C<undef> for an anonymous root.
 
 =head2 $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats, $root->frozen
 
 Proxies applied to every mount whose handle supports the method, in
-mount order. C<stats> returns a hashref of per-mount stats (or class
-name where a leaf has no C<stats>). A composite mount counts as its
-whole subtree: parent, child index and every registered child, open or
-not. C<freeze_all> returns the number of handles it sealed, so 0 is a
+mount order. C<stats> returns a hashref per mount: the leaf's own stats
+where it has them, and C<< { class => ref $handle } >> where it does
+not. A composite mount counts as its whole subtree: parent, child index
+and every registered child, open or not. C<freeze_all> returns the number of handles it sealed, so 0 is a
 success: either everything was already sealed, or no mount can be.
 C<frozen> tells those apart, and is what a producer should assert
-before shipping the directory. A mounted native handle is sealed with
+before shipping the directory -- but only 21 of the 39 families can be
+sealed at all, so a store holding any of the other 18 (C<buffer>,
+C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>, C<pubsub>,
+C<reqrep>, C<ringbuffer>, C<sync>, the timing wheels, C<reservoir>,
+C<topk>, C<segmenttree>, C<disjointset>, C<perfecthash>, and
+C<sortedset:strings>) can never report C<frozen>. C<frozen> is a
+predicate and does not say which mount blocks it;
+C<< open_readonly($dir, strict => 1) >> does, by naming the first
+unsupported class it meets. Freezing is also a one-way door for the
+store: afterwards C<open> refuses it for every process, including the
+one that froze it, and C<open_sealed> is how it is reopened. A mounted native handle is sealed with
 the rest, so the caller's own object becomes read-only. C<unlink_all>
-removes the mounts, the manifest, and any storage this root's own
-C<unmount> retained, but leaves F<.manifest.lock>, which
-another process may still be holding, so the directory is not empty
-afterwards.
+removes the mounts, the manifest, and every retained store the manifest
+names -- whichever process unmounted it, since the ledger is shared --
+but leaves F<.manifest.lock>, which another process may still be
+holding, so the directory is not empty afterwards. C<freeze_all> and
+C<unlink_all> both croak on a read-only root.
+
+=head1 SHARING A ROOT
+
+Topology changes take a directory lock and bump a revision, so they
+serialise between processes. A root that was opened before another
+writer's change gets a C<stale manifest revision> error from C<mount>,
+C<unmount>, C<freeze_all> and C<unlink_all>, raised before any
+constructor or factory runs: reopen the root and retry against the
+current configuration. Ordinary reads and writes never check the
+revision, so they neither fail nor refresh.
+
+A root keeps its own mount namespace until it is reopened, and a
+composite child it already holds open is part of that namespace. If
+another process destroys and recreates the store, this root goes on
+reading the child it holds, and C<exists> and C<children> go on
+reporting it, until something makes it take the composite lock again and
+the instance check fires. It never crosses into the new store's
+storage -- it is answering for the old one -- so a worker that must
+notice a teardown should reopen rather than wait to be told.
+
+Configure topology from one coordinator and let the workers open the
+result; that is the pattern the revision protocol is built for.
 
 =head1 PATH FORMAT
 
@@ -1597,21 +1645,27 @@ remainder with C</> so route-style keys work in string paths.
 =item * Set-like (Bloom family, BitSet, RoaringBitmap, SortedSet,
 DisjointSet): one member component.
 
-Map-, set- and queue-like mounts croak on a longer path rather than
-using the first component and discarding the rest, which addressed a
-record the path did not name. RadixTree, which joins, is unaffected.
-
 =item * Indexed (NDArray, Fenwick, Fenwick2D, SegmentTree, Graph):
 all remaining components are indices/coordinates.
 
 =item * Queue-, sketch- and sync-like: no remainder; use
-C<shared_push>/C<shared_pop>/C<shared_call>. The value is an argument,
-not a path component, so through a cursor the node itself is C<< $node->push('',
-$value) >> -- the relative path comes first, as it does for every cursor
-verb. C<ringbuffer>'s C<get> is the one exception and reads one component,
-its sequence number.
+C<shared_push>/C<shared_pop>/C<shared_call>, which take the value as an
+argument. C<ringbuffer>'s C<get> is the one exception and reads one
+component, its sequence number.
 
 =back
+
+Map-, set- and queue-like mounts croak on a longer path rather than
+using the first component and discarding the rest. RadixTree, which
+joins, is unaffected.
+
+Mount selection takes the longest name that matches the joined
+components, so a nested mount wins over the same string reached through
+a shorter one: with C<users> and C<users/sales> mounted,
+C</users/sales/eu> addresses the C<users/sales> mount, not the C<sales>
+record or composite child of C<users>. Array paths join the same way, a
+component containing C</> included, so do not give a nested mount a name
+that spells out an address its parent also serves.
 
 No escaping is provided in the string tier: keys containing C</> or
 the empty string need the array tier.
@@ -1626,33 +1680,43 @@ Intern C<intern/id_of>). Where a verb would lie (a plain Bloom filter
 has no delete; sketches and sync primitives have no keyed get/set) it
 croaks with guidance to use C<shared_call> instead of faking it.
 
-Where it is defined, C<shared_exists> always returns C<1> or C<0>,
-an index outside the structure included; where a type has no honest
+Where it is defined, C<shared_exists> always returns C<1> or C<0>, an
+index outside the structure included; where a type has no honest
 C<exists> (C<ndarray>, C<fenwick2d>) it croaks like any other absent
-verb. C<shared_incr> uses
-C<incr_by> when a delta is given and the leaf supports it; a leaf with
-neither C<incr_by> nor a delta form of C<incr> (most C<buffer> variants)
-rejects the delta from its own XS, so use C<shared_call> there.
+verb. C<shared_incr> uses C<incr_by> when a delta is given and the leaf
+supports it; a leaf with neither C<incr_by> nor a delta form of C<incr>
+(most C<buffer> variants) rejects the delta from its own XS, so use
+C<shared_call> there.
 
-A few per-backend behaviours are the leaf's, not the facade's, and are
-worth knowing before you rely on them. C<shared_set($path, 0)> clears for
-BitSet but counts as an add for RoaringBitmap and the Cuckoo and counting
-Bloom filters, whose value argument is ignored; use C<shared_delete> to
-remove. C<shared_delete> on a C<buffer> writes the variant's zero, which
-for C<buffer:str> is the one-character string C<"0">. A write can also
-fail by returning false rather than croaking: C<sortedset:strings> and
-C<intern> derive a string arena of 32 bytes per declared entry, so longer
-members exhaust it early and C<shared_set> then returns C<undef>. Pass a
-larger C<arena> (C<sortedset:strings>) or third constructor argument
-(C<intern>) if your members are long, and check the return value. Keys cross into XS
-as bytes, so encode wide characters first: a character above U+00FF is
-accepted by the HashMap and SortedSet families and fatal in RadixTree,
-Intern and the filter family. An integer-addressed leaf numifies a
-non-integer key, so C<'abc'> addresses element 0: C<buffer>, C<fenwick>,
-C<segmenttree> and C<disjointset> refuse it, but C<bitset>,
-C<roaringbitmap>, C<pool>, C<ndarray>, C<graph>, C<fenwick2d>,
-C<ringbuffer>'s C<get> and the integer C<hashmap> variants read or write
-element 0 (with a warning under C<-w>).
+These are the leaf's own behaviours showing through, and worth knowing
+before you rely on them:
+
+=over 4
+
+=item * C<shared_set($path, 0)> clears for BitSet, but counts as an add
+for RoaringBitmap and the Cuckoo and counting Bloom filters, whose value
+argument is ignored. Use C<shared_delete> to remove.
+
+=item * C<shared_delete> on a C<buffer> writes the variant's zero, which
+for C<buffer:str> is the one-character string C<"0">.
+
+=item * A write can fail by returning false instead of croaking:
+C<sortedset:strings> and C<intern> derive a string arena of 32 bytes per
+declared entry, so longer members exhaust it early and C<shared_set>
+returns C<undef>. Pass a larger C<arena>, or a larger third constructor
+argument for C<intern>, and check the return value.
+
+=item * Keys cross into XS as bytes, so encode wide characters first. A
+character above U+00FF is accepted by the HashMap and SortedSet families
+and fatal in RadixTree, Intern and the filter family.
+
+=item * An integer-addressed leaf numifies a non-integer key, so
+C<'abc'> addresses element 0. C<buffer>, C<fenwick>, C<segmenttree> and
+C<disjointset> refuse it; C<bitset>, C<roaringbitmap>, C<pool>,
+C<ndarray>, C<graph>, C<fenwick2d>, C<ringbuffer>'s C<get> and the
+integer C<hashmap> variants write element 0, with a warning under C<-w>.
+
+=back
 
 =head2 shared_call($root, $path, $method, @args)
 
@@ -1684,8 +1748,8 @@ C<write> (no pop)). Unsupported directions croak.
 
 C<shareda_get/set/delete/exists/incr/call/push/pop> take an arrayref
 of components instead of a slash string. Binary-safe; components may
-contain C</> or be empty strings. Mount resolution uses the same
-longest-prefix rule over components.
+contain C</> or be empty strings, subject to the resolution rule in
+L</PATH FORMAT>.
 
 =head1 COMPILED PATH API
 
@@ -1785,11 +1849,6 @@ a reserved child is reported as an error. This provides exception rollback
 and limited interruption recovery, without promising power-loss transactions
 or automatic orphan cleanup.
 
-New readiness markers include the child ID; legacy readiness flags remain
-readable. Counters and interruption markers use additional registry keys.
-Old undersized registries need adequate capacity before further writes;
-missing construction records are not reconstructed automatically.
-
 =head1 PERFORMANCE
 
 The facade is pure Perl; every operation ends in the leaf's XS, so
@@ -1882,10 +1941,9 @@ as the examples here spell it for brevity -- can be pre-created by anyone,
 who then chooses what the first real process attaches to.
 
 Mount names are sanitised into the root directory, so a name containing
-C<..> or C</> cannot place a backing file outside it, and a manifest naming
-a backing file that is absent is refused rather than silently recreated.
-Anything you grant write access to a shared mapping is trusted not to
-corrupt it while others are attached, as with the leaves.
+C<..> or C</> cannot place a backing file outside it. Anything you grant
+write access to a shared mapping is trusted not to corrupt it while
+others are attached, as with the leaves.
 
 =head1 SEE ALSO
 

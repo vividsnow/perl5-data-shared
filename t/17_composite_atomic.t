@@ -383,7 +383,9 @@ subtest 'a stale composite cannot attach to a recreated store' => sub {
     }
 
     ok !eval { $stale->get('/users/alice/k'); 1 }, 'the stale worker is refused, not served';
-    like $@, qr/composite instance was deleted/, 'and told why';
+    # The storage belongs to a newer incarnation, which is a different state
+    # from this instance's own teardown and says so.
+    like $@, qr/belongs to a newer instance/, 'and told why';
     ok !eval { $stale->set('/users/alice/k', 'from-stale'); 1 }, 'and cannot write either';
 
     my $check = Data::Shared->open($dir);
@@ -416,7 +418,7 @@ subtest 'a stale read-only composite cannot attach to a recreated store' => sub 
     $fresh->freeze_all;
 
     ok !eval { $ro->get('/users/alice/k'); 1 }, 'the stale reader is refused';
-    like $@, qr/composite instance was deleted/, 'and told why';
+    like $@, qr/belongs to a newer instance/, 'and told why';
     # Parenthesised: `is Data::Shared->...` parses as a method call on the
     # class name, not as a call to is().
     my $fresh_reader = Data::Shared->open_readonly($dir);
@@ -429,6 +431,65 @@ subtest 'a stale read-only composite cannot attach to a recreated store' => sub 
 # open -- and the worker then attached to whatever appeared at the same child
 # path. Teardown waits for the lock now, which lets the worker finish against
 # the old instance as the POD allows.
+# A recreated store restarts its revision, so the same configuration
+# reproduces the same manifest bytes and a stale root's revision check passes.
+# Letting a teardown run against a dead instance -- which it must, to finish
+# its own -- also let it run against a SUCCESSOR's, and remove its storage.
+subtest 'a stale root cannot tear down its successor' => sub {
+    my $base = tempdir(CLEANUP => 1);
+    my $dir = "$base/store";
+    my $spec = ['hashmap:ss', 100, ['hashmap:ss', 100]];
+    my $stale = Data::Shared->new($dir);
+    eval { $stale->mount('users', $spec); 1 } or plan skip_all => "composite unavailable: $@";
+    $stale->set('/users/alice/k', 'original');
+
+    Data::Shared->open($dir)->unlink_all;
+    my $fresh = Data::Shared->new($dir);
+    $fresh->mount('users', $spec);
+    $fresh->set('/users/bob/k', 'replacement');
+
+    ok !eval { $stale->unlink_all; 1 }, "the stale root's teardown is refused";
+    like $@, qr/belongs to a newer instance/, 'because the storage is not its own';
+    ok -d "$dir/.children/users", "the replacement's children survive";
+    undef $fresh;
+    my $check = Data::Shared->open($dir);
+    is $check->get('/users/bob/k'), 'replacement', 'and its data is intact';
+};
+
+# The sweep opened each lock '+<', so a read-only lock file -- which the
+# composite's own read fallback expressly supports -- made it skip the lock and
+# remove the directory while a worker held it.
+subtest 'teardown respects a read-only composite lock' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('users', ['hashmap:ss', 100, ['hashmap:ss', 100]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    $root->set('/users/alice/k', 'v');
+    my $lockfile = "$dir/.children/users/.lock";
+    chmod 0400, $lockfile or die $!;
+
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '<', $lockfile) && flock $fh, Fcntl::LOCK_EX();
+        syswrite $held_w, $ok ? "held\n" : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    is scalar <$held_r>, "held\n", 'a worker holds the read-only lock';
+    my $start = Time::HiRes::time();
+    $root->unmount('users');
+    $root->unlink_all;
+    my $waited = Time::HiRes::time() - $start;
+    waitpid $pid, 0;
+    cmp_ok $waited, '>', 1, 'the teardown waited for it';
+    ok !-d "$dir/.children/users", 'and then removed the directory';
+};
+
 subtest 'teardown waits for a composite lock it does not hold' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my $root = Data::Shared->new($dir);

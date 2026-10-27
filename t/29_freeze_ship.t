@@ -157,4 +157,35 @@ subtest 'sync covers every registered child' => sub {
     is $calls, 42, 'and really flushed that many';
 };
 
+# The documented lifecycle ends in teardown, and a frozen store had no
+# reachable last step: open refuses a sealed leaf the writable way, and
+# open_readonly gives a root whose unlink_all croaks. Every shipped store
+# leaked its directory once the process that froze it exited.
+subtest 'a shipped store can still be torn down' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $producer = Data::Shared->new($dir);
+        eval { $producer->mount('cache', 'hashmap:ii', undef, 64); 1 }
+            or plan skip_all => "hashmap unavailable: $@";
+        $producer->mount('users', ['hashmap:ss', 64, ['hashmap:ss', 64]]);
+        $producer->set('/cache/1', 1);
+        $producer->set('/users/alice/k', 'v');
+        $producer->freeze_all;
+    }
+    ok !eval { Data::Shared->open($dir); 1 }, 'a writable open is refused, as the leaves require';
+    my $ro = Data::Shared->open_readonly($dir);
+    ok !eval { $ro->unlink_all; 1 }, 'and a read-only root will not reclaim it';
+    undef $ro;
+
+    my $sealed = Data::Shared->open_sealed($dir);
+    ok $sealed, 'open_sealed attaches the sealed leaves';
+    is $sealed->get('/cache/1'), 1, 'reads still work';
+    is $sealed->get('/users/alice/k'), 'v', 'through the composite too';
+    ok !eval { $sealed->set('/cache/2', 2); 1 }, 'a data write is still refused';
+    ok $sealed->unlink_all, 'and the storage can finally be reclaimed';
+    is scalar(() = glob "$dir/*.shm"), 0, 'no backing files are left';
+    ok !-d "$dir/.children", 'no child directories are left';
+    ok !-e "$dir/manifest.json", 'and no manifest';
+};
+
 done_testing;

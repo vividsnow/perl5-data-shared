@@ -219,6 +219,22 @@ sub new {
 
 sub _index_file { my ($self) = @_; return "$self->{dir}/index.shm" }
 
+# Shared, read-only, and best-effort: a reader that cannot open the lock at all
+# is no worse off than it was before this existed, and must not be refused a
+# shipped store over it.
+sub _with_shared_lock {
+    my ($self, $code) = @_;
+    my $lockfile = defined $self->{dir} ? "$self->{dir}/.lock" : undef;
+    my $fh;
+    if (defined $lockfile && -e $lockfile && CORE::open($fh, '<', $lockfile)) {
+        until (flock $fh, LOCK_SH) {
+            last unless $!{EINTR};
+        }
+    }
+    local $self->{_locked} = 1;
+    return $code->();
+}
+
 # A store torn down and recreated at the same directory allocates child ids
 # from zero again, so child-0 of the new incarnation sits where child-0 of the
 # old one did. A process still holding the old index read its own registrations
@@ -226,24 +242,36 @@ sub _index_file { my ($self) = @_; return "$self->{dir}/index.shm" }
 # addresses that do not exist in it -- and wrote into it. The marker in the
 # index cannot catch this: the stale process reads its own copy, and a destroy
 # on a frozen index never got to write one.
+use constant {
+    _INDEX_SAME     => 0,
+    _INDEX_ABSENT   => 1,   # our own teardown, finished or interrupted
+    _INDEX_REPLACED => 2,   # a different incarnation of the store
+};
+
 sub _index_replaced {
     my ($self) = @_;
-    return 0 unless defined $self->{dir} && defined $self->{_index_ino};
+    return _INDEX_SAME unless defined $self->{dir} && defined $self->{_index_ino};
     my ($dev, $ino) = (stat _index_file($self))[0, 1];
-    # Absent counts as retired too, not just replaced. Leaving that to the
-    # marker assumed the marker exists, and a destroy on a frozen index never
-    # writes one: a process that acquired the removed lock file in that window
-    # found no index to compare against, passed, and then attached to the
-    # replacement that appeared a moment later.
-    return 1 unless defined $ino;
-    return ($dev == $self->{_index_dev} && $ino == $self->{_index_ino}) ? 0 : 1;
+    # Absent and replaced are not the same thing. Leaving absence to the
+    # retirement marker assumed the marker exists, and a destroy on a frozen
+    # index never writes one; but conflating the two let a teardown, which may
+    # legitimately meet its own absent index, also proceed against a
+    # SUCCESSOR's index and remove its storage.
+    return _INDEX_ABSENT unless defined $ino;
+    return ($dev == $self->{_index_dev} && $ino == $self->{_index_ino})
+        ? _INDEX_SAME : _INDEX_REPLACED;
 }
 
 sub _assert_live_instance {
     my ($self) = @_;
+    my $state = $self->_index_replaced;
+    # Refused even while tearing down: this directory now belongs to another
+    # incarnation, and nothing this object does to it is wanted.
+    Carp::croak('Data::Shared: composite storage belongs to a newer instance')
+        if $state == _INDEX_REPLACED;
     return if $self->{_cleanup};
     Carp::croak('Data::Shared: composite instance was deleted')
-        if $self->{index}->get('x:') || $self->_index_replaced;
+        if $self->{index}->get('x:') || $state == _INDEX_ABSENT;
     return;
 }
 
@@ -342,7 +370,12 @@ sub _with_lock {
     # readers of a shipped store -- the ones that cannot write and so cannot be
     # warned by anything else -- served another incarnation's data.
     $self->_assert_live_instance if $self->{index};
-    return $code->() if $self->{readonly} || $self->{_locked};
+    return $code->() if $self->{_locked};
+    # A read-only root holds a SHARED lock for the section rather than none.
+    # Checking identity and then opening the child without a lock left the
+    # window open anyway: a teardown's exclusive lock met no reader to wait
+    # for, so the reader opened a successor's child under its own address.
+    return $self->_with_shared_lock($code) if $self->{readonly};
     my $fh;
     if (defined $self->{dir}) {
         my $lockfile = "$self->{dir}/.lock";
