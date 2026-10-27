@@ -84,4 +84,39 @@ subtest 'string sorted-set sidecars are reserved' => sub {
     is $root->get('/board/alice'), 42, 'original string sorted-set remains usable';
 };
 
+# The child's own unlink left the index naming storage that was gone: this
+# process kept writing into the dead mapping and every other one croaked on the
+# address, sync_all and freeze_all included.
+subtest 'retiring a child through call retires its registration' => sub {
+    for my $method (qw(unlink destroy)) {
+        my $dir = tempdir(CLEANUP => 1);
+        my $root = Data::Shared->new($dir);
+        $root->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+        $root->set('/users/alice/1', 42);
+        $root->set('/users/bob/1', 7);
+        Data::Shared::shared_call($root, '/users/alice', $method);
+        ok !$root->exists('/users/alice'), "$method: the child is no longer registered";
+        is_deeply [sort $root->children('/users')], ['bob'], "$method: the sibling stays";
+        ok eval { $root->sync_all; 1 }, "$method: sync_all still works" or diag $@;
+        undef $root;
+        my $reopened = eval { Data::Shared->open($dir) };
+        ok $reopened, "$method: another process can still open the store" or diag $@;
+        is eval { $reopened->get('/users/bob/1') }, 7, "$method: and read what is left"
+            if $reopened;
+        # Sealing last: a frozen store is the shipped state and opens read-only.
+        ok eval { $reopened->freeze_all; 1 }, "$method: and can still be sealed" or diag $@;
+        undef $reopened;
+        ok eval { Data::Shared->open_readonly($dir) }, "$method: the sealed store ships" or diag $@;
+    }
+};
+
+subtest 'retiring an address that was never created creates nothing' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+    $root->set('/users/alice/1', 1);
+    Data::Shared::shared_call($root, '/users/ghost', 'unlink');
+    is_deeply [sort $root->children('/users')], ['alice'], 'no child was created to remove it';
+};
+
 done_testing;

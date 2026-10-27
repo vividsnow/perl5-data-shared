@@ -830,6 +830,15 @@ sub dispatch_call {
         Carp::croak("Data::Shared: composite mount '" . $self->{name} . "' has no method '$method'");
     }
     my ($addr, @child_rest) = @$rest;
+    # Retiring a child's storage has to retire its registration with it. The
+    # child's own unlink left the index naming a file that was gone: this
+    # process went on writing into the dead mapping while every other one
+    # croaked on the address, sync_all and freeze_all included, so the store
+    # could no longer be flushed or shipped. Before _ensure_child, or retiring
+    # an address that does not exist would create the child to remove it.
+    if (!@child_rest && ($method eq 'unlink' || $method eq 'destroy')) {
+        return $self->delete_subtree($root, $addr);
+    }
     my $rt = $self->{readonly} ? $self->_existing_child($root, $addr) : $self->_ensure_child($root, $addr);
     Carp::croak('Data::Shared: read-only composite has no constructed child at this path') unless $rt;
     if ($rt->{kind} eq 'composite') {

@@ -77,4 +77,16 @@ subtest ':keywords not provided' => sub {
     like $@, qr/:keywords.*not available/, 'keywords error';
 };
 
+# mount accepts '/a/' for 'a' and every cursor method canonicalizes, so the
+# symmetric spelling silently did nothing here and reported 0.
+subtest 'unmount and mount_info canonicalize the name mount accepts' => sub {
+    my $r = Data::Shared->new;
+    eval { $r->mount('/a/', 'hashmap:ii', undef, 16); 1 } or plan skip_all => "hashmap unavailable: $@";
+    is_deeply [$r->mounts], ['a'], 'mount installed the canonical name';
+    ok $r->mount_info('/a/'), 'mount_info accepts the spelling mount took';
+    is $r->mount_info('/a/')->{name}, 'a', 'and reports the canonical name';
+    is $r->unmount('/a/'), 1, 'unmount accepts it too';
+    is_deeply [$r->mounts], [], 'and the mount is gone';
+};
+
 done_testing;

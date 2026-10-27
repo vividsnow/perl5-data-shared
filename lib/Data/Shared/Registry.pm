@@ -40,13 +40,26 @@ sub _buf_exists {
     };
 }
 
+# The same bounds check in front of a backend whose own test croaks out of
+# range: exists is documented to answer 1 or 0 for any path, and a caller
+# probing candidate indices died instead of being told no.
+sub _bounded_exists {
+    my ($method) = @_;
+    return sub {
+        my ($h, $idx) = @_;
+        return 0 unless _index_shape_ok($idx);
+        return 0 if $idx < 0 || $idx >= $h->capacity;
+        return $h->$method($idx) ? 1 : 0;
+    };
+}
+
 our %REGISTRY = (
     bitset => {
         key => 'bitset', dist => 'Data-BitSet-Shared',
         class => 'Data::BitSet::Shared', path_class => 'set', freeze => 1,
         verbs => {
             get    => 'test',
-            exists => 'test',
+            exists => _bounded_exists('test'),
             # No value read as false and cleared the bit, reporting success.
             # @_ < 3, not an undef test: an explicit undef still means the
             # caller meant to pass something, as Node::delete reads it.
@@ -241,7 +254,7 @@ our %REGISTRY = (
         },
         verbs => {
             get => 'get', set => 'set', delete => 'free',
-            exists => 'is_allocated', incr => 'add',
+            exists => _bounded_exists('is_allocated'), incr => 'add',
         },
     },
     pubsub => {

@@ -265,8 +265,16 @@ sub _dispatch_call {
     # Retiring a mount's storage retires the mount with it: removing the files
     # while the manifest still named them left a store that no later new,
     # open or open_readonly would accept, in any process.
-    return $root->unmount($name, unlink => 1)
-        if !@$rest && ($method eq 'unlink' || $method eq 'destroy');
+    if ($method eq 'unlink' || $method eq 'destroy') {
+        return $root->unmount($name, unlink => 1) unless @$rest;
+        # Below a leaf the remainder is passed to the backend, which takes no
+        # argument for these and removed the mount's whole file anyway, while
+        # the manifest went on naming it. A composite routes it to the child.
+        Carp::croak("Data::Shared: '$method' retires a mount or a composite child,"
+            . " not the record at '/" . join('/', @$components) . "';"
+            . " use shared_delete to remove a record")
+            unless $mount->{composite};
+    }
     if (my $comp = $mount->{composite}) {
         return $comp->dispatch_call($root, $rest, $method, @args);
     }
@@ -502,6 +510,10 @@ sub sharedc_call {
     if (($m eq 'unlink' || $m eq 'destroy') && @{ $cp->{components} }) {
         my ($name, $mount, $rest) = _resolve($r, $cp->{components});
         return $r->unmount($name, unlink => 1) unless @$rest;
+        Carp::croak("Data::Shared: '$m' retires a mount or a composite child,"
+            . " not the record at '/" . join('/', @{ $cp->{components} }) . "';"
+            . " use shared_delete to remove a record")
+            unless $mount->{composite};
     }
     my $bound = _compiled_code($r, $cp, 'call', $m);
     return $bound->(@a);
@@ -514,7 +526,7 @@ sub _empty_root {
     my ($class, $dir, %opt) = @_;
     return bless { dir => $dir, mounts => {}, order => [], readonly => $opt{readonly} ? 1 : 0,
         strict_readonly => $opt{strict} ? 1 : 0, gen => 0, _nested => 0,
-        _revision => 0, _compiled => {} }, $class;
+        _revision => 0, _compiled => {}, _retained => [] }, $class;
 }
 
 sub new {
@@ -653,7 +665,11 @@ sub _manifest_data {
         next if $m->{transient};
         push @mounts, { name => $name, spec => $m->{spec}, args => $m->{args} };
     }
-    return { version => 1, revision => $self->{_revision}, mounts => \@mounts };
+    my $data = { version => 1, revision => $self->{_revision}, mounts => \@mounts };
+    # Only when there is something to say, so a store that never retains keeps
+    # byte-identical manifests.
+    $data->{retained} = [ @{ $self->{_retained} } ] if @{ $self->{_retained} };
+    return $data;
 }
 
 sub _write_manifest {
@@ -684,7 +700,7 @@ sub _invalidate_compiled {
 }
 
 sub _mutate {
-    my ($self, $code) = @_;
+    my ($self, $code, $after) = @_;
     Carp::croak('Data::Shared: root is read-only, cannot change mounts') if $self->{readonly};
     Carp::croak('Data::Shared: nested mount mutations are not supported') if $self->{_mutating};
     return Data::Shared::Manifest::with_lock($self, 1, sub {
@@ -699,8 +715,9 @@ sub _mutate {
         # every sibling process its topology was stale -- which broke the
         # ordinary pattern of forked workers each mounting a scratch handle.
         local $self->{_published} = 0;
-        my ($mounts, $order, $nested, $revision, $stamp) =
-            ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision}, $self->{_manifest_stamp});
+        my ($mounts, $order, $nested, $revision, $stamp, $retained) =
+            ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision},
+             $self->{_manifest_stamp}, [ @{ $self->{_retained} } ]);
         my $ret;
         my $ok = eval {
             $ret = $code->();
@@ -712,7 +729,8 @@ sub _mutate {
         };
         my $err = $@;
         if (!$ok) {
-            @{$self}{qw(mounts order _nested _revision _manifest_stamp)} = ($mounts, $order, $nested, $revision, $stamp);
+            @{$self}{qw(mounts order _nested _revision _manifest_stamp _retained)} =
+                ($mounts, $order, $nested, $revision, $stamp, $retained);
             my $cleanup = _cleanup_paths($self->{_pending_paths});
             # An exception object must reach the caller intact; the rewrite and
             # re-croak below would stringify it.
@@ -724,6 +742,12 @@ sub _mutate {
             Carp::croak($err . (length $cleanup ? " (rollback: $cleanup)" : ''));
         }
         $self->_invalidate_compiled if $self->{_changed};
+        # Still holding the topology lock, and only after the manifest no
+        # longer names the storage. Run outside the lock, a removal raced a
+        # sibling process that had already read the new manifest, mounted the
+        # same name onto the file that was about to go, and published a mount
+        # nothing could ever open.
+        $after->() if $after;
         return $ret;
     });
 }
@@ -796,6 +820,8 @@ sub _replay_manifest {
     local $self->{_replaying} = 1;
     local $self->{_opening} = 1;
     local $self->{_abs_cache} = {};     # shared with $check by the copy below
+    # Before the replay, so a mount that adopts retained storage clears it.
+    $self->{_retained} = [ @{ $data->{retained} || [] } ];
     my $check = bless { %$self, mounts => {} }, ref $self;
     my @recipes;
     for my $m (@{ $data->{mounts} }) {
@@ -856,6 +882,14 @@ sub _install_recipe {
     $self->{_nested} = 1 if index($name, '/') >= 0;
     $self->{_changed} = 1;
     $self->{_published} = 1 unless $recipe->{transient};
+    # A mount adopting retained storage owns it again, so the manifest must
+    # stop offering it to unlink_all as loose storage.
+    if (@{ $self->{_retained} } && @{ $recipe->{storage_paths} }) {
+        my %adopted = map { $_ => 1 } @{ $recipe->{storage_paths} };
+        my $before = @{ $self->{_retained} };
+        @{ $self->{_retained} } = grep { !$adopted{$_} } @{ $self->{_retained} };
+        $self->{_published} = 1 if @{ $self->{_retained} } != $before;
+    }
     return $composite ? Data::Shared::Node->new($self, [split m{/}, $name]) : $handle;
 }
 
@@ -865,10 +899,24 @@ sub mount {
     return $self->_mutate(sub { $self->_install_recipe($self->_recipe($name, $spec, @args)) });
 }
 
+# mount accepts '/a/' for 'a', and handle, node and children all canonicalize
+# through _path_components, so unmount and mount_info reading the name verbatim
+# made the symmetric spelling a silent no-op.
+sub _canon_mount_name {
+    my ($name) = @_;
+    return undef unless defined $name && !ref $name;
+    $name =~ s{^/+}{};
+    $name =~ s{/+$}{};
+    return length $name ? $name : undef;
+}
+
 sub unmount {
     my ($self, $name, %opt) = @_;
     my @unknown = sort grep { $_ ne 'unlink' } keys %opt;
     Carp::croak("Data::Shared: unknown unmount option '$unknown[0]'") if @unknown;
+    $name = _canon_mount_name($name);
+    return 0 unless defined $name;
+    $self->_check_unlinkable($name) if $opt{unlink};
     my $gone;
     my $ret = $self->_mutate(sub {
         $gone = delete $self->{mounts}{$name} or return 0;
@@ -876,22 +924,67 @@ sub unmount {
         $self->{_nested} = (grep { index($_, '/') >= 0 } keys %{ $self->{mounts} }) ? 1 : 0;
         $self->{_changed} = 1;
         $self->{_published} = 1 unless $gone->{transient};
+        # Retaining the storage is the documented behaviour, and the manifest
+        # is where it has to be said: recorded in this root's memory only, the
+        # list died with the process that unmounted, so the next process --
+        # the coordinator pattern the POD recommends -- could not reclaim it
+        # with unlink_all, and a same-named remount served the old data back.
+        $self->_record_retained($gone->{storage_paths}) unless $opt{unlink} || $gone->{transient};
         return 1;
-    });
-    return $ret unless $ret && $gone;
     # Only once the manifest no longer names it: unlinked first, a failed
     # publish would roll the mount back onto storage that is already gone.
-    if ($opt{unlink}) {
-        my $handle = $gone->{handle};
-        $handle->unlink if $handle && $handle->can('unlink');
-    }
-    else {
-        # Retaining it is the documented behaviour, but unlink_all could not
-        # find it afterwards, so a later mount of the same name adopted it --
-        # data and all -- in a store the caller believed it had emptied.
-        push @{ $self->{_retained} }, @{ $gone->{storage_paths} || [] };
-    }
+    }, $opt{unlink} ? sub { $self->_retire_storage($gone) } : undef);
     return $ret;
+}
+
+# One handle can be mounted under several names on purpose, and the alias is
+# transient, so retiring it published nothing while still removing the file its
+# persistent owner is recorded under: no process could open the store again.
+sub _check_unlinkable {
+    my ($self, $name) = @_;
+    my $mount = $self->{mounts}{$name} or return;
+    my $handle = $mount->{handle};
+    return unless blessed($handle);
+    my $addr = refaddr($handle);
+    for my $other (@{ $self->{order} }) {
+        next if $other eq $name;
+        my $sibling = $self->{mounts}{$other}{handle};
+        next unless blessed($sibling) && refaddr($sibling) == $addr;
+        Carp::croak("Data::Shared: mount '$name' shares its storage with '$other';"
+            . " unmount '$other' as well, or unmount '$name' without unlink");
+    }
+    return;
+}
+
+sub _retire_storage {
+    my ($self, $gone) = @_;
+    my $handle = $gone && $gone->{handle};
+    return unless $handle && $handle->can('unlink');
+    return if eval { $handle->unlink; 1 };
+    my $err = $@;
+    # The manifest has already stopped naming this mount, so storage that
+    # survived the removal has to be recorded as retained before the error
+    # leaves: otherwise nothing names it and no later call can reclaim it.
+    $self->_record_retained($gone->{storage_paths});
+    if ($self->{_published}) {
+        $self->{_revision}++;
+        $self->_write_manifest;
+    }
+    die $err;
+}
+
+# Deduplicated, because a mount rotated under one name retains the same path
+# every cycle: the duplicates grew the manifest and the root without bound and
+# made unlink_all report a removal per cycle instead of per file.
+sub _record_retained {
+    my ($self, $paths) = @_;
+    return unless $paths && @$paths;
+    my %have = map { $_ => 1 } @{ $self->{_retained} };
+    my @new = grep { !$have{$_}++ } @$paths;
+    return unless @new;
+    push @{ $self->{_retained} }, @new;
+    $self->{_published} = 1;
+    return;
 }
 
 sub handle {
@@ -949,7 +1042,9 @@ sub mount_names { my @k = $_[0]->mounts; return @k }
 
 sub mount_info {
     my ($self, $name) = @_;
-    my $m = $self->{mounts}{$name} or return undef;
+    $name = _canon_mount_name($name);
+    my $m = defined $name ? $self->{mounts}{$name} : undef;
+    return undef unless $m;
     return { name => $name, class => $m->{class}, key => $m->{entry}{key},
              dist => $m->{entry}{dist}, path_class => $m->{entry}{path_class},
              file => $m->{file}, transient => $m->{transient},
@@ -959,8 +1054,15 @@ sub mount_info {
 sub sync_all {
     my ($self) = @_;
     my $n = 0;
-    for my $m (values %{ $self->{mounts} }) {
-        if ($m->{handle}->can('sync')) { $m->{handle}->sync; $n++ }
+    # Insertion order and subtree counting, as freeze_all does: hash order made
+    # which mounts were flushed before a croak differ from run to run, and
+    # counting the mount reported 1 for a composite that flushed its parent,
+    # its index and every registered child.
+    for my $name (@{ $self->{order} }) {
+        my $h = $self->{mounts}{$name}{handle};
+        next unless $h->can('sync');
+        if ($h->isa('Data::Shared::Composite')) { $n += $h->sync }
+        else { $h->sync; $n++ }
     }
     return $n;
 }
@@ -1027,19 +1129,38 @@ sub unlink_all {
             # remove.
             elsif (!$!{ENOENT}) { Carp::croak("Data::Shared: cannot unlink manifest: $!") }
         }
-        # Storage an unmount on this root retained, by the paths that mount
-        # itself recorded: left behind, the next same-named mount in a store
-        # the caller believed it had emptied adopted it, data and all, and a
-        # program that rotates mounts grew on disk without bound.
-        if (my $retained = delete $self->{_retained}) {
-            my $failed = _cleanup_paths($retained);
+        # Storage an unmount retained, by the paths the mount itself recorded
+        # and the manifest published, so any process can reclaim it. Counted by
+        # what this call actually removed, and what resisted stays on the list
+        # for a retry: deleting the list first left paths nothing could name.
+        if (@{ $self->{_retained} }) {
+            my %seen;
+            my @paths = grep { !$seen{$_}++ } @{ $self->{_retained} };
+            my $existed = grep { -e } @paths;
+            my $failed = _cleanup_paths(\@paths);
+            my @left = grep { -e } @paths;
+            $n += $existed - @left;
+            @{ $self->{_retained} } = @left;
             Carp::croak("Data::Shared: $failed") if length $failed;
-            $n += @$retained;
         }
-        # Ours and empty once every composite is gone. The lock file stays: a
-        # process still holding it would keep an fd to a deleted file while the
-        # next one created a fresh lock, and the two would not serialise.
-        rmdir "$self->{dir}/.children" if defined $self->{dir};
+        # Ours and empty once every composite is gone, except for a directory a
+        # killed producer left unpublished: the POD says unlink_all is what
+        # reclaims those, and an unchecked rmdir on a non-empty .children left
+        # them for ever. The whole store is being torn down here, so anything
+        # still under our own hidden directory goes with it.
+        if (defined $self->{dir}) {
+            my $children = "$self->{dir}/.children";
+            if (opendir my $dh, $children) {
+                my @orphans = map { "$children/$_" } grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+                closedir $dh;
+                if (@orphans) {
+                    my $failed = _cleanup_paths(\@orphans);
+                    Carp::croak("Data::Shared: $failed") if length $failed;
+                    $n += @orphans;
+                }
+            }
+            rmdir $children;
+        }
         $self->{mounts} = {};
         $self->{order} = [];
         $self->{_nested} = 0;
@@ -1141,7 +1262,10 @@ cloned into ithreads (C<CLONE_SKIP>).
 The leaf dists are recommended rather than required, so installing this
 facade does not compile all 39 of them. Install the ones you mount;
 mounting a type whose dist is absent croaks naming the dist to install.
-C<cpanm --with-recommends Data::Shared> installs every leaf.
+C<cpanm --with-recommends Data::Shared> installs every leaf. One
+dependency is not implied by what you mount: a composite on an anonymous
+root locks its children with Data-Sync-Shared, so install that dist too.
+File-backed composites use the directory lock and do not need it.
 
 =head1 ROOT AND MOUNTS
 
@@ -1236,16 +1360,31 @@ C<set>/C<keys> backing paths are auto-filled for file-backed roots.
 Backing paths already owned by another mount are rejected before
 construction, including aliases produced by filename sanitization
 (e.g. C<a/b> and C<a__b>) and string SortedSet sidecars. Mount the
-same native handle under another name to share it intentionally.
+same native handle under another name to share it intentionally; an
+C<unmount> that would unlink storage another mount still names is
+refused, so retire the aliases first.
+
+Mount names are matched by longest prefix over the joined path, so a
+nested name wins over the same string reached through a shorter mount:
+with C<users> and C<users/sales> mounted, C</users/sales/eu> addresses
+the C<users/sales> mount, not the C<sales> record or composite child of
+C<users>. That holds for array paths too, where a component containing
+C</> joins like any other, so do not give a nested mount a name that
+spells out an address its parent also serves.
 
 =head2 $root->unmount($name), $root->mounts, $root->mount_info($name)
 
-Lifecycle and introspection for mounts. C<unmount> retains the mount's
-storage, so a later mount of the same name adopts it;
-C<< unmount($name, unlink => 1) >> removes it instead, once the manifest no
-longer names it. A native C<unlink> or C<destroy> reached through
-C<shared_call> at a mount does the same, because leaving the manifest naming
-storage that is gone makes the store refuse to open at all.
+Lifecycle and introspection for mounts. Names are canonicalized as
+C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
+C<unmount> retains the mount's storage, so a later mount of the same
+name adopts it, and the manifest records what was retained: any process
+that opens the root afterwards reclaims it with C<unlink_all>.
+C<< unmount($name, unlink => 1) >> removes it instead, under the same
+directory lock that published its removal, so a sibling process cannot
+mount the name onto storage that is about to go. A native C<unlink> or
+C<destroy> reached through C<shared_call> at a mount does the same,
+because leaving the manifest naming storage that is gone makes the store
+refuse to open at all.
 Manifest changes use a directory lock and revision. A root opened before
 another writer's topology change receives a C<stale manifest revision> error
 before constructors or factories run. Reopen the root and retry with the
@@ -1256,10 +1395,11 @@ the revision before operating on shared storage.
 A mount argument has to be representable in the manifest, since replaying it
 is how every later process reopens the store: C<Inf>, C<NaN> and a lone
 surrogate are refused at mount time rather than published as text nothing can
-parse back. Strings are recorded as bytes, so a path spelled as characters
-above Latin-1 names the same file as its UTF-8 byte spelling. A character in
-U+0080..U+00FF is indistinguishable from a Latin-1 byte and names the
-one-byte file.
+parse back. Strings are recorded as bytes: a path held as characters is encoded to
+its UTF-8 bytes, so it names the same file as that byte spelling. The
+rule is uniform across U+0080 and above, which means a character
+C<"\x{e9}"> and the single byte C<"\xe9"> are two different paths
+naming two different files.
 
 Version-one manifests without a revision are accepted as revision zero.
 New writers add a revision and a F<.manifest.lock> file; existing backend
@@ -1363,6 +1503,12 @@ the native C<$method>. Every native operation of every leaf is
 reachable this way, including those with no generic verb. On a
 composite mount the first remaining component instead selects the
 child, and the rest are passed to the child's method.
+
+C<unlink> and C<destroy> are the exception: they retire storage, so they
+are only accepted where a registration can be retired with it, at a
+mount or at a composite child, and are refused at a record below one.
+At a composite child they remove the child's registration too, the same
+as C<shared_delete> on that address.
 
     shared_call($root, '/visitors', 'add_many', ['a', 'b']);
     shared_call($root, '/fenwick', 'prefix', 500);

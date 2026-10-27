@@ -2,6 +2,8 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use Time::HiRes ();
+use POSIX ();
 use Data::Shared qw(shared_get shared_set shared_call shared_compile sharedc_call);
 
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
@@ -123,4 +125,105 @@ subtest 'a native unlink retires the mount with the storage' => sub {
     }
 };
 
+# Recorded in this root's memory only, the retained list died with the process
+# that unmounted: the next one could not reclaim the storage with unlink_all,
+# and a same-named remount served the old data back.
+subtest 'another process reclaims what an unmount retained' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $a = Data::Shared->new($dir);
+        $a->mount('keep', 'hashmap:ii', undef, 16);
+        $a->mount('cache', 'hashmap:ii', undef, 100);
+        $a->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+        shared_set($a, '/cache/1', 111);
+        shared_set($a, '/users/alice/1', 222);
+        $a->unmount($_) for qw(cache users);
+    }
+    my $b = Data::Shared->open($dir);
+    is_deeply [$b->mounts], ['keep'], 'the survivor is the only mount';
+    ok $b->unlink_all, 'unlink_all succeeds';
+    is bytes_under($dir), 0, 'and reclaims the storage the other process retained';
+    ok !-d "$dir/.children", 'including the composite child directory';
+
+    my $c = Data::Shared->new($dir);
+    $c->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+    is shared_get($c, '/users/alice/1'), undef, 'a later mount does not resurrect it';
+};
+
+subtest 'unlink_all counts what it removed, not what was retained' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    for my $i (1 .. 20) {
+        $root->mount('s', 'hashmap:ii', undef, 16);
+        shared_set($root, '/s/1', $i);
+        $root->unmount('s');
+    }
+    is $root->unlink_all, 2, 'one backing file and the manifest';
+    is bytes_under($dir), 0, 'and nothing is left on disk';
+};
+
+# One handle can be mounted twice on purpose, and the alias is transient, so
+# retiring it published nothing while removing the file its persistent owner is
+# recorded under: no process could open the store again.
+subtest 'storage shared with another mount is not unlinked' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    my $handle = $root->mount('cache', 'hashmap:ss', undef, 100);
+    shared_set($root, '/cache/k', 'v');
+    $root->mount('alias', $handle);
+    for my $how (['unmount', sub { $_[0]->unmount('alias', unlink => 1) }],
+                 ['shared_call', sub { shared_call($_[0], '/alias', 'unlink') }]) {
+        my ($label, $call) = @$how;
+        ok !eval { $call->($root); 1 }, "$label: refused";
+        like $@, qr/shares its storage with 'cache'/, "$label: and says with which mount";
+    }
+    ok -e "$dir/cache.shm", 'the owner still has its storage';
+    ok $root->unmount('alias'), 'unmounting the alias without unlink is fine';
+    undef $root; undef $handle;
+    ok eval { Data::Shared->open($dir) }, 'and the store still opens' or diag $@;
+};
+
+# Removed after the lock was released, a sibling that had already read the new
+# manifest could mount the same name onto the file that was about to go.
+subtest 'storage is removed while the topology lock is held' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $stamp = "$dir/removed-at";
+    my $root = Data::Shared->new($dir);
+    $root->mount('keep', 'hashmap:ii', undef, 16);
+    $root->mount('scratch', SlowUnlink->new($stamp));
+
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        select undef, undef, undef, 0.2;        # land inside the removal
+        my $other = eval { Data::Shared->open($dir) };
+        $other->mount('sibling', 'hashmap:ii', undef, 16) if $other;
+        if (open my $fh, '>', "$dir/locked-at") {
+            print $fh Time::HiRes::time();
+            close $fh;
+        }
+        POSIX::_exit(0);
+    }
+    $root->unmount('scratch', unlink => 1);
+    waitpid $pid, 0;
+
+    my $removed = -e $stamp ? do { open my $f, '<', $stamp; local $/; <$f> } : undef;
+    my $locked = -e "$dir/locked-at" ? do { open my $f, '<', "$dir/locked-at"; local $/; <$f> } : undef;
+    ok defined $removed && length $removed, 'the removal ran';
+    ok defined $locked && length $locked, 'the sibling changed topology';
+    cmp_ok $locked, '>', $removed, 'only after the storage was gone'
+        if defined $removed && defined $locked && length $removed && length $locked;
+};
+
 done_testing;
+
+package SlowUnlink;
+sub new { my ($class, $stamp) = @_; return bless { stamp => $stamp }, $class }
+sub unlink {
+    my ($self) = @_;
+    select undef, undef, undef, 0.6;
+    open my $fh, '>', $self->{stamp} or die $!;
+    print $fh Time::HiRes::time();
+    close $fh or die $!;
+    return 1;
+}

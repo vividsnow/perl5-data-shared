@@ -174,6 +174,14 @@ sub read {
         Carp::croak("Data::Shared: invalid mount arguments in '$path'") unless ref $mount->{args} eq 'ARRAY';
         Carp::croak("Data::Shared: missing mount spec in '$path'") unless defined $mount->{spec};
     }
+    if (exists $data->{retained}) {
+        Carp::croak("Data::Shared: invalid retained storage in '$path'")
+            unless ref $data->{retained} eq 'ARRAY';
+        for my $kept (@{ $data->{retained} }) {
+            Carp::croak("Data::Shared: invalid retained storage in '$path'")
+                unless defined $kept && !ref $kept && length $kept;
+        }
+    }
     # Everything decoded from the file is tainted, and the backing path is built
     # from the mount name, so under -T a leaf with a taint guard refused to
     # reopen: a store was writable once and dead afterwards. The manifest is
