@@ -643,6 +643,33 @@ sub _track_paths {
     push @{ $self->{_pending_paths} }, grep { defined $_ && !-e $_ } @paths;
 }
 
+# A composite directory is removed while another process may be part-way
+# through opening a child under it, holding that composite's own lock. The
+# sweep ignored that lock, so it could remove the directory between a worker's
+# instance check and its open, and the worker then attached to the replacement
+# that appeared at the same child path. Taking the lock first lets the worker
+# finish against the old instance, which is what the POD allows it to do.
+# Ordering is topology lock then composite lock, the same direction every other
+# path takes, so this cannot deadlock against a worker that holds only the
+# latter.
+sub _lock_composite_dirs {
+    my ($paths) = @_;
+    my @held;
+    for my $path (@$paths) {
+        next unless -d $path && !-l $path;
+        my $lockfile = "$path/.lock";
+        next unless -e $lockfile;
+        require Fcntl;
+        # CORE::open, because this package defines an open of its own.
+        CORE::open(my $fh, '+<', $lockfile) or next;
+        until (flock $fh, Fcntl::LOCK_EX()) {
+            last unless $!{EINTR};
+        }
+        push @held, $fh;
+    }
+    return \@held;
+}
+
 sub _cleanup_paths {
     my ($paths) = @_;
     my @errors;
@@ -838,7 +865,13 @@ sub _replay_manifest {
         push @recipes, $recipe;
     }
     my $ok = eval { $self->_install_recipe($_) for @recipes; 1 };
-    Carp::croak("Data::Shared: failed to replay manifest '$path': $@") unless $ok;
+    unless ($ok) {
+        # Stripped as _mutate and Composite::_rethrow strip it: the inner error
+        # already carries a location, and wrapping it added a second one.
+        my $why = $@;
+        $why =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s unless ref $why;
+        Carp::croak("Data::Shared: failed to replay manifest '$path': $why");
+    }
     $self->{_revision} = $data->{revision};
     $self->{_manifest_stamp} = $raw;
     $self->_invalidate_compiled;
@@ -934,7 +967,14 @@ sub unmount {
         # list died with the process that unmounted, so the next process --
         # the coordinator pattern the POD recommends -- could not reclaim it
         # with unlink_all, and a same-named remount served the old data back.
-        $self->_record_retained($gone->{storage_paths}) unless $opt{unlink} || $gone->{transient};
+        # Recorded even when it is about to be unlinked, so that the published
+        # manifest names the storage for the moment between losing the mount
+        # and losing the file. A process killed in that window left the file
+        # named by nothing at all: not the manifest, not the ledger, so a later
+        # mount of the same name adopted it and served the old data, and no
+        # call could reclaim it. _retire_storage drops the entry once the file
+        # is actually gone.
+        $self->_record_retained($gone->{storage_paths}) unless $gone->{transient};
         return 1;
     # Only once the manifest no longer names it: unlinked first, a failed
     # publish would roll the mount back onto storage that is already gone.
@@ -1001,18 +1041,30 @@ sub _storage_of {
 sub _retire_storage {
     my ($self, $gone) = @_;
     my $handle = $gone && $gone->{handle};
-    return unless $handle && $handle->can('unlink');
-    return if eval { $handle->unlink; 1 };
-    my $err = $@;
-    # The manifest has already stopped naming this mount, so storage that
-    # survived the removal has to be recorded as retained before the error
-    # leaves: otherwise nothing names it and no later call can reclaim it.
-    $self->_record_retained($gone->{storage_paths});
-    if ($self->{_published}) {
-        $self->{_revision}++;
-        $self->_write_manifest;
+    # Nothing to remove, so the ledger entry recorded for the crash window has
+    # no file to describe.
+    return $self->_forget_retained($gone) unless $handle && $handle->can('unlink');
+    unless (eval { $handle->unlink; 1 }) {
+        my $err = $@;
+        # Left on the ledger, which already names it: the storage survived the
+        # removal and something has to be able to reclaim it.
+        die $err;
     }
-    die $err;
+    return $self->_forget_retained($gone);
+}
+
+# The file is gone, so the entry that covered the window between the publish
+# and the removal has done its job.
+sub _forget_retained {
+    my ($self, $gone) = @_;
+    my @paths = @{ ($gone && $gone->{storage_paths}) || [] } or return;
+    my %drop = map { $self->_ledger_form($_) => 1 } @paths;
+    my $before = @{ $self->{_retained} };
+    @{ $self->{_retained} } = grep { !$drop{$_} } @{ $self->{_retained} };
+    return if @{ $self->{_retained} } == $before;
+    $self->{_revision}++;
+    $self->_write_manifest unless $self->{readonly};
+    return;
 }
 
 # Deduplicated, because a mount rotated under one name retains the same path
@@ -1221,7 +1273,10 @@ sub unlink_all {
             my @entries = grep { !$seen{$_}++ } @{ $self->{_retained} };
             my %path = map { $_ => $self->_ledger_resolve($_) } @entries;
             my $existed = grep { -e $path{$_} } @entries;
-            my $failed = _cleanup_paths([ map { $path{$_} } @entries ]);
+            my @paths = map { $path{$_} } @entries;
+            my $held = _lock_composite_dirs(\@paths);
+            my $failed = _cleanup_paths(\@paths);
+            undef $held;
             my @left = grep { -e $path{$_} } @entries;
             $n += $existed - @left;
             @{ $self->{_retained} } = @left;
@@ -1238,7 +1293,9 @@ sub unlink_all {
                 my @orphans = map { "$children/$_" } grep { $_ ne '.' && $_ ne '..' } readdir $dh;
                 closedir $dh;
                 if (@orphans) {
+                    my $held = _lock_composite_dirs(\@orphans);
                     my $failed = _cleanup_paths(\@orphans);
+                    undef $held;
                     Carp::croak("Data::Shared: $failed") if length $failed;
                     $n += @orphans;
                 }
@@ -1477,7 +1534,13 @@ Manifest changes use a directory lock and revision. A root opened before
 another writer's topology change receives a C<stale manifest revision> error
 before constructors or factories run. Reopen the root and retry with the
 current configuration. Roots keep their own mount namespace until reopened;
-they do not refresh automatically. C<freeze_all> and C<unlink_all> also check
+they do not refresh automatically. A composite child already open in a root
+is part of that namespace: if another process destroys and recreates the
+store, this root goes on reading the child it holds, and C<exists> and
+C<children> still report it, until something makes it take the composite
+lock again and the instance check fires. Such a root never crosses into the
+new store's storage, but it is answering for the old one, so a worker that
+must notice a teardown should reopen rather than wait to be told. C<freeze_all> and C<unlink_all> also check
 the revision before operating on shared storage.
 
 A mount argument has to be representable in the manifest, since replaying it
@@ -1731,13 +1794,17 @@ missing construction records are not reconstructed automatically.
 
 The facade is pure Perl; every operation ends in the leaf's XS, so
 per-call overhead depends on the tier. A sample run of
-F<bench/overhead.pl> on one idle x86_64 host, reading one integer key:
+F<bench/overhead.pl> on one x86_64 host, reading one integer key, rates
+taken from measured CPU time:
 
     native handle    0.08 us/op
-    compiled         0.58 us/op
-    array path       2.07 us/op
-    shared_call      2.21 us/op
-    string path      2.80 us/op
+    compiled         0.65 us/op
+    array path       2.60 us/op
+    shared_call      2.60 us/op
+    string path      3.40 us/op
+
+Those are one host's figures and the string tier varied by about 15% run
+to run; the ordering is the durable part, not the values.
 
 The string and array tiers pay for path parsing and mount resolution on
 every call. A compiled path skips both: a live binding is checked only
@@ -1746,7 +1813,8 @@ bound closure without being copied again. Use compiled paths, or the
 native handle from C<handle>, in hot loops. The handle is the floor and
 costs no facade call at all, which is why dispatch is not in XS: an XS
 dispatcher would speed up a middle tier that callers can bypass. Run
-F<bench/benchmark.pl> and F<bench/overhead.pl> on your hardware.
+F<bench/benchmark.pl>, F<bench/overhead.pl> and F<bench/mounts.pl> on your
+hardware; every figure quoted here comes from one of them.
 F<bench/composite.pl> measures deep reads with a warm child cache
 and with repeated cache eviction. Composite compiled paths still
 resolve the child registry on every call; their cost differs from
@@ -1754,12 +1822,13 @@ flat compiled paths.
 
 Creating flat mounts costs quadratic total time in their number: each one
 validates and republishes the whole manifest, so the marginal cost of one
-more doubles as the count doubles. On one idle host the average was about
-1.3 ms per mount at 25 mounts and 7.6 ms at 200, i.e. 1.5 s to create 200,
-with the 200th alone costing about 15 ms. Keys are not affected: writing
-10_000 keys into one flat mount took 32 ms and never touches the manifest.
-Opening such a root is superlinear too, and paid by every process that opens
-it: about 0.13 s to replay 400 mounts on the same host.
+more doubles as the count doubles. F<bench/mounts.pl> measures this; on the
+same host the average was 1.4 ms per mount at 25 mounts and 8.0 ms at 200,
+i.e. 1.6 s to create 200, with the 200th alone costing 16 ms. Keys are not
+affected: writing 10_000 keys into one flat mount took 38 ms and never
+touches the manifest, which that script also asserts. Opening such a root
+is superlinear too, and paid by every process that opens it: 0.15 s to
+replay 400 mounts on the same host.
 A namespace with hundreds of B<mounts> belongs in a composite mount
 (L</DEEP PATHS (COMPOSITES)>) instead, where children are registered in the
 parent and the root manifest stays a single record.

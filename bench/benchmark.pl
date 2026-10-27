@@ -35,7 +35,9 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
 }
 
 {
-    print "\n== Queue::Int push+pop ==\n";
+    # Each iteration is a push AND a pop, so these rates are per pair, not per
+    # operation: they are not comparable with the single-op cases above.
+    print "\n== Queue::Int push+pop (rate is per push+pop pair) ==\n";
     my $root = Data::Shared->new;
     $root->mount('jobs', 'queue:int', undef, 8192);
     my $native = $root->handle('/jobs');
@@ -52,9 +54,13 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
     my $root = Data::Shared->new;
     $root->mount('visitors', 'hyperloglog', undef, 14);
     my $native = $root->handle('/visitors');
+    # count as well as add, which the heading has always claimed: a read and a
+    # write through the escape hatch do not cost the same.
     cmpthese(-$secs, {
-        native => sub { $native->add('alice') },
-        call   => sub { shared_call($root, '/visitors', 'add', 'alice') },
+        'native add'  => sub { $native->add('alice') },
+        'call add'    => sub { shared_call($root, '/visitors', 'add', 'alice') },
+        'native count' => sub { my $v = $native->count },
+        'call count'  => sub { my $v = shared_call($root, '/visitors', 'count') },
     });
 }
 

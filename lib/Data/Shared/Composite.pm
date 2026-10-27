@@ -971,8 +971,22 @@ sub delete_subtree {
         if (defined $id) {
             my $rt = $self->_forget($id) || $cleanup_rt;
             if ($rt) {
-                if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
-                elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
+                # Said the same way the directory removal below says it: the
+                # index entries are already gone by here, so a raw backend
+                # error from the child's own retirement read as though the
+                # delete had failed, while the very next failure point reported
+                # the same state accurately.
+                my $ok = eval {
+                    if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
+                    elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
+                    1;
+                };
+                unless ($ok) {
+                    my $why = $@;
+                    $why =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s unless ref $why;
+                    Carp::croak("Data::Shared: subtree detached but retiring its storage"
+                        . " failed: $why");
+                }
             }
             if (defined $self->{dir}) {
                 my $cleanup = Data::Shared::_cleanup_paths(["$self->{dir}/child-$id"]);
@@ -990,6 +1004,12 @@ sub destroy {
     # native unlink at the mount croaked on the missing directory and left the
     # manifest behind, so the root could not be reopened either.
     return 0 if defined $self->{dir} && !-d $self->{dir};
+    # A teardown is the one operation allowed to run against a dead instance:
+    # it is what makes it dead. Without this, a destroy that removed the index
+    # and then failed to remove the directory -- an unwritable .children, say
+    # -- could never be retried, because the retry met its own absent index
+    # and refused, leaving the directory and the manifest for ever.
+    local $self->{_cleanup} = 1;
     return $self->_with_lock(sub {
         my $frozen = $self->{index}->can('frozen') && $self->{index}->frozen;
         if (!$frozen) {
@@ -1164,9 +1184,13 @@ Data::Shared::Composite - Runtime for composite Data::Shared mounts
 Internal to L<Data::Shared>; not a public API. A composite mount
 keeps one child instance per parent address: children are allocated
 through a hidden registry, constructed lazily on first write, opened
-on demand from per-child storage, and cached with LRU eviction.
-Reads of a missing child never create one. See the C<DEEP PATHS>
-section of L<Data::Shared>.
+on demand from per-child storage, and cached with LRU eviction, which
+C<cache_size> bounds for a file-backed root only: an anonymous segment
+cannot be reopened once evicted, so an anonymous composite keeps every
+child it has opened. A read of a missing child never creates one, but
+C<call> at a missing address does, because the facade cannot know
+whether the native method mutates. See the C<DEEP PATHS> section of
+L<Data::Shared>, which is authoritative for both.
 
 Lifecycle mutations are serialized through allocation, construction,
 publication, and deletion. Exception rollback preserves existing scores and

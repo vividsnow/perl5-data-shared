@@ -3,6 +3,8 @@ use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
 use POSIX qw(_exit);
+use Fcntl ();
+use Time::HiRes ();
 use Data::Shared qw(shared_compile sharedc_get);
 
 eval { require Data::HashMap::Shared::SS; require Data::Sync::Shared::RWLock; 1 }
@@ -420,6 +422,45 @@ subtest 'a stale read-only composite cannot attach to a recreated store' => sub 
     my $fresh_reader = Data::Shared->open_readonly($dir);
     is $fresh_reader->get('/users/dave/k'), 'dave-new-store',
         'a fresh reader still sees the new store';
+};
+
+# The instance check is check-then-open, so removing a composite's directory
+# without taking its lock could drop it between a worker's check and its child
+# open -- and the worker then attached to whatever appeared at the same child
+# path. Teardown waits for the lock now, which lets the worker finish against
+# the old instance as the POD allows.
+subtest 'teardown waits for a composite lock it does not hold' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('users', ['hashmap:ss', 100, ['hashmap:ss', 100]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    $root->set('/users/alice/k', 'v');
+    my $lockfile = "$dir/.children/users/.lock";
+    ok -e $lockfile, 'the composite has its own lock';
+
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '+<', $lockfile) && flock $fh, Fcntl::LOCK_EX();
+        syswrite $held_w, $ok ? "held\n" : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    my $ack = <$held_r>;
+    is $ack, "held\n", 'a worker holds it';
+
+    my $start = Time::HiRes::time();
+    $root->unmount('users');
+    $root->unlink_all;
+    my $waited = Time::HiRes::time() - $start;
+    waitpid $pid, 0;
+    is $?, 0, 'the worker kept the lock for its whole hold';
+    cmp_ok $waited, '>', 1, 'the teardown waited for it rather than removing underneath';
+    ok !-d "$dir/.children/users", 'and then removed the directory';
 };
 
 done_testing;

@@ -358,6 +358,75 @@ subtest 'a retained entry resolves against a wide-character root' => sub {
     is scalar(() = glob "$dir/*.shm"), 0, 'and the retained file is really gone';
 };
 
+# The ownership check runs before _mutate scopes the path cache, so a rotation
+# left one memo per retired path in the root for its whole lifetime.
+subtest 'rotating mounts does not grow the root' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    for my $i (1 .. 50) {
+        $root->mount("rot$i", 'hashmap:ii', undef, 16);
+        $root->unmount("rot$i", unlink => 1);
+    }
+    is_deeply [$root->mounts], [], 'every rotation was retired';
+    is scalar keys %{ $root->{_abs_cache} || {} }, 0,
+        'and no resolved path is held after the operation that resolved it';
+    is bytes_under($dir), (-s "$dir/manifest.json" || 0), 'only the manifest is left on disk';
+};
+
+# A teardown is the one operation allowed to run against a dead instance: it
+# is what makes it dead. Treating an absent index as retired meant a destroy
+# that removed the index and then failed to remove the directory could never be
+# retried, and the store could not be opened either.
+subtest 'a teardown blocked part-way can be retried' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('users', ['hashmap:ss', 100, ['hashmap:ss', 100]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    shared_set($root, '/users/alice/k', 'v');
+    $root->freeze_all;
+    chmod 0500, "$dir/.children" or die $!;
+    plan skip_all => 'running as a user that ignores directory permissions'
+        if rmdir "$dir/.children/users";
+    ok !eval { $root->unlink_all; 1 }, 'the blocked teardown reports failure';
+    ok -d "$dir/.children/users", 'and leaves the directory it could not remove';
+    chmod 0700, "$dir/.children" or die $!;
+    ok $root->unlink_all, 'the retry completes';
+    ok !-d "$dir/.children/users", 'the directory is gone';
+    ok !-e "$dir/manifest.json", 'and so is the manifest';
+};
+
+# Between publishing a manifest without the mount and removing its storage,
+# the file was named by nothing: not the manifest, not the ledger. A process
+# killed there left a file a later same-named mount adopted -- serving old data
+# -- that no call could reclaim. The ledger now covers that window.
+subtest 'a kill between the publish and the removal leaves the file reclaimable' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $root = Data::Shared->new($dir);
+        $root->mount('m1', 'hashmap:ss', undef, 128);
+        shared_set($root, '/m1/secret', 'olddata');
+    }
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        my $root = Data::Shared->open($dir);
+        no warnings 'redefine';
+        # The only way into that window: die where the removal would have run.
+        local *Data::Shared::_retire_storage = sub { kill 9, $$ };
+        $root->unmount('m1', unlink => 1);
+        POSIX::_exit(0);
+    }
+    waitpid $pid, 0;
+    is $? & 127, 9, 'the worker died in the window';
+    ok -e "$dir/m1.shm", 'its storage is still on disk';
+    my $manifest = do { open my $fh, '<', "$dir/manifest.json" or die $!; local $/; <$fh> };
+    unlike $manifest, qr/"m1"/, 'the manifest no longer names the mount';
+    like $manifest, qr/"retained"\s*:\s*\[[^\]]*m1/, 'but the ledger names the storage';
+    my $next = Data::Shared->open($dir);
+    ok $next->unlink_all, 'so another process can reclaim it';
+    ok !-e "$dir/m1.shm", 'and the storage is gone';
+};
+
 done_testing;
 
 package SlowUnlink;

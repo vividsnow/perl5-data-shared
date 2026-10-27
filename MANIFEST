@@ -2,6 +2,7 @@
 .gitignore
 bench/benchmark.pl
 bench/composite.pl
+bench/mounts.pl
 bench/overhead.pl
 bench/results.txt
 bench/scaling.pl

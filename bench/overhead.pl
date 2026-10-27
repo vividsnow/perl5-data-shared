@@ -26,7 +26,12 @@ for my $case (
 ) {
     my ($name, $code) = @$case;
     my $r = countit($secs, $code);
-    my $rate = $r->iters / $r->cpu_p;
+    my $cpu = $r->cpu_p;
+    if ($cpu <= 0) {
+        printf "%-14s no CPU time measured; raise DS_BENCH_TIME\n", $name;
+        next;
+    }
+    my $rate = $r->iters / $cpu;
     printf "%-14s %10.0f/s  %6.2f us/op\n", $name, $rate, 1e6 / $rate;
 }
 print "sanity: ", shared_get($root, '/cache/500'), "\n";
