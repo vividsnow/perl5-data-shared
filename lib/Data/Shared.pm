@@ -1539,11 +1539,12 @@ encoded to its UTF-8 bytes first, uniformly from U+0080 up: the character
 C<"\x{e9}"> and the single byte C<"\xe9"> are therefore two different
 paths naming two different files.
 
-Special cases: C<perfecthash> mounts need a built file path, a
-C<< { build_int => \@keys, path => $file } >> /
-C<build_str> hashref, a factory, or a loaded handle (it is an
-immutable build-then-load structure). A build spec creates a missing file
-once; an existing file is loaded without rebuilding. C<sortedset:strings> takes
+Special cases: C<perfecthash> is an immutable build-then-load structure,
+so a C<'perfecthash'> spec takes either a built file path or a
+C<< { build_int => \@keys, path => $file } >> / C<build_str> hashref. A
+build spec creates a missing file once; an existing file is loaded
+without rebuilding. To supply one some other way, pass the factory or
+the loaded handle as the spec, as for any other type. C<sortedset:strings> takes
 C<< mount('names', 'sortedset:strings', { max => 100_000 }) >>;
 C<set>/C<keys> backing paths are auto-filled for file-backed roots.
 Backing paths already owned by another mount are rejected before

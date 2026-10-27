@@ -29,7 +29,12 @@ sub plan {
             Carp::croak('perfecthash build keys must be an ARRAY reference')
                 if $plan->{build} && ref $plan->{keys} ne 'ARRAY';
         } else {
-            Carp::croak('Data::Shared: perfecthash mounts need a built file path, a {build_int|build_str, path} hashref, a coderef factory, or a loaded handle');
+            # Named for this position only. The old text also offered a factory
+            # and a loaded handle, which do not belong here: those are passed
+            # as the SPEC, like any other type, and never reach this branch.
+            Carp::croak('Data::Shared: a perfecthash spec takes a built file path or a'
+                . ' {build_int|build_str, path} hashref; pass a factory or a loaded'
+                . ' handle as the spec itself instead');
         }
         Carp::croak('perfecthash mount requires a path') unless defined $plan->{file};
     } elsif ($class eq 'Data::SortedSet::Shared::Strings') {
