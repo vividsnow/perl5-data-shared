@@ -110,6 +110,20 @@ subtest 'retiring a child through call retires its registration' => sub {
     }
 };
 
+subtest 'retiring a record below a child is refused' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+    $root->set('/users/alice/1', 42);
+    for my $method (qw(unlink destroy)) {
+        ok !eval { Data::Shared::shared_call($root, "/users/alice/1", $method); 1 },
+            "$method at a record below a child is refused";
+        like $@, qr/retires a composite child, not the record/, "$method: and says why";
+    }
+    ok $root->exists('/users/alice'), 'the child is still registered';
+    is $root->get('/users/alice/1'), 42, 'and its record is intact';
+};
+
 subtest 'retiring an address that was never created creates nothing' => sub {
     my $dir = tempdir(CLEANUP => 1);
     my $root = Data::Shared->new($dir);

@@ -4,6 +4,7 @@ use Test::More;
 use File::Temp qw(tempdir);
 use Time::HiRes ();
 use POSIX ();
+use Cwd ();
 use Data::Shared qw(shared_get shared_set shared_call shared_compile sharedc_call);
 
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
@@ -213,6 +214,71 @@ subtest 'storage is removed while the topology lock is held' => sub {
     ok defined $locked && length $locked, 'the sibling changed topology';
     cmp_ok $locked, '>', $removed, 'only after the storage was gone'
         if defined $removed && defined $locked && length $removed && length $locked;
+};
+
+# The ledger is published and read by another process, so a root opened as a
+# relative path recorded a relative one, which the next process resolved
+# against its own working directory and removed whatever sat there.
+subtest 'retained paths are recorded absolute' => sub {
+    my $base = tempdir(CLEANUP => 1);
+    my $elsewhere = tempdir(CLEANUP => 1);
+    my $start = Cwd::getcwd();
+    chdir $base or die $!;
+    {
+        my $r = Data::Shared->new('state');       # a relative root, as a daemon may use
+        $r->mount('users', ['hashmap:ss', 100, ['hashmap:ii', 100]]);
+        shared_set($r, '/users/alice/1', 42);
+        $r->unmount('users');
+    }
+    my $manifest = do { open my $fh, '<', "$base/state/manifest.json" or die $!; local $/; <$fh> };
+    chdir $elsewhere or die $!;
+    like $manifest, qr{"retained"\s*:\s*\[\s*"/}, 'the ledger holds an absolute path';
+    # The next process opens it by absolute path from a different directory: a
+    # relative entry resolved against this cwd instead, removing whatever sat
+    # there and leaving the store's own storage behind.
+    my $next = Data::Shared->open("$base/state");
+    is $next->unlink_all, 2, 'unlink_all reclaims it from another directory';
+    chdir $start or die $!;
+    ok !-d "$base/state/.children/users", 'the composite directory is gone';
+};
+
+# Ownership is a property of the storage, not the object: an alias kept across
+# a remount points at a new handle object on the same file.
+subtest 'a handle reopened onto the same storage is still shared' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    my $handle = $root->mount('cache', 'hashmap:ss', undef, 100);
+    shared_set($root, '/cache/k', 'v');
+    $root->mount('alias', $handle);
+    $root->unmount('cache');
+    $root->mount('cache', 'hashmap:ss', undef, 100);   # adopts, new handle object
+    ok !eval { $root->unmount('alias', unlink => 1); 1 }, 'the stale alias cannot unlink it';
+    like $@, qr/shares its storage with 'cache'/, 'and names the owner';
+    ok -e "$dir/cache.shm", 'the owner keeps its storage';
+
+    my $solo = Data::Shared->new(tempdir(CLEANUP => 1));
+    $solo->mount('only', 'hashmap:ss', undef, 100);
+    is $solo->unmount('only', unlink => 1), 1, 'a mount sharing nothing still unlinks';
+};
+
+# The manifest is removed first, so without counting the ledger the retry a
+# caller makes after fixing what blocked the cleanup returned 0 and looked
+# like success.
+subtest 'a failed retained cleanup can be retried' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $hold = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('ext', 'hashmap:ii', "$hold/ext.shm", 16);
+    shared_set($root, '/ext/1', 5);
+    $root->unmount('ext');
+    chmod 0500, $hold or die $!;
+    plan skip_all => 'running as a user that ignores directory permissions'
+        if unlink "$hold/ext.shm";
+    ok !eval { $root->unlink_all; 1 }, 'the blocked cleanup reports failure';
+    ok -e "$hold/ext.shm", 'and the storage survives';
+    chmod 0700, $hold or die $!;
+    is $root->unlink_all, 1, 'the retry removes it';
+    ok !-e "$hold/ext.shm", 'and the storage is gone';
 };
 
 done_testing;

@@ -165,12 +165,17 @@ our %REGISTRY = (
     fenwick2d => {
         key => 'fenwick2d', dist => 'Data-Fenwick2D-Shared',
         class => 'Data::Fenwick2D::Shared', path_class => 'indexed', freeze => 1,
+        key_int => 1,
         verbs => { get => 'point', set => 'set', incr => 'update' },
     },
     graph => {
         key => 'graph', dist => 'Data-Graph-Shared',
         class => 'Data::Graph::Shared', path_class => 'indexed', freeze => 0,
-        verbs => { get => 'node_data', delete => 'remove_node' },
+        key_int => 1,
+        # has_node is an honest exists, and get croaks on a node that is not
+        # there, so without it a caller had no probe that answers rather than
+        # dying.
+        verbs => { get => 'node_data', delete => 'remove_node', exists => 'has_node' },
     },
     hashmap => {
         key => 'hashmap', dist => 'Data-HashMap-Shared',
@@ -234,6 +239,7 @@ our %REGISTRY = (
     ndarray => {
         key => 'ndarray', dist => 'Data-NDArray-Shared',
         class => 'Data::NDArray::Shared', path_class => 'indexed', freeze => 1,
+        key_int => 1,
         verbs => { get => 'get', set => 'set' },
     },
     perfecthash => {
@@ -254,7 +260,17 @@ our %REGISTRY = (
         },
         verbs => {
             get => 'get', set => 'set', delete => 'free',
-            exists => _bounded_exists('is_allocated'), incr => 'add',
+            exists => _bounded_exists('is_allocated'),
+            # add() takes a mandatory delta and incr() takes none, so mapping
+            # the verb to either one alone left the other form croaking from
+            # the XS: the no-delta form, which the POD calls the base form,
+            # could never succeed on a variant that has both.
+            incr => sub { my ($h, $slot, @delta) = @_;
+                return $h->add($slot, $delta[0]) if @delta && $h->can('add');
+                return $h->incr($slot) if !@delta && $h->can('incr');
+                Carp::croak('pool: ' . ref($h) . " does not support 'incr'"
+                    . (@delta ? ' with a delta' : ' without a delta')
+                    . ' (use shared_call for operations outside the generic verbs)') },
         },
     },
     pubsub => {
@@ -326,7 +342,13 @@ our %REGISTRY = (
         class => 'Data::SegmentTree::Shared', path_class => 'indexed', freeze => 0,
         key_int => 1,
         verbs => {
-            get => sub { my ($h, $p) = @_; return $h->sum($p, $p) },
+            # One index, as every other verb of a 1-D leaf takes: dropping the
+            # extra components answered a point query for a path that named
+            # something else, where the string-mapped verbs croak.
+            get => sub { my ($h, @p) = @_;
+                Carp::croak('segmenttree: get takes one index; use shared_call for a range')
+                    if @p != 1;
+                return $h->sum($p[0], $p[0]) },
             set => 'set', incr => 'add',
             # Without the shape check a non-numeric index numified to 0, which
             # is in range, so exists answered true for any member.
@@ -346,7 +368,15 @@ our %REGISTRY = (
             set => sub { my ($h, $m, $score) = @_;
                 Carp::croak("sortedset set needs a score") if @_ < 3;
                 return $h->add($m, $score) },
-            delete => 'remove', incr => 'incr',
+            delete => 'remove',
+            # A delta is required, not defaulted. Without one the integer class
+            # croaks from its XS but the Strings wrapper interned the member,
+            # added nothing, and returned the unchanged score as if it had
+            # worked -- and on a member that did not exist it left a ghost
+            # behind with score 0.
+            incr => sub { my ($h, $m, @delta) = @_;
+                Carp::croak('sortedset incr needs a delta') unless @delta;
+                return $h->incr($m, $delta[0]) },
         },
     },
     spatialhash => {

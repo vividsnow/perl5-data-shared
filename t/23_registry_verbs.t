@@ -1,5 +1,5 @@
 use strict; use warnings; use Test::More;
-use Data::Shared qw(shared_get shared_set shared_exists);
+use Data::Shared qw(shared_get shared_set shared_exists shared_incr shared_call);
 my $root = Data::Shared->new;
 eval { $root->mount('ds', 'disjointset', undef, 100); 1 }
     or plan skip_all => "backend unavailable: $@";
@@ -30,4 +30,107 @@ subtest 'exists is bounded for every integer leaf' => sub {
         }
     }
 };
+# Four indexed leaves guarded their index and three did not, so a non-ASCII
+# digit numified to 0 and the write landed on the wrong cell with only a
+# warning. Same class as the bitset/pool exists fix, one entry over.
+subtest 'every indexed leaf refuses a non-integer index' => sub {
+    my $digit = "\x{661}";                      # ARABIC-INDIC DIGIT ONE
+    # graph has no set verb, so each case names a verb that entry does map.
+    my @cases = (['ndarray', ['f64', 2, 3], 2, 'set'], ['fenwick2d', [24, 7], 2, 'set'],
+                 ['graph', [100, 500], 1, 'get'], ['fenwick', [100], 1, 'set'],
+                 ['segmenttree', [100], 1, 'set']);
+    my $tested = 0;
+    for my $case (@cases) {
+        my ($key, $args, $dims, $verb) = @$case;
+        my $r = Data::Shared->new;
+        next unless eval { $r->mount('x', $key, undef, @$args); 1 };
+        $tested++;
+        my $call = $verb eq 'set' ? sub { shared_set($r, $_[0], 7) } : sub { shared_get($r, $_[0]) };
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        my $path = '/x/' . join('/', ($digit) x $dims);
+        ok !eval { $call->($path); 1 }, "$key: a non-ASCII digit index is refused";
+        like $@, qr/index must be an integer/, "$key: by the index guard";
+        is scalar @warnings, 0, "$key: and does not warn its way through"
+            or diag join '', @warnings;
+        # An ordinary index reaches the backend: it may still fail there (graph
+        # has no node 1 yet), but never on the shape of the index.
+        my $ok = '/x/' . join('/', (1) x $dims);
+        eval { $call->($ok); 1 };
+        unlike $@, qr/index must be an integer/, "$key: an ordinary index passes the guard";
+    }
+    plan skip_all => 'no indexed backend available' unless $tested;
+};
+
+# The integer class croaks from its XS without a delta, but the Strings
+# wrapper interned the member, added nothing, and returned the unchanged score
+# as if it had worked -- leaving a ghost member behind for one that was absent.
+subtest 'sortedset incr requires a delta' => sub {
+    my $tested = 0;
+    for my $spec ('sortedset', 'sortedset:strings') {
+        my $r = Data::Shared->new;
+        my @args = $spec eq 'sortedset' ? (undef, 100) : ({ max => 100 });
+        next unless eval { $r->mount('s', $spec, @args); 1 };
+        $tested++;
+        my $member = $spec eq 'sortedset' ? 1 : 'a';
+        shared_set($r, "/s/$member", 10);
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, $_[0] };
+        ok !eval { shared_incr($r, "/s/$member"); 1 }, "$spec: a bare incr is refused";
+        is scalar @warnings, 0, "$spec: without warning its way through"
+            or diag join '', @warnings;
+        is shared_get($r, "/s/$member"), 10, "$spec: and the score is untouched";
+        ok !shared_exists($r, '/s/ghost'), "$spec: a refused incr leaves no member";
+        ok eval { shared_incr($r, "/s/$member", 5); 1 }, "$spec: a delta still works" or diag $@;
+        is shared_get($r, "/s/$member"), 15, "$spec: and applies it";
+    }
+    plan skip_all => 'no sortedset backend available' unless $tested;
+};
+
+# add() takes a mandatory delta and incr() takes none, so mapping the verb to
+# one of them left the other form croaking from the XS.
+subtest 'pool incr works with and without a delta' => sub {
+    my $tested = 0;
+    for my $variant (qw(i64 i32 f64 str)) {
+        my $r = Data::Shared->new;
+        next unless eval { $r->mount('p', "pool:$variant", undef, 100, 8); 1 };
+        $tested++;
+        my $slot = shared_call($r, '/p', 'alloc');
+        my $handle = $r->handle('/p');
+        next unless eval { shared_set($r, "/p/$slot", 10); 1 };
+        if ($handle->can('incr')) {
+            my $bare = eval { shared_incr($r, "/p/$slot"); 1 };
+            ok $bare, "pool:$variant: a bare incr works" or diag $@;
+            is shared_get($r, "/p/$slot"), 11, "pool:$variant: and adds one";
+            ok eval { shared_incr($r, "/p/$slot", 5); 1 }, "pool:$variant: a delta works" or diag $@;
+            is shared_get($r, "/p/$slot"), 16, "pool:$variant: and adds the delta";
+        }
+        else {
+            my $bare = eval { shared_incr($r, "/p/$slot"); 1 };
+            my $err = $@;
+            ok !$bare, "pool:$variant: supports neither form, so it is refused";
+            like $err, qr/does not support 'incr'/, "pool:$variant: and says so";
+        }
+    }
+    plan skip_all => 'no pool backend available' unless $tested;
+};
+
+subtest 'graph exists answers rather than croaking' => sub {
+    my $r = Data::Shared->new;
+    plan skip_all => 'graph unavailable' unless eval { $r->mount('g', 'graph', undef, 100, 500); 1 };
+    my $id = shared_call($r, '/g', 'add_node', 1);
+    is shared_exists($r, "/g/$id"), 1, 'a node that exists';
+    is shared_exists($r, '/g/99'), 0, 'and one that does not';
+};
+
+subtest 'a one-dimensional leaf refuses a second index' => sub {
+    my $r = Data::Shared->new;
+    plan skip_all => 'segmenttree unavailable'
+        unless eval { $r->mount('arr', 'segmenttree', undef, 100); 1 };
+    shared_set($r, '/arr/10', 55);
+    is shared_get($r, '/arr/10'), 55, 'the point query works';
+    ok !eval { shared_get($r, '/arr/10/20'); 1 }, 'a second index is refused';
+    like $@, qr/takes one index/, 'and says so';
+};
+
 done_testing;

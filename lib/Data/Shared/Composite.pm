@@ -844,6 +844,13 @@ sub dispatch_call {
     if ($rt->{kind} eq 'composite') {
         return $rt->{comp}->dispatch_call($root, \@child_rest, $method, @args);
     }
+    # As the facade refuses below a flat mount: the child leaf takes no
+    # argument for these and removed its whole file anyway, while the parent
+    # index went on naming it.
+    Carp::croak("Data::Shared: '$method' retires a composite child, not the record"
+        . " at '$addr/" . join('/', @child_rest) . "' below it;"
+        . " use shared_delete to remove a record")
+        if $method eq 'unlink' || $method eq 'destroy';
     return Data::Shared::_dispatch_record_call($rt->{record}, \@child_rest, $method, @args);
 }
 

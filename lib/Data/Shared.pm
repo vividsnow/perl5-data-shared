@@ -883,9 +883,10 @@ sub _install_recipe {
     $self->{_changed} = 1;
     $self->{_published} = 1 unless $recipe->{transient};
     # A mount adopting retained storage owns it again, so the manifest must
-    # stop offering it to unlink_all as loose storage.
+    # stop offering it to unlink_all as loose storage. Matched absolute, as the
+    # ledger records them.
     if (@{ $self->{_retained} } && @{ $recipe->{storage_paths} }) {
-        my %adopted = map { $_ => 1 } @{ $recipe->{storage_paths} };
+        my %adopted = map { $_ => 1 } map { $self->_abs_path($_) } @{ $recipe->{storage_paths} };
         my $before = @{ $self->{_retained} };
         @{ $self->{_retained} } = grep { !$adopted{$_} } @{ $self->{_retained} };
         $self->{_published} = 1 if @{ $self->{_retained} } != $before;
@@ -940,20 +941,40 @@ sub unmount {
 # One handle can be mounted under several names on purpose, and the alias is
 # transient, so retiring it published nothing while still removing the file its
 # persistent owner is recorded under: no process could open the store again.
+# Ownership is a property of the storage, not of the object: comparing
+# identities alone let a handle reopened onto the same file -- an alias kept
+# across a remount, or one taken from a second open() of the same directory --
+# unlink a file the manifest still named.
 sub _check_unlinkable {
     my ($self, $name) = @_;
     my $mount = $self->{mounts}{$name} or return;
     my $handle = $mount->{handle};
     return unless blessed($handle);
     my $addr = refaddr($handle);
+    my %mine = map { $_ => 1 } _storage_of($mount);
     for my $other (@{ $self->{order} }) {
         next if $other eq $name;
-        my $sibling = $self->{mounts}{$other}{handle};
-        next unless blessed($sibling) && refaddr($sibling) == $addr;
+        my $sibling = $self->{mounts}{$other};
+        my $shared = blessed($sibling->{handle}) && refaddr($sibling->{handle}) == $addr;
+        $shared ||= grep { $mine{$_} } _storage_of($sibling);
+        next unless $shared;
         Carp::croak("Data::Shared: mount '$name' shares its storage with '$other';"
             . " unmount '$other' as well, or unmount '$name' without unlink");
     }
     return;
+}
+
+# A transient mount records no storage paths, because the caller built the
+# handle, so ask the handle where it lives.
+sub _storage_of {
+    my ($mount) = @_;
+    my @paths = @{ $mount->{storage_paths} || [] };
+    my $handle = $mount->{handle};
+    if (!@paths && blessed($handle) && $handle->can('path')) {
+        my $path = eval { $handle->path };
+        push @paths, $path if defined $path && !ref $path && length $path;
+    }
+    return @paths;
 }
 
 sub _retire_storage {
@@ -979,8 +1000,12 @@ sub _retire_storage {
 sub _record_retained {
     my ($self, $paths) = @_;
     return unless $paths && @$paths;
+    # Absolute, because this list is published and read back by another
+    # process: a root opened as a relative path recorded a relative one, which
+    # the next process resolved against its own working directory and removed
+    # whatever happened to sit there.
     my %have = map { $_ => 1 } @{ $self->{_retained} };
-    my @new = grep { !$have{$_}++ } @$paths;
+    my @new = grep { !$have{$_}++ } map { $self->_abs_path($_) } @$paths;
     return unless @new;
     push @{ $self->{_retained} }, @new;
     $self->{_published} = 1;
@@ -1114,7 +1139,10 @@ sub unlink_all {
         # composite destroy: a second call used to croak that the manifest
         # could not be read.
         my $published = !defined $self->{dir} || -e $self->manifest_path;
-        return 0 unless $published || @{ $self->{order} };
+        # Retained storage counts as work left: a cleanup that failed removed
+        # the manifest first, so without this the retry a caller makes after
+        # fixing whatever blocked it returned 0 and looked like success.
+        return 0 unless $published || @{ $self->{order} } || @{ $self->{_retained} };
         $self->_assert_revision if $published;
         my $n = 0;
         # Insertion order, not hash order: the last iteration over mounts that
@@ -1221,8 +1249,9 @@ Data::Shared - Path-addressed facade over the Data-*-Shared family
 
     my $app = Data::Shared->new('/tmp/app.shared');
     $app->mount('cache', 'hashmap:ii', undef, 100_000);
+    shared_set($app, '/cache/42', 100);
     my $same = Data::Shared->open('/tmp/app.shared');
-    shared_get($same, '/cache/42');
+    shared_get($same, '/cache/42');            # 100, from another handle
 
     my $cp = shared_compile('/cache/42');
     sharedc_get($root, $cp);
@@ -1378,7 +1407,10 @@ Lifecycle and introspection for mounts. Names are canonicalized as
 C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
 C<unmount> retains the mount's storage, so a later mount of the same
 name adopts it, and the manifest records what was retained: any process
-that opens the root afterwards reclaims it with C<unlink_all>.
+that opens the root afterwards reclaims it with C<unlink_all>. One ledger
+entry per retained store survives until then, and every topology change
+republishes it, so a long-running program that rotates mounts under fresh
+names should pass C<< unlink => 1 >> rather than accumulate them.
 C<< unmount($name, unlink => 1) >> removes it instead, under the same
 directory lock that published its removal, so a sibling process cannot
 mount the name onto storage that is about to go. A native C<unlink> or
@@ -1406,6 +1438,11 @@ New writers add a revision and a F<.manifest.lock> file; existing backend
 file formats and generated filenames are preserved. Concurrent writers must
 all use the revised protocol. Mount topology is simplest to manage from one
 coordinator.
+
+=head2 $root->dir, $root->readonly, $root->manifest_path
+
+Accessors: the root's directory (C<undef> when anonymous), whether it
+was opened read-only, and the path of its manifest.
 
 =head2 $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats, $root->frozen
 
@@ -1470,7 +1507,10 @@ Intern C<intern/id_of>). Where a verb would lie (a plain Bloom filter
 has no delete; sketches and sync primitives have no keyed get/set) it
 croaks with guidance to use C<shared_call> instead of faking it.
 
-C<shared_exists> always returns C<1> or C<0>. C<shared_incr> uses
+Where it is defined, C<shared_exists> always returns C<1> or C<0>,
+an index outside the structure included; where a type has no honest
+C<exists> (C<ndarray>, C<fenwick2d>) it croaks like any other absent
+verb. C<shared_incr> uses
 C<incr_by> when a delta is given and the leaf supports it; a leaf with
 neither C<incr_by> nor a delta form of C<incr> (most C<buffer> variants)
 rejects the delta from its own XS, so use C<shared_call> there.
@@ -1709,6 +1749,12 @@ argument list is not re-applied to a file that already exists, and the leaf
 rejects a file whose header does not match the declared type, but the file
 itself decides the mapping. An C<args> entry naming an absolute path is
 honoured, so a manifest can reach a file outside the root.
+
+Put the root where only its trusted writers can create it. Because an
+existing directory keeps its own mode and the manifest inside it is trusted,
+a root named under a world-writable directory -- F</tmp> on a shared host,
+as the examples here spell it for brevity -- can be pre-created by anyone,
+who then chooses what the first real process attaches to.
 
 Mount names are sanitised into the root directory, so a name containing
 C<..> or C</> cannot place a backing file outside it, and a manifest naming

@@ -83,6 +83,7 @@ pass an explicit path/factory; a file-backed root handles it.
     shared_set($root, '/bits/10', 0);               # clear by falsy value
 
     $root->mount('members', 'roaringbitmap', undef, 256);
+    $root->mount('other', 'roaringbitmap', undef, 256);
     shared_set($root, '/members/70000', 1);
     shared_call($root, '/members', 'union', $root->handle('/other'));
 
@@ -167,7 +168,7 @@ Keyed sketches accept generic verbs; the rest are call-driven.
     shared_call($root, '/hist', 'value_at_percentile', 99);
 
     $root->mount('sample', 'reservoir', undef, 100);
-    shared_call($root, '/sample', 'add', $_) for @stream;
+    shared_call($root, '/sample', 'add', $_) for 1 .. 10_000;   # the stream
     shared_call($root, '/sample', 'sample');
 
     $root->mount('setsim', 'minhash', undef, 256);
@@ -180,7 +181,7 @@ Keyed sketches accept generic verbs; the rest are call-driven.
     shared_call($root, '/sem', 'release');
 
     $root->mount('timers', 'timingwheel', undef, 512, 10_000);
-    my $id = shared_call($root, '/timers', 'add', 30, $job_id);
+    my $id = shared_call($root, '/timers', 'add', 30, 42);       # 42 is the job
     shared_call($root, '/timers', 'advance', 1);
 
 ReqRep is likewise call-driven (server C<recv_wait>/C<reply>, client
