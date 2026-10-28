@@ -60,6 +60,7 @@ subtest 'the sealing root can still read every child' => sub {
         $producer->freeze_all;
     }
     ok !eval { Data::Shared->open($dir); 1 }, 'a writable reopen of a sealed store is still refused';
+    like $@, qr/is frozen \(read-only\)/, 'by the leaf, for the reason that matters';
     ok eval { Data::Shared->open_readonly($dir); 1 }, 'and a read-only one works';
 };
 
@@ -150,7 +151,11 @@ subtest 'sync covers every registered child' => sub {
     my ($root) = store(children => 40);                 # default cache_size 32
     my $stats = $root->stats->{users};
     is $stats->{children}, 40, '40 children registered';
-    cmp_ok $stats->{open}, '<', 40, 'and fewer than that open';
+    # undef numifies to 0, so without this the comparison holds for a stats
+    # hash that stopped reporting the counter at all -- and the sync claim
+    # below rests on eviction having happened.
+    ok defined $stats->{open}, 'the open-child counter is reported';
+    cmp_ok $stats->{open}, '<', 40, 'and fewer than that are open';
     $calls = 0;
     my $n = $root->node('/users')->call('sync');
     is $n, 42, 'sync reports children plus parent and index';

@@ -206,24 +206,30 @@ subtest 'storage is removed while the topology lock is held' => sub {
     unless ($pid) {
         close $entered_w;
         my $go = <$entered_r>;                  # the removal has started
-        my $other = eval { Data::Shared->open($dir) };
-        $other->mount('sibling', 'hashmap:ii', undef, 16) if $other;
-        if (open my $fh, '>', "$dir/locked-at") {
-            print $fh Time::HiRes::time();
-            close $fh;
-        }
-        POSIX::_exit(defined $go && $go =~ /removing/ ? 0 : 1);
+        POSIX::_exit(1) unless defined $go && $go =~ /removing/;
+        # Stamped only after the topology change really happened, and the exit
+        # status reports that rather than the signal: stamping unconditionally
+        # meant the timing came out right even if this process never mounted
+        # anything, so the test proved nothing about the lock.
+        my $other = eval { Data::Shared->open($dir) } or POSIX::_exit(2);
+        eval { $other->mount('sibling', 'hashmap:ii', undef, 16); 1 } or POSIX::_exit(3);
+        CORE::open(my $fh, '>', "$dir/locked-at") or POSIX::_exit(4);
+        print $fh Time::HiRes::time();
+        close $fh or POSIX::_exit(5);
+        POSIX::_exit(0);
     }
     close $entered_r;
     $root->unmount('scratch', unlink => 1);
     waitpid $pid, 0;
-    is $?, 0, 'the child was released by the removal, not by a timer';
+    is $?, 0, 'the sibling opened the store and mounted, released by the removal';
 
     my $removed = -e $stamp ? do { open my $f, '<', $stamp; local $/; <$f> } : '';
     my $locked = -e "$dir/locked-at" ? do { open my $f, '<', "$dir/locked-at"; local $/; <$f> } : '';
     ok length $removed, 'the removal ran';
     ok length $locked, 'the sibling changed topology';
     cmp_ok $locked, '>', $removed, 'only after the storage was gone';
+    my $after = Data::Shared->open($dir);
+    ok((grep { $_ eq 'sibling' } $after->mounts), 'and its mount is in the published manifest');
 };
 
 # The ledger is published and read by another process, so a root opened as a
@@ -291,6 +297,7 @@ subtest 'a failed retained cleanup can be retried' => sub {
     plan skip_all => 'running as a user that ignores directory permissions'
         if unlink "$hold/ext.shm";
     ok !eval { $root->unlink_all; 1 }, 'the blocked cleanup reports failure';
+    like $@, qr/cannot clean|Permission denied/, 'naming what it could not remove';
     ok -e "$hold/ext.shm", 'and the storage survives';
     chmod 0700, $hold or die $!;
     is $root->unlink_all, 1, 'the retry removes it';
@@ -368,9 +375,15 @@ subtest 'rotating mounts does not grow the root' => sub {
         $root->unmount("rot$i", unlink => 1);
     }
     is_deeply [$root->mounts], [], 'every rotation was retired';
-    is scalar keys %{ $root->{_abs_cache} || {} }, 0,
-        'and no resolved path is held after the operation that resolved it';
-    is bytes_under($dir), (-s "$dir/manifest.json" || 0), 'only the manifest is left on disk';
+    # Absent, not merely empty: the cache is localized per operation, so
+    # between them the key is gone entirely. That is the strongest form of
+    # "nothing was retained", and asserting that it exists would be wrong.
+    ok !exists $root->{_abs_cache} || !keys %{ $root->{_abs_cache} },
+        'no resolved path is held after the operation that resolved it';
+    # Likewise: without this the comparison below is 0 == 0 on a store whose
+    # manifest has gone.
+    ok -e "$dir/manifest.json", 'the manifest is still there';
+    is bytes_under($dir), -s "$dir/manifest.json", 'only the manifest is left on disk';
 };
 
 # A teardown is the one operation allowed to run against a dead instance: it

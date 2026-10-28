@@ -33,9 +33,14 @@ is shared_get($root, '/ds/8'), shared_get($root, '/ds/9'), 'the two-member form 
 subtest 'exists is bounded for every integer leaf' => sub {
     my %capacity = (bitset => [1000], pool => [100, 8], buffer => [64],
                     fenwick => [64], segmenttree => [64], disjointset => [64]);
+    my $tested = 0;
     for my $key (sort keys %capacity) {
         my $r = Data::Shared->new;
-        next unless mounted($r, 'x', $key, undef, @{ $capacity{$key} });
+        unless (mounted($r, 'x', $key, undef, @{ $capacity{$key} })) {
+            note "$key unavailable, its bounds are not covered here";
+            next;
+        }
+        $tested++;
         my $cap = $capacity{$key}[0];
         for my $idx (0, $cap, $cap + 1_000_000) {
             my $got = eval { shared_exists($r, "/x/$idx") };
@@ -43,6 +48,10 @@ subtest 'exists is bounded for every integer leaf' => sub {
             ok defined $got && ($got eq '1' || $got eq '0'), "$key: exists($idx) is 1 or 0";
         }
     }
+    # As its sibling subtests do: with none of the six installed this would
+    # otherwise pass having asserted nothing, under a name that claims all of
+    # them. A partial install is ordinary with 39 separate dists.
+    plan skip_all => 'no integer leaf available' unless $tested;
 };
 # Four indexed leaves guarded their index and three did not, so a non-ASCII
 # digit numified to 0 and the write landed on the wrong cell with only a

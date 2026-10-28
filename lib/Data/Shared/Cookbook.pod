@@ -218,9 +218,11 @@ See the DEEP PATHS section of L<Data::Shared>.
 =head1 FREEZE AND SHIP
 
     $root->freeze_all;                               # where leaves support it
-    # The gate, because it names the first mount that cannot be sealed. Do not
-    # gate on $root->frozen: it is false for any store holding an unsealable
-    # leaf, including ones that ship and read perfectly well.
+    # The gate: it croaks naming the first mount that cannot be sealed, which
+    # is what "not shippable" really means. Do not gate on $root->frozen -- it
+    # is false for any store holding an unsealable leaf, including ones that
+    # read back perfectly well in place. A store built from the recipes above
+    # does NOT pass this gate; see below for why.
     my $ro = Data::Shared->open_readonly('/tmp/app.shared', strict => 1);
     shared_get($ro, '/cache/42');                    # lock-free reads
     # shared_set($ro, ...) croaks: root is read-only

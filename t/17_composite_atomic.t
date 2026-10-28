@@ -51,6 +51,8 @@ subtest 'failed readiness publication is rolled back' => sub {
             return $put->(@_);
         };
         ok !eval { $root->set('/users/broken/key', 'bad'); 1 }, 'metadata failure propagated';
+        like $@, qr/composite registry|cannot (?:put|record)/,
+            'from the registry write, not from somewhere else';
     }
     is_deeply [$root->children('/users')], [], 'address not published';
     is $root->call('/users', 'child_count'), 0, 'count restored';
@@ -452,8 +454,13 @@ subtest 'a stale root cannot tear down its successor' => sub {
     like $@, qr/belongs to a newer instance/, 'because the storage is not its own';
     ok -d "$dir/.children/users", "the replacement's children survive";
     undef $fresh;
-    my $check = Data::Shared->open($dir);
-    is $check->get('/users/bob/k'), 'replacement', 'and its data is intact';
+    # Guarded: if the refusal above ever regresses, the store is gone and this
+    # open dies -- which would abort the whole file instead of failing one
+    # subtest, hiding every test after it.
+    my $check = eval { Data::Shared->open($dir) };
+    ok $check, 'the replacement still opens' or diag $@;
+    is eval { $check->get('/users/bob/k') }, 'replacement', 'and its data is intact'
+        if $check;
 };
 
 # The sweep opened each lock '+<', so a read-only lock file -- which the
@@ -488,6 +495,73 @@ subtest 'teardown respects a read-only composite lock' => sub {
     waitpid $pid, 0;
     cmp_ok $waited, '>', 1, 'the teardown waited for it';
     ok !-d "$dir/.children/users", 'and then removed the directory';
+};
+
+# The sweep locked only the directory it was handed. A nested composite has a
+# lock of its own, and a worker part-way through a deep read holds that one
+# while the outer directory is what gets removed.
+subtest 'teardown waits for a nested composite lock' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('atlas', ['hashmap:ss', 64, ['hashmap:ss', 64, ['hashmap:ss', 64]]]); 1 }
+        or plan skip_all => "nested composite unavailable: $@";
+    $root->set('/atlas/eu/paris/k', 'v');
+    my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
+    ok $nested, 'the nested composite has its own lock' or plan skip_all => 'no nested lock';
+
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '+<', $nested) && flock $fh, Fcntl::LOCK_EX();
+        syswrite $held_w, $ok ? "held\n" : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    is scalar <$held_r>, "held\n", 'a worker holds the nested lock';
+    my $start = Time::HiRes::time();
+    $root->unmount('atlas');
+    $root->unlink_all;
+    my $waited = Time::HiRes::time() - $start;
+    waitpid $pid, 0;
+    cmp_ok $waited, '>', 1, 'the teardown waited for the nested lock too';
+    ok !-d "$dir/.children/atlas", 'and then removed the tree';
+};
+
+# A read-only root now holds a SHARED lock for a composite section rather than
+# none, which is only worth anything if the teardown's exclusive lock waits for
+# shared holders. That is the property to pin.
+subtest 'teardown waits for a shared holder, not only an exclusive one' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('users', ['hashmap:ss', 64, ['hashmap:ss', 64]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    $root->set('/users/alice/k', 'v');
+    my $lockfile = "$dir/.children/users/.lock";
+
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '<', $lockfile) && flock $fh, Fcntl::LOCK_SH();
+        syswrite $held_w, $ok ? "shared\n" : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    is scalar <$held_r>, "shared\n", 'a reader holds it shared';
+    my $start = Time::HiRes::time();
+    $root->unmount('users');
+    $root->unlink_all;
+    my $waited = Time::HiRes::time() - $start;
+    waitpid $pid, 0;
+    is $?, 0, 'the reader held it for its whole hold';
+    cmp_ok $waited, '>', 1, 'and the teardown waited for it';
 };
 
 subtest 'teardown waits for a composite lock it does not hold' => sub {
