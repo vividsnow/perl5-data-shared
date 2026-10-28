@@ -1869,7 +1869,11 @@ high-cardinality parents need an explicit budget. The budget sizes the
 child index when the composite is created and cannot be raised
 afterwards: mounting a name over storage an C<unmount> retained with a
 larger C<max_children> is refused, since the index file cannot grow.
-C<< unmount($name, unlink => 1) >> first, and build the subtree again. Anonymous composites
+C<< unmount($name, unlink => 1) >> first, and build the subtree again.
+Every child is also an entry in the parent leaf, so whichever of the two
+is smaller is the real ceiling: size the parent for the budget, or a
+C<sortedset> parent of four fills after four children whatever
+C<max_children> says. Anonymous composites
 retain all opened children until subtree deletion or root destruction,
 because an anonymous segment cannot be reopened after eviction;
 C<cache_size> bounds only file-backed child caches. Use a file-backed

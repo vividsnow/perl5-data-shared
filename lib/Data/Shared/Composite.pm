@@ -635,7 +635,22 @@ sub _parent_register {
     } else {
         Data::Shared::_dispatch_record('set', $self->{parent_record}, [$addr], $id);
     }
-    Carp::croak('Data::Shared: cannot register child in parent backend') unless $self->_parent_exists($addr);
+    return if $self->_parent_exists($addr);
+    # Name the exhausted resource, as _index_put does. Every child is an entry
+    # in the parent leaf, so the parent's own capacity bounds the child count
+    # as much as max_children does -- and a sortedset parent cannot grow, so a
+    # composite sized only by max_children filled at a fraction of it with a
+    # message that read like an internal error.
+    my $s = ($self->{parent_handle}->can('stats') ? $self->{parent_handle}->stats : undef) || {};
+    my $size = $s->{size} // $s->{count};
+    my $cap = $s->{capacity} // $s->{max_entries} // $s->{max};
+    Carp::croak(sprintf
+        "Data::Shared: cannot register child '%s' in the %s parent of '%s'"
+        . " (parent holds %s of %s; every child is an entry in it, so its own"
+        . " capacity bounds max_children=%s)",
+        $addr, $key || ref $self->{parent_handle}, $self->{name},
+        map { defined $_ ? $_ : '?' }
+            $size, $cap, $self->{_budget} // $self->{node}{max_children});
     return;
 }
 

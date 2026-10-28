@@ -102,6 +102,25 @@ subtest 'a nested level keeps serving the budget its storage was built for' => s
         'and names that number, not the one the manifest published';
 };
 
+# A child is an entry in the parent leaf too, so a parent smaller than the
+# budget is the real ceiling. The refusal said only 'cannot register child in
+# parent backend', which reads like an internal error and names neither the
+# exhausted resource nor the limit -- next to _index_put, which names both.
+subtest 'a full parent leaf names itself as the ceiling' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    eval { $root->mount('l', ['sortedset', 4, ['bloomfilter', 10_000, 0.01]]); 1 }
+        or plan skip_all => "sortedset-parented composite unavailable: $@";
+    my $made = 0;
+    for my $i (1 .. 8) {
+        last unless eval { shared_set($root, "/l/$i/x", 1); 1 };
+        $made++;
+    }
+    is $made, 4, 'the capacity-4 parent takes four children';
+    like $@, qr/in the sortedset parent of 'l'/, 'the refusal names the parent';
+    like $@, qr/parent holds 4 of 4/, 'and the resource that ran out';
+    like $@, qr/bounds max_children=10000/, 'and the budget it bounds';
+};
+
 # Opening a composite must not recount its children: the counter is maintained
 # under the lock, so a recount per open made every cold access O(children) and
 # wrote to the index on a read path. The 'p:' marker is what calls for a recount.
