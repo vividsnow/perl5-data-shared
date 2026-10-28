@@ -213,6 +213,33 @@ sub new {
         elsif (!$self->{readonly} && !$self->{_cleanup} && !$self->_index_frozen) {
             $self->_index_put('k:', $chain);
         }
+        # The index file is sized from max_children once, when it is created,
+        # and reopening adopts whatever is on disk. So the only documented way
+        # to grow a composite -- unmount, then remount the same name with a
+        # larger budget -- was accepted, published the larger number, and then
+        # refused children at a fraction of it while quoting the published
+        # number back. Recorded rather than measured: the index's slot table
+        # doubles on demand and stops at a ceiling its stats do not predict.
+        # Compared on a topology change only, so a store that has already
+        # published an oversized budget still opens and serves what it can.
+        my $budget = $index->get('b:');
+        if (defined $budget && $budget =~ /\A[0-9]+\z/ && $budget < $node->{max_children}) {
+            # Refused where the caller named the budget, and enforced where it
+            # did not: a lazily opened child is reached from a read, and
+            # croaking there would take out a store that merely published an
+            # oversized number -- so that one keeps serving, up to the ceiling
+            # its storage really has.
+            Carp::croak("Data::Shared: composite '$self->{name}' storage was created"
+                . " for max_children=$budget and cannot serve"
+                . " $node->{max_children}; the index is sized when it is created,"
+                . " so raising the budget needs unmount(unlink => 1) first")
+                unless $o{replaying};
+            $self->{_budget} = $budget;
+        }
+        elsif (!defined $budget && !$self->{readonly} && !$self->{_cleanup}
+               && !$self->_index_frozen) {
+            $self->_index_put('b:', $node->{max_children});
+        }
     }, undef, $o{opening} ? 1 : 0);   # reopening tolerates an unwritable lock; creating does not
     return $self;
 }
@@ -230,6 +257,11 @@ sub _with_shared_lock {
         until (flock $fh, LOCK_SH) {
             last unless $!{EINTR};
         }
+        # Again, now that the lock is held, exactly as the exclusive branch
+        # does: the caller's check happened before the wait, so a teardown and
+        # recreate that completed during it left this object reading the
+        # successor's children under its own addresses.
+        $self->_assert_live_instance if $self->{index};
     }
     local $self->{_locked} = 1;
     return $code->();
@@ -479,13 +511,17 @@ sub _index_put {
     return 1 if $self->{index}->put($key, $value);
     my $s = ($self->{index}->can('stats') ? $self->{index}->stats : undef) || {};
     # Name the exhausted resource; the old message pasted the whole address in
-    # and said only "cannot write", which reads like an I/O error.
+    # and said only "cannot write", which reads like an I/O error. The slot
+    # table, not max_entries: a put fails when size reaches capacity, and
+    # max_entries is the smaller load-factor figure, so the old message read
+    # "entries 32/24" -- already past a limit that is not the one that bit.
     my $shown = length($key) > 72 ? substr($key, 0, 69) . '...' : $key;
     Carp::croak(sprintf
         "Data::Shared: composite registry is full, cannot write '%s'"
         . " (entries %s/%s, string arena %s/%s bytes, max_children=%s)",
         $shown, map { defined $_ ? $_ : '?' }
-            $s->{size}, $s->{max_entries}, $s->{arena_used}, $s->{arena_cap},
+            $s->{size}, $s->{capacity} // $s->{max_entries},
+            $s->{arena_used}, $s->{arena_cap},
             $self->{node}{max_children});
 }
 
@@ -527,8 +563,11 @@ sub _child_count {
 
 sub _allocate_id {
     my ($self) = @_;
-    Carp::croak("Data::Shared: composite child limit exceeded (max_children=$self->{node}{max_children}) at $self->{name}")
-        if $self->_child_count >= $self->{node}{max_children};
+    # _budget is set only where the storage was created for fewer children than
+    # the mount asks for, and is then the number the index can actually serve.
+    my $limit = $self->{_budget} // $self->{node}{max_children};
+    Carp::croak("Data::Shared: composite child limit exceeded (max_children=$limit) at $self->{name}")
+        if $self->_child_count >= $limit;
     my $id = $self->{index}->get('n:') // 0;
     Carp::croak('Data::Shared: invalid composite child sequence') unless $id =~ /\A[0-9]+\z/;
     $self->_index_put('n:', $id + 1); # IDs are never rolled back or reused.
@@ -678,6 +717,9 @@ sub _open_child {
     # out of the cache.
     my %mode = (opening => $opening, strict_readonly => $self->{strict_readonly},
         pending_paths => $pending, cleanup => $cleanup, frozen_ok => $self->{_frozen_ok},
+        # A child is reached from a read, so opening one is never the moment to
+        # refuse a spec: see the budget check in new().
+        replaying => $opening ? 1 : 0,
         sealed_ok => $opening ? 1 : 0);
     my $rt;
     if ($node->{child}) {
@@ -1078,7 +1120,22 @@ sub destroy {
         $self->{lru_next} = {};
         delete @{$self}{qw(lru_head lru_tail)};
         if (defined $self->{dir}) {
+            # Whatever is left down there goes with the directory, and a nested
+            # composite nobody cached was never destroyed through its own
+            # object, so its lock was never taken: a frozen store reaches this
+            # with an empty cache, so the whole subtree went out from under
+            # readers holding nested locks. Our own lock is held already and
+            # must not be reopened here -- flock conflicts with itself across
+            # two descriptors -- so the sweep starts one level down.
+            my @under;
+            if (opendir my $dh, $self->{dir}) {
+                @under = map { "$self->{dir}/$_" }
+                    grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+                closedir $dh;
+            }
+            my $held = Data::Shared::_lock_composite_dirs(\@under);
             my $cleanup = Data::Shared::_cleanup_paths([$self->{dir}]);
+            undef $held;
             Carp::croak("Data::Shared: cannot remove retired composite: $cleanup") if length $cleanup;
         }
         return 1;

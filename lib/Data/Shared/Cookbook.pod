@@ -227,9 +227,10 @@ See the DEEP PATHS section of L<Data::Shared>.
     shared_get($ro, '/cache/42');                    # lock-free reads
     # shared_set($ro, ...) croaks: root is read-only
 
-Shipping the directory read-only needs every mount to be freezable, and
-18 of the 39 families are not -- including C<buffer> and
-C<sortedset:strings>, which the recipes above mount. A store holding
+Shipping the directory read-only needs every mount to be freezable or
+immutable, and 17 of the 39 families are neither -- including C<buffer>
+and the C<sortedset:strings> variant, which the recipes above mount.
+(C<perfecthash> is immutable: it ships without being sealed.) A store holding
 any of them never reports C<frozen>, so the C<die> above fires; and a
 write-protected copy of it cannot be opened at all, because an
 unfreezable leaf is reopened with its ordinary constructor, which needs

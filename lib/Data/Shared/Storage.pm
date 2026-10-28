@@ -61,12 +61,29 @@ sub plan {
             shift @args if @args;
             unshift @args, $root->_file_for($name);
         }
+        elsif (@args && defined $args[0] && !ref $args[0]) {
+            # The caller named this file, rather than the facade deriving it
+            # from the root directory. Only such a path is checked below: a
+            # derived one is relative exactly when the root's own directory is,
+            # which is legitimate and resolved consistently elsewhere.
+            $plan->{explicit_file} = 1;
+        }
         $plan->{file} = $args[0] if @args && defined $args[0] && !ref $args[0];
     }
     $plan->{paths} = [$plan->{file}] if $plan->{kind} ne 'strings' && defined $plan->{file};
     for my $path (@{ $plan->{paths} }) {
         Carp::croak("Data::Shared: invalid backing path for '$name'")
             if ref $path || !length($path) || index($path, "\0") >= 0;
+        # An explicit path is published in the manifest and every later process
+        # resolves it again. Left relative, it resolved against whatever
+        # working directory that process happened to have: at best the open
+        # failed, at worst it found a different file of the same name and
+        # attached to it. Refused rather than silently anchored, because only
+        # the caller knows which directory they meant.
+        Carp::croak("Data::Shared: backing path for '$name' must be absolute,"
+            . " since every process that opens this store resolves it again"
+            . " (got '$path')")
+            if $plan->{explicit_file} && $path !~ m{\A/};
     }
     return $plan;
 }

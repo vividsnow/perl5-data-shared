@@ -440,6 +440,30 @@ subtest 'a kill between the publish and the removal leaves the file reclaimable'
     ok !-e "$dir/m1.shm", 'and the storage is gone';
 };
 
+# The POD promises teardown leaves nothing but the lock, and the composite
+# equivalent of this is already swept, but a backing file created by a
+# coordinator that died before publishing the manifest is named by nothing --
+# so it survived unlink_all and no API could even report it.
+subtest 'teardown reclaims a backing file no manifest ever named' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    $root->mount('cache', 'hashmap:ii', undef, 64);
+    shared_set($root, '/cache/7', 42);
+
+    my $orphan = "$dir/scratch.shm";
+    { my $h = Data::HashMap::Shared::II->new($orphan, 16) }
+    ok -f $orphan, 'an unpublished backing file is on disk';
+    is $root->mount_info('scratch'), undef, 'and no mount record names it';
+
+    my $n = $root->unlink_all;
+    ok !-f $orphan, 'teardown removes it too';
+    cmp_ok $n, '>=', 3, 'and counts it among what it removed';
+    opendir my $dh, $dir or die $!;
+    my @left = sort grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+    is_deeply \@left, ['.manifest.lock'], 'leaving only the lock, as documented';
+};
+
 done_testing;
 
 package SlowUnlink;

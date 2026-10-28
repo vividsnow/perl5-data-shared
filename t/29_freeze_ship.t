@@ -193,4 +193,32 @@ subtest 'a shipped store can still be torn down' => sub {
     ok !-e "$dir/manifest.json", 'and no manifest';
 };
 
+# The POD publishes this split and names the families that block the predicate,
+# which drifts silently: it listed perfecthash among them although frozen()
+# exempts an immutable backend, so the shipping gate it documents was wrong for
+# the one family that needs no sealing.
+subtest 'the freezability split the POD publishes is the one the registry has' => sub {
+    my $registry = Data::Shared::Registry::registry();
+    my %by;
+    for my $key (keys %$registry) {
+        my $e = $registry->{$key};
+        push @{ $by{ $e->{freeze} ? 'sealable' : $e->{immutable} ? 'immutable' : 'neither' } }, $key;
+    }
+    is scalar keys %$registry, 39, '39 families';
+    is scalar @{ $by{sealable} }, 21, '21 can be sealed';
+    is_deeply $by{immutable}, ['perfecthash'], 'perfecthash is the only immutable one';
+    is scalar @{ $by{neither} }, 17, 'and 17 block the predicate';
+
+    my $pod = do {
+        open my $fh, '<', $INC{'Data/Shared.pm'} or die $!;
+        local $/; <$fh>;
+    };
+    like $pod, qr/only 21 of the 39 families can be\s*\nsealed/, 'the POD says 21';
+    like $pod, qr/any of the other 17/, 'and 17';
+    for my $key (@{ $by{neither} }) {
+        next if $key =~ /timingwheel/;      # written as "the timing wheels"
+        like $pod, qr/C<\Q$key\E>/, "the POD names $key as a blocker";
+    }
+};
+
 done_testing;

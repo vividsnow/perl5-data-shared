@@ -224,7 +224,13 @@ sub write {
     require File::Temp;
     require File::Basename;
     my ($fh, $tmp) = File::Temp::tempfile('.manifest-XXXXXXXX', DIR => File::Basename::dirname($path), UNLINK => 0);
+    # Carried across the replace. File::Temp makes the new file 0600 and rename
+    # takes the mode with it, so a root an administrator had deliberately made
+    # group-readable stopped being readable by the group at the next topology
+    # change -- silently, and the POD calls sharing a root an explicit choice.
+    my $mode = (stat $path)[2];
     my $ok = eval {
+        chmod $mode & 07777, $tmp or die "cannot set manifest mode: $!" if defined $mode;
         # A caller's $, would land between the JSON and the newline and $\ after
         # it, either of which publishes a manifest nothing can parse again.
         local ($,, $\);

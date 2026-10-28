@@ -36,6 +36,22 @@ sub is_owner_only {
 }
 
 is_owner_only($dir, 'root directory');
+
+# File::Temp creates the replacement 0600 and rename carries that mode across,
+# so a root an administrator had deliberately made group-readable stopped being
+# readable by the group at the next topology change -- silently.
+subtest 'publishing a manifest keeps the mode it already had' => sub {
+    my $shared = tempdir(CLEANUP => 1);
+    my $r = Data::Shared->new("$shared/root");
+    eval { $r->mount('a', 'hashmap:ii', undef, 16); 1 } or plan skip_all => "hashmap unavailable: $@";
+    my $manifest = "$shared/root/manifest.json";
+    chmod 0640, $manifest or die $!;
+    is((stat $manifest)[2] & 07777, 0640, 'set group-readable by hand');
+    $r->mount('b', 'hashmap:ii', undef, 16);
+    is((stat $manifest)[2] & 07777, 0640, 'and a topology change preserves it');
+    $r->unmount('b');
+    is((stat $manifest)[2] & 07777, 0640, 'as does unmounting');
+};
 is_owner_only("$dir/.manifest.lock", 'manifest lock');
 is_owner_only("$dir/manifest.json", 'manifest');
 

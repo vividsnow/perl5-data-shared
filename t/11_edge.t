@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use Test::More;
 use File::Temp qw(tempdir);
+use Cwd ();
 use Data::Shared qw(shared_get shared_set shared_delete shared_exists shared_incr
                     shared_call shared_push shared_pop
                     shareda_get shareda_set shareda_delete shareda_exists shareda_incr
@@ -279,6 +280,29 @@ subtest 'a call error names the operation, not one tier' => sub {
     like $@, qr/a call path must name a mount/, 'and says so in the same terms';
     ok !eval { $r->node('/cache')->call(''); 1 }, 'a cursor refuses an empty method name';
     like $@, qr/node call requires a method name/, 'by its own guard';
+};
+
+# An explicit backing path is published in the manifest and resolved again by
+# every process that opens the store. Left relative it resolved against each
+# process's own working directory: at best the open failed, at worst it found a
+# different file of the same name and attached to it.
+subtest 'an explicit backing path must be absolute' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new("$dir/store");
+    ok !eval { $root->mount('stats', 'hashmap:ii', 'stats.shm', 16); 1 },
+        'a relative explicit path is refused';
+    like $@, qr/must be absolute/, 'and says why';
+    ok eval { $root->mount('stats', 'hashmap:ii', "$dir/stats.shm", 16); 1 },
+        'the absolute form mounts' or diag $@;
+    # A path the facade derives is relative exactly when the root's directory
+    # is, which is legitimate: the check must not reach it. Done inside a temp
+    # directory, since a relative root would otherwise land in the checkout.
+    my $start = Cwd::getcwd();
+    chdir $dir or die $!;
+    my $here = Data::Shared->new('relative-root');
+    ok eval { $here->mount('derived', 'hashmap:ii', undef, 16); 1 },
+        'a derived path under a relative root still mounts' or diag $@;
+    chdir $start or die $!;
 };
 
 done_testing;

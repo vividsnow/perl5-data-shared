@@ -665,45 +665,43 @@ sub _lock_composite_dirs {
     my ($paths) = @_;
     my @held;
     require Fcntl;
-    for my $path (@$paths) {
-        # Every lock beneath it, not just its own: a nested composite has a
-        # lock of its own, and a worker part-way through a deep read holds
-        # that one while the outer directory is what gets removed.
-        for my $lockfile (_composite_locks_under($path)) {
+    # Every lock beneath it, not just its own: a nested composite has a lock of
+    # its own, and a worker part-way through a deep read holds that one while
+    # the outer directory is what gets removed. Descended one level at a time
+    # with the level above already locked, rather than from a list taken up
+    # front: a child composite is only ever created while its parent's lock is
+    # held, so an inventory built before any lock was taken could miss one
+    # created a moment later -- and name one deleted a moment later, which the
+    # open below then failed on.
+    my @queue = @$paths;
+    while (my $path = shift @queue) {
+        next unless -d $path && !-l $path;
+        my $lockfile = "$path/.lock";
+        my $fh;
+        if (-e $lockfile) {
             # '<' as a fallback, because a lock file may be read-only and
             # Linux takes an exclusive flock on a read-only descriptor; and
             # loud rather than silent, because proceeding without the lock is
-            # the race this whole helper exists to stop.
-            my $fh;
-            CORE::open($fh, '+<', $lockfile)
-                or CORE::open($fh, '<', $lockfile)
-                or Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!");
+            # the race this whole helper exists to stop. Gone is not a failure:
+            # what the lock was guarding has been removed already.
+            unless (CORE::open($fh, '+<', $lockfile)
+                    || CORE::open($fh, '<', $lockfile)) {
+                Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!")
+                    unless $!{ENOENT};
+            }
+        }
+        if ($fh) {
             until (flock $fh, Fcntl::LOCK_EX()) {
                 next if $!{EINTR};
                 Carp::croak("Data::Shared: cannot lock composite '$lockfile': $!");
             }
             push @held, $fh;
         }
-    }
-    return \@held;
-}
-
-sub _composite_locks_under {
-    my ($path) = @_;
-    return () unless -d $path && !-l $path;
-    my @locks;
-    my @queue = ($path);
-    while (my $dir = shift @queue) {
-        push @locks, "$dir/.lock" if -e "$dir/.lock";
-        opendir my $dh, $dir or next;
-        for my $entry (readdir $dh) {
-            next if $entry eq '.' || $entry eq '..';
-            my $child = "$dir/$entry";
-            push @queue, $child if -d $child && !-l $child;
-        }
+        opendir my $dh, $path or next;
+        push @queue, map { "$path/$_" } grep { $_ ne '.' && $_ ne '..' } readdir $dh;
         closedir $dh;
     }
-    return @locks;
+    return \@held;
 }
 
 sub _cleanup_paths {
@@ -745,7 +743,20 @@ sub _write_manifest {
     Carp::croak('Data::Shared: root is read-only, cannot write manifest') if $self->{readonly};
     my $data = $self->_manifest_data;
     $self->{_manifest_stamp} = Data::Shared::Manifest::write($self->manifest_path, $data);
+    $self->_stamp_manifest_identity;
     return 1;
+}
+
+# Which manifest file this root's published state belongs to. The revision and
+# the published bytes cannot tell a root's own store from an identical one
+# built after somebody destroyed it: a teardown and an identical rebuild
+# reproduce both, so a surviving root passed its own staleness check and then
+# retired and reclaimed a successor's storage. Every publication renames a new
+# file into place, so the inode does distinguish them.
+sub _stamp_manifest_identity {
+    my ($self) = @_;
+    @{$self}{qw(_manifest_dev _manifest_ino)} = (stat $self->manifest_path)[0, 1];
+    return;
 }
 
 sub _assert_revision {
@@ -758,6 +769,10 @@ sub _assert_revision {
     my ($current, $stamp) = Data::Shared::Manifest::read($self->manifest_path);
     Carp::croak('Data::Shared: stale manifest revision; reopen the root before changing mounts')
         unless $current->{revision} == $self->{_revision} && $stamp eq $self->{_manifest_stamp};
+    my ($dev, $ino) = (stat $self->manifest_path)[0, 1];
+    Carp::croak('Data::Shared: this store was replaced; open the root again')
+        if defined $self->{_manifest_ino} && defined $ino
+        && ($dev != $self->{_manifest_dev} || $ino != $self->{_manifest_ino});
 }
 
 sub _invalidate_compiled {
@@ -782,9 +797,10 @@ sub _mutate {
         # every sibling process its topology was stale -- which broke the
         # ordinary pattern of forked workers each mounting a scratch handle.
         local $self->{_published} = 0;
-        my ($mounts, $order, $nested, $revision, $stamp, $retained) =
+        my ($mounts, $order, $nested, $revision, $stamp, $retained, $dev, $ino) =
             ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision},
-             $self->{_manifest_stamp}, [ @{ $self->{_retained} } ]);
+             $self->{_manifest_stamp}, [ @{ $self->{_retained} } ],
+             $self->{_manifest_dev}, $self->{_manifest_ino});
         my $ret;
         my $ok = eval {
             $ret = $code->();
@@ -796,8 +812,9 @@ sub _mutate {
         };
         my $err = $@;
         if (!$ok) {
-            @{$self}{qw(mounts order _nested _revision _manifest_stamp _retained)} =
-                ($mounts, $order, $nested, $revision, $stamp, $retained);
+            @{$self}{qw(mounts order _nested _revision _manifest_stamp _retained
+                        _manifest_dev _manifest_ino)} =
+                ($mounts, $order, $nested, $revision, $stamp, $retained, $dev, $ino);
             my $cleanup = _cleanup_paths($self->{_pending_paths});
             # An exception object must reach the caller intact; the rewrite and
             # re-croak below would stringify it.
@@ -910,6 +927,7 @@ sub _replay_manifest {
     }
     $self->{_revision} = $data->{revision};
     $self->{_manifest_stamp} = $raw;
+    $self->_stamp_manifest_identity;
     $self->_invalidate_compiled;
     return 1;
 }
@@ -938,6 +956,11 @@ sub _install_recipe {
             node => $recipe->{node}, dir => $recipe->{dir}, path => [split m{/}, $name],
             readonly => $self->{readonly}, strict_readonly => $self->{strict_readonly},
             pending_paths => $self->{_pending_paths}, frozen_ok => $self->{_frozen_ok},
+            # Distinct from opening: adopting storage that is already there is
+            # an open as far as construction goes, but it is still a topology
+            # change the caller chose, and the only moment a changed spec can
+            # be refused while the caller is there to be told.
+            replaying => $self->{_opening} ? 1 : 0,
             opening => $self->{_opening} || (defined $recipe->{dir} && -e $recipe->{dir}));
         $handle = $composite;
         $file = $recipe->{dir};
@@ -1337,6 +1360,17 @@ sub unlink_all {
                 }
             }
             rmdir $children;
+            # Derived backing files no mount record names. A coordinator killed
+            # between creating one and publishing the manifest leaves a file
+            # nothing can ever name again: the composite equivalent is swept
+            # just above and documented, so the flat one was the only leak
+            # behind the POD's promise that teardown leaves only the lock.
+            if (opendir my $dh, $self->{dir}) {
+                my @stray = grep { /\.shm\z/ && -f "$self->{dir}/$_" }
+                    grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+                closedir $dh;
+                $n += grep { CORE::unlink "$self->{dir}/$_" } @stray;
+            }
         }
         $self->{mounts} = {};
         $self->{order} = [];
@@ -1547,6 +1581,12 @@ without rebuilding. To supply one some other way, pass the factory or
 the loaded handle as the spec, as for any other type. C<sortedset:strings> takes
 C<< mount('names', 'sortedset:strings', { max => 100_000 }) >>;
 C<set>/C<keys> backing paths are auto-filled for file-backed roots.
+A backing path you name yourself must be absolute, because it is
+published in the manifest and resolved again by every process that
+opens the store; a relative one would resolve against each process's own
+working directory. Paths the facade derives from the root directory are
+unaffected, and are relative exactly when that directory is.
+
 Backing paths already owned by another mount are rejected before
 construction, including aliases produced by filename sanitization
 (e.g. C<a/b> and C<a__b>) and string SortedSet sidecars. Mount the
@@ -1561,8 +1601,10 @@ Lifecycle and introspection for mounts. Names are canonicalized as
 C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
 
 C<unmount> keeps the mount's storage and records it in the manifest, so
-a later mount of the same name adopts it and any process that opens the
-root can reclaim it with C<unlink_all>. That record costs one manifest
+a later mount of the same name adopts it. To reclaim it while the store
+stays in service, mount the name again and C<unmount> it with
+C<< unlink => 1 >>; C<unlink_all> reclaims it too, from any process that
+opens the root, but takes the whole store with it. That record costs one manifest
 entry per retained store until something reclaims it, and every topology
 change republishes the manifest, so a program that rotates mounts under
 fresh names should pass C<< unlink => 1 >> rather than accumulate them.
@@ -1589,11 +1631,12 @@ and every registered child, open or not. C<freeze_all> returns the number of han
 success: either everything was already sealed, or no mount can be.
 C<frozen> tells those apart, and is what a producer should assert
 before shipping the directory -- but only 21 of the 39 families can be
-sealed at all, so a store holding any of the other 18 (C<buffer>,
-C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>, C<pubsub>,
-C<reqrep>, C<ringbuffer>, C<sync>, the timing wheels, C<reservoir>,
-C<topk>, C<segmenttree>, C<disjointset>, C<perfecthash>, and
-C<sortedset:strings>) can never report C<frozen>. C<frozen> is a
+sealed at all. C<perfecthash> is immutable and needs no sealing, so it
+does not block the predicate; a store holding any of the other 17
+(C<buffer>, C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>,
+C<pubsub>, C<reqrep>, C<ringbuffer>, C<sync>, the timing wheels,
+C<reservoir>, C<topk>, C<segmenttree>, C<disjointset>) or the
+C<sortedset:strings> variant can never report C<frozen>. C<frozen> is a
 predicate and does not say which mount blocks it;
 C<< open_readonly($dir, strict => 1) >> does, by naming the first
 unsupported class it meets. Freezing is also a one-way door for the
@@ -1613,8 +1656,13 @@ serialise between processes. A root that was opened before another
 writer's change gets a C<stale manifest revision> error from C<mount>,
 C<unmount>, C<freeze_all> and C<unlink_all>, raised before any
 constructor or factory runs: reopen the root and retry against the
-current configuration. Ordinary reads and writes never check the
-revision, so they neither fail nor refresh.
+current configuration. A store destroyed and rebuilt at the same
+directory is refused the same way, as C<this store was replaced>, since
+an identical rebuild reproduces both the revision and the published
+bytes. Ordinary reads and writes never check the revision, so they
+neither fail nor refresh; a write to a mount another process retired
+with C<< unlink => 1 >> is one of those, and succeeds into a mapping
+whose file is gone, where nothing will read it back.
 
 A root keeps its own mount namespace until it is reopened, and a
 composite child it already holds open is part of that namespace. If
@@ -1705,7 +1753,9 @@ for C<buffer:str> is the one-character string C<"0">.
 C<sortedset:strings> and C<intern> derive a string arena of 32 bytes per
 declared entry, so longer members exhaust it early and C<shared_set>
 returns C<undef>. Pass a larger C<arena>, or a larger third constructor
-argument for C<intern>, and check the return value.
+argument for C<intern>, and check the return value. A full C<queue>,
+C<deque>, C<stack> or C<heap> drops a C<shared_push> the same way, as
+does a C<shared_set> past the end of a C<buffer>.
 
 =item * Keys cross into XS as bytes, so encode wide characters first. A
 character above U+00FF is accepted by the HashMap and SortedSet families
@@ -1815,7 +1865,11 @@ Each composite declares C<max_children> (default 10_000) and
 C<cache_size> open children (default 32, LRU close/reopen) via the
 hashref spec form or a trailing C<{max_children =E<gt> ..., cache_size =E<gt> ...}>
 in the arrayref form. One child instance is one backing segment, so
-high-cardinality parents need an explicit budget. Anonymous composites
+high-cardinality parents need an explicit budget. The budget sizes the
+child index when the composite is created and cannot be raised
+afterwards: mounting a name over storage an C<unmount> retained with a
+larger C<max_children> is refused, since the index file cannot grow.
+C<< unmount($name, unlink => 1) >> first, and build the subtree again. Anonymous composites
 retain all opened children until subtree deletion or root destruction,
 because an anonymous segment cannot be reopened after eviction;
 C<cache_size> bounds only file-backed child caches. Use a file-backed
@@ -1921,6 +1975,8 @@ Once), TimingWheel, HierTimingWheel, ReqRep.
 
 A file-backed root is created mode C<0700>, and the manifest and the
 C<.manifest.lock> that serialises topology changes are created C<0600>.
+Republishing the manifest keeps whatever mode it already had, so a root
+you widened on purpose stays widened.
 Backing files come from the leaves, which create them C<0600> with
 C<O_NOFOLLOW> and C<O_EXCL>. A directory or lock that already exists keeps
 its own mode, so sharing a root between users stays an explicit choice; the

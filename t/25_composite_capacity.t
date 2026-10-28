@@ -39,6 +39,69 @@ for my $len (126, 200, 254) {
     is $root->mount_info('t')->{composite}, 1, 'and it really is composite';
 }
 
+# The index file is sized from max_children when it is created, so remounting
+# the same name with a larger budget published a number the storage could not
+# serve: children were refused at a fraction of it, and the refusal quoted the
+# published number back.
+subtest 'a composite cannot be remounted with a budget its storage cannot serve' => sub {
+    my $spec = sub { ['hashmap:ss', 64, ['hashmap:ii', 16], { max_children => $_[0] }] };
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    $root->mount('u', $spec->(3));
+    shared_set($root, '/u/alice/5', 1);
+
+    $root->unmount('u');
+    ok !eval { $root->mount('u', $spec->(50)); 1 }, 'raising the budget is refused';
+    like $@, qr/created for max_children=3 and cannot serve 50/, 'and names both';
+    like $@, qr/unmount\(unlink => 1\)/, 'and the way out';
+
+    ok eval { $root->mount('u', $spec->(3)); 1 }, 'the recorded budget still mounts' or diag $@;
+    is Data::Shared::shared_get($root, '/u/alice/5'), 1, 'over the same children';
+    $root->unmount('u');
+    ok eval { $root->mount('u', $spec->(2)); 1 }, 'and so does a smaller one' or diag $@;
+
+    # The storage really does hold what it promises, and the refusal that comes
+    # when it is full names the slot table -- the limit that actually binds.
+    # The old message printed max_entries, a smaller load-factor figure a put
+    # had already sailed past, so it read "entries 32/24".
+    my $fresh = Data::Shared->new(tempdir(CLEANUP => 1));
+    $fresh->mount('u', $spec->(50));
+    my $made = 0;
+    for my $i (1 .. 60) {
+        last unless eval { shared_set($fresh, "/u/u$i/5", $i); 1 };
+        $made++;
+    }
+    is $made, 50, 'a budget of 50 really holds 50 children';
+    like $@, qr/child limit exceeded \(max_children=50\)/, 'and stops on the budget, not the file';
+};
+
+# The refusal belongs where the caller named the budget. A nested level is
+# reached from a read, so refusing there would take out a store for publishing
+# an oversized number; it serves the ceiling its storage really has instead,
+# and says that number rather than the published one.
+subtest 'a nested level keeps serving the budget its storage was built for' => sub {
+    my $spec = sub {
+        ['hashmap:ss', 64, ['hashmap:ss', 64, ['hashmap:ii', 16], { max_children => $_[0] }],
+         { max_children => 100 }];
+    };
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    eval { $root->mount('u', $spec->(3)); 1 } or plan skip_all => "nested composite unavailable: $@";
+    shared_set($root, '/u/eu/paris/5', 1);
+    $root->unmount('u');
+    ok eval { $root->mount('u', $spec->(50)); 1 },
+        'raising only a nested budget is not refused at mount' or diag $@;
+    is eval { Data::Shared::shared_get($root, '/u/eu/paris/5') }, 1,
+        'and a deep read still works' or diag $@;
+
+    my $made = 1;        # paris
+    for my $i (1 .. 12) {
+        last unless eval { shared_set($root, "/u/eu/city$i/5", $i); 1 };
+        $made++;
+    }
+    is $made, 3, 'the nested level stops at what its index holds';
+    like $@, qr/child limit exceeded \(max_children=3\)/,
+        'and names that number, not the one the manifest published';
+};
+
 # Opening a composite must not recount its children: the counter is maintained
 # under the lock, so a recount per open made every cold access O(children) and
 # wrote to the index on a read path. The 'p:' marker is what calls for a recount.

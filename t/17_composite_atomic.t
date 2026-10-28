@@ -450,8 +450,15 @@ subtest 'a stale root cannot tear down its successor' => sub {
     $fresh->mount('users', $spec);
     $fresh->set('/users/bob/k', 'replacement');
 
+    # Retiring the mount first was the way round the composite's own identity
+    # check: unmount keeps the storage and ledgers it, and the sweep then
+    # removed it by pathname -- which by then named the successor's directory.
+    # The manifest's inode is what refuses it: a teardown and an identical
+    # rebuild reproduce the revision and the published bytes exactly.
+    ok !eval { $stale->unmount('users'); 1 }, "the stale root cannot retire the mount";
+    like $@, qr/was replaced/, 'because the store is not the one it published';
     ok !eval { $stale->unlink_all; 1 }, "the stale root's teardown is refused";
-    like $@, qr/belongs to a newer instance/, 'because the storage is not its own';
+    like $@, qr/was replaced|belongs to a newer instance/, 'because the storage is not its own';
     ok -d "$dir/.children/users", "the replacement's children survive";
     undef $fresh;
     # Guarded: if the refusal above ever regresses, the store is gone and this
@@ -529,6 +536,103 @@ subtest 'teardown waits for a nested composite lock' => sub {
     waitpid $pid, 0;
     cmp_ok $waited, '>', 1, 'the teardown waited for the nested lock too';
     ok !-d "$dir/.children/atlas", 'and then removed the tree';
+};
+
+# A frozen index cannot take the retirement marker, so that teardown visits the
+# children it happens to have cached and then removes the directory. Reopened
+# with open_sealed nothing is cached, so the whole subtree went out from under
+# a reader holding a nested lock -- the one case where the reader cannot be
+# warned by anything else, since it cannot write.
+subtest 'tearing down a sealed store waits for a nested lock it never cached' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $maker = Data::Shared->new($dir);
+        eval { $maker->mount('atlas', ['hashmap:ss', 64, ['hashmap:ss', 64, ['hashmap:ss', 64]]]); 1 }
+            or plan skip_all => "nested composite unavailable: $@";
+        $maker->set('/atlas/eu/paris/k', 'v');
+        $maker->freeze_all or plan skip_all => 'nothing could be sealed';
+    }
+    my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
+    ok $nested, 'the sealed store has a nested lock' or plan skip_all => 'no nested lock';
+
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '<', $nested) && flock $fh, Fcntl::LOCK_EX();
+        syswrite $held_w, $ok ? "held\n" : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    is scalar <$held_r>, "held\n", 'a reader holds the nested lock';
+
+    my $sealed = Data::Shared->open_sealed($dir);
+    is scalar(keys %{ $sealed->{mounts}{atlas}{composite}{cache} }), 0,
+        'and the teardown has nothing cached to walk';
+    my $start = Time::HiRes::time();
+    $sealed->unlink_all;
+    my $waited = Time::HiRes::time() - $start;
+    waitpid $pid, 0;
+    cmp_ok $waited, '>', 1, 'the teardown waited for it anyway';
+    ok !-d "$dir/.children/atlas", 'and then removed the tree';
+};
+
+# The read-only branch checks identity and then waits for the shared lock, so a
+# teardown and recreate that completed during the wait left the reader holding
+# an index that says nothing about the store it is now attached to. The
+# exclusive branch rechecks after the wait; this one did not.
+subtest 'a read-only reader rechecks identity after waiting for the lock' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $root = Data::Shared->new($dir);
+        eval { $root->mount('users', ['hashmap:ss', 64, ['hashmap:ss', 64]]); 1 }
+            or plan skip_all => "composite unavailable: $@";
+        $root->set('/users/alice/k', 'original');
+        # A read-only open needs the files sealed, so the reader this is about
+        # is a reader of a shipped store.
+        $root->freeze_all or plan skip_all => 'nothing could be sealed';
+    }
+    my $index = "$dir/.children/users/index.shm";
+    my $lock = "$dir/.children/users/.lock";
+    ok -e $index && -e $lock, 'the composite has an index and a lock'
+        or plan skip_all => 'unexpected layout';
+    # A copy to rename over the index: an unlink and recreate is what a
+    # teardown does, and the inode at that path is what tells them apart.
+    my $replacement = "$dir/.children/users/index.new";
+    { open my $in, '<', $index or die $!; open my $out, '>', $replacement or die $!;
+      local $/; print {$out} <$in>; close $out or die $! }
+
+    my $ro = eval { Data::Shared->open_readonly($dir) };
+    $ro or plan skip_all => "read-only open unavailable: $@";
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, '+<', $lock) && flock $fh, Fcntl::LOCK_EX();
+        syswrite $held_w, $ok ? "held\n" : "failed\n";
+        # While the reader is parked on the shared lock, not before it: its own
+        # check already passed against the index that was there.
+        select undef, undef, undef, 1;
+        my $renamed = rename $replacement, $index;
+        syswrite $held_w, $renamed ? "replaced\n" : "failed\n";
+        select undef, undef, undef, 0.3;
+        POSIX::_exit($ok && $renamed ? 0 : 1);
+    }
+    close $held_w;
+    is scalar <$held_r>, "held\n", 'a writer holds the composite lock';
+
+    my $got = eval { $ro->get('/users/alice/k') };
+    my $err = $@;
+    is scalar <$held_r>, "replaced\n", 'the store was replaced during the wait';
+    waitpid $pid, 0;
+    ok !defined $got, 'the parked reader is not served from the replacement'
+        or diag "got '$got'";
+    like $err, qr/belongs to a newer instance/, 'it is told the storage is not its own';
 };
 
 # A read-only root now holds a SHARED lock for a composite section rather than
