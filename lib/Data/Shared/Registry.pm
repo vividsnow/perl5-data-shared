@@ -9,21 +9,14 @@ our @CARP_NOT = qw(Data::Shared Data::Shared::Adapter::Map
                    Data::Shared::Adapter::Set Data::Shared::Adapter::Indexed
                    Data::Shared::Adapter::Sketch);
 
-# One shape test for every integer-addressed entry, used by the exists verbs
-# here and by the adapters' key handling for the rest. Keeping two copies is
-# what let a trailing newline pass one and not the other. [0-9], not \d: \d
-# also matches non-ASCII digits, which numify to the element they look like,
-# so U+0661 walked past an earlier guard and overwrote element 0.
-# One compiled pattern, used directly by both, so neither pays a call for the
-# other and there is still only one definition to keep right.
+# ASCII digits only: \d accepts Unicode digits that the backend can numify to 0.
 my $INDEX_SHAPE = qr/\A-?[0-9]+\z/;
 
 sub _index_shape_ok {
     return defined $_[0] && $_[0] =~ $INDEX_SHAPE ? 1 : 0;
 }
 
-# Entries flagged key_int get this from the adapter, for every verb but
-# exists, which is documented to answer 1 or 0 for any path.
+# Adapters validate key_int for every verb except the boolean exists probe.
 sub _assert_index {
     my ($key, $idx) = @_;
     Carp::croak("$key: index must be an integer, not '" . (defined $idx ? $idx : 'undef') . "'")
@@ -36,12 +29,7 @@ sub _assert_index {
 my $ADD_KEY = sub { my ($h, $k, $v) = @_; return $h->add($k) };
 my $ESTIMATE_EXISTS = sub { my ($h, $k) = @_; return $h->estimate($k) > 0 ? 1 : 0 };
 
-# incr exists for its delta, so an explicit undef one is a caller's missing
-# variable rather than a request to add nothing. Passed through it added 0 and
-# returned the unchanged value as a success: the last silent member of the
-# missing-argument class the entries below guard by hand for sortedset,
-# bitset, disjointset and radixtree. A delta left out entirely still means the
-# backend's own default, which is what the POD documents.
+# An omitted delta uses the backend default; explicit undef is a missing argument.
 sub _assert_delta {
     my ($key, @args) = @_;
     Carp::croak("$key: incr delta must be a number, not undef")
@@ -49,11 +37,7 @@ sub _assert_delta {
     return;
 }
 
-# For an indexed family that exposes no capacity to compare against. The bound
-# is the backend's own node-index ceiling, which it reports by croaking past
-# it: without this, exists croaked for a negative index (numified into the
-# unsigned range) and for anything above the ceiling, where the promise is 1 or
-# 0 for any index, one outside the structure included.
+# Graph's unsigned node-index ceiling; out-of-range native probes croak.
 my $GRAPH_INDEX_MAX = 0xFFFFFFFF;
 sub _nonneg_exists {
     my ($method) = @_;
@@ -74,9 +58,7 @@ sub _capacity_exists {
     };
 }
 
-# The same bounds check in front of a backend whose own test croaks out of
-# range: exists is documented to answer 1 or 0 for any path, and a caller
-# probing candidate indices died instead of being told no.
+# The backend's native existence test croaks outside capacity.
 sub _bounded_exists {
     my ($method) = @_;
     return sub {
@@ -94,9 +76,7 @@ our %REGISTRY = (
         verbs => {
             get    => 'test',
             exists => _bounded_exists('test'),
-            # No value read as false and cleared the bit, reporting success.
-            # @_ < 3, not an undef test: an explicit undef still means the
-            # caller meant to pass something, as Node::delete reads it.
+            # Explicit undef is a value; an omitted value must not clear the bit.
             set    => sub { my ($h, $idx, $v) = @_;
                 Carp::croak("bitset set needs a value (1 to set, 0 to clear)") if @_ < 3;
                 return $v ? $h->set($idx) : $h->clear($idx) },
@@ -173,9 +153,7 @@ our %REGISTRY = (
         verbs => {
             get => 'find',
             exists => _capacity_exists(),
-            # Without the guard a missing second member numified to 0 and
-            # unioned the member with element 0. DisjointSet has no split, so
-            # that merge is permanent.
+            # DisjointSet numifies an omitted peer to 0 and cannot undo a merge.
             set => sub {
                 my ($h, $m, $other) = @_;
                 Carp::croak("disjointset set needs a second member to union with")
@@ -205,9 +183,7 @@ our %REGISTRY = (
         key => 'graph', dist => 'Data-Graph-Shared',
         class => 'Data::Graph::Shared', path_class => 'indexed',
         key_int => 1,
-        # has_node is an honest exists, and get croaks on a node that is not
-        # there, so without it a caller had no probe that answers rather than
-        # dying.
+        # Graph get croaks for absent nodes; has_node supplies a safe probe.
         verbs => { get => 'node_data', delete => 'remove_node',
                    exists => _nonneg_exists('has_node') },
     },
@@ -295,10 +271,7 @@ our %REGISTRY = (
         verbs => {
             get => 'get', set => 'set', delete => 'free',
             exists => _bounded_exists('is_allocated'),
-            # add() takes a mandatory delta and incr() takes none, so mapping
-            # the verb to either one alone left the other form croaking from
-            # the XS: the no-delta form, which the POD calls the base form,
-            # could never succeed on a variant that has both.
+            # Pool add requires a delta; incr accepts none.
             incr => sub { my ($h, $slot, @delta) = @_;
                 return $h->add($slot, $delta[0]) if @delta && $h->can('add');
                 return $h->incr($slot) if !@delta && $h->can('incr');
@@ -376,16 +349,13 @@ our %REGISTRY = (
         class => 'Data::SegmentTree::Shared', path_class => 'indexed',
         key_int => 1,
         verbs => {
-            # One index, as every other verb of a 1-D leaf takes: dropping the
-            # extra components answered a point query for a path that named
-            # something else, where the string-mapped verbs croak.
+            # One index, and shape-checked: a non-numeric one numifies to 0,
+            # which is in range, so exists answered true for any member.
             get => sub { my ($h, @p) = @_;
                 Carp::croak('segmenttree: get takes one index; use shared_call for a range')
                     if @p != 1;
                 return $h->sum($p[0], $p[0]) },
             set => 'set', incr => 'add',
-            # Without the shape check a non-numeric index numified to 0, which
-            # is in range, so exists answered true for any member.
             exists => sub { my ($h, $p) = @_;
                 return (_index_shape_ok($p) && $p >= 0 && $p < $h->size) ? 1 : 0 },
             delete => sub { my ($h, $p) = @_; return $h->set($p, 0) },
@@ -403,11 +373,7 @@ our %REGISTRY = (
                 Carp::croak("sortedset set needs a score") if @_ < 3;
                 return $h->add($m, $score) },
             delete => 'remove',
-            # A delta is required, not defaulted. Without one the integer class
-            # croaks from its XS but the Strings wrapper interned the member,
-            # added nothing, and returned the unchanged score as if it had
-            # worked -- and on a member that did not exist it left a ghost
-            # behind with score 0.
+            # SortedSet::Strings accepts an omitted delta and may intern a ghost member.
             incr => sub { my ($h, $m, @delta) = @_;
                 Carp::croak('sortedset incr needs a delta') unless @delta;
                 return $h->incr($m, $delta[0]) },
@@ -477,8 +443,7 @@ for my $key (keys %REGISTRY) {
         : $REGISTRY{$key}{immutable} ? 'immutable' : 'unsupported';
 }
 $REGISTRY{sortedset}{variants}{Strings}{readonly} = 'unsupported';
-# The class has neither freeze nor new_readonly, and the %NATIVE_READONLY loop
-# above is per-entry, so the inherited freeze => 1 was a wrong published fact.
+# SortedSet::Strings has neither freeze nor new_readonly.
 $REGISTRY{sortedset}{variants}{Strings}{freeze} = 0;
 
 sub registry { return \%REGISTRY }

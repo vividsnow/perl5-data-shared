@@ -31,9 +31,6 @@ sub plan {
             Carp::croak('perfecthash build keys must be an ARRAY reference')
                 if $plan->{build} && ref $plan->{keys} ne 'ARRAY';
         } else {
-            # Named for this position only. The old text also offered a factory
-            # and a loaded handle, which do not belong here: those are passed
-            # as the SPEC, like any other type, and never reach this branch.
             Carp::croak('Data::Shared: a perfecthash spec takes a built file path or a'
                 . ' {build_int|build_str, path} hashref; pass a factory or a loaded'
                 . ' handle as the spec itself instead');
@@ -41,8 +38,7 @@ sub plan {
         Carp::croak('perfecthash mount requires a path') unless defined $plan->{file};
     } elsif ($class eq 'Data::SortedSet::Shared::Strings') {
         $plan->{kind} = 'strings';
-        # The leading-undef placeholder every other spec accepts would become a
-        # hash key here and warn before the croak below, so reject it by name.
+        # Reject the path placeholder before interpreting the list as key/value options.
         Carp::croak("sortedset:strings takes options, not the undef path"
             . " placeholder: pass max => N (and optionally set/keys)")
             if @args && !defined $args[0];
@@ -70,21 +66,13 @@ sub plan {
         $plan->{file} = $args[0] if @args && defined $args[0] && !ref $args[0];
     }
     $plan->{paths} = [$plan->{file}] if $plan->{kind} ne 'strings' && defined $plan->{file};
-    # Which paths the caller named, rather than the facade deriving them from
-    # the root directory. Per path, not per plan: sortedset:strings takes two,
-    # and the caller may name one and leave the other to be derived.
+    # SortedSet::Strings may mix one explicit backing path with one derived path.
     my %explicit = map { $_ => 1 } grep { !ref $_ } @{ $plan->{explicit} || [] };
     for my $path (@{ $plan->{paths} }) {
         Carp::croak("Data::Shared: invalid backing path for '$name'")
             if ref $path || !length($path) || index($path, "\0") >= 0;
-        # An explicit path is published in the manifest and every later process
-        # resolves it again. Left relative, it resolved against whatever
-        # working directory that process happened to have: at best the open
-        # failed, at worst it found a different file of the same name and
-        # attached to it. Refused rather than silently anchored, because only
-        # the caller knows which directory they meant. A derived path is
-        # relative exactly when the root's own directory is, which is
-        # legitimate and resolved consistently elsewhere.
+        # Explicit paths must be absolute; derived paths follow the root's directory spelling.
+        # Do not anchor caller paths implicitly; only the caller knows the intended directory.
         Carp::croak("Data::Shared: backing path for '$name' must be absolute,"
             . " since every process that opens this store resolves it again"
             . " (got '$path')")
@@ -109,9 +97,7 @@ sub _load {
     my $minimum = $resolved->{entry} && $resolved->{entry}{min_version};
     my $key = $load . "\0" . ($minimum // '');
     return if $LOADED{$key};
-    # Pass the dist name through: a variant class like
-    # Data::HashMap::Shared::II lives in the Data-HashMap-Shared dist, so it
-    # cannot be derived from the class name.
+    # Variant module names do not determine the distribution that provides them.
     Data::Shared::_require_class($load, $resolved->{entry} && $resolved->{entry}{dist});
     if ($minimum) {
         eval { $load->VERSION($minimum) };
@@ -125,9 +111,6 @@ sub check_readonly {
     my $class = $resolved->{class};
     _load($resolved);
     return if $resolved->{entry} && $resolved->{entry}{immutable};
-    # The mount as well as the class, where the caller knows it: the Cookbook
-    # sends a producer to this croak to find which mount blocks a shipped
-    # store, and a class name does not say which mount that was.
     Carp::croak("Data::Shared: strict read-only access is not supported by $class"
         . (defined $name && length $name ? " at mount '$name'" : ''))
         unless $class->can('new_readonly');
@@ -160,8 +143,7 @@ sub construct {
         $handle = $class->new_readonly($plan->{file});
     } else {
         my ($args) = Data::Shared::Manifest::snapshot($plan->{args});
-        # frozen_ok: the freeze walk must reach children that are already
-        # frozen, and a frozen file refuses the writable constructor.
+        # Frozen files refuse writable constructors, including during a subtree walk.
         if (($root->{_cleanup} || $root->{_frozen_ok}) && $class->can('new_readonly')) {
             $handle = eval { $class->$ctor(@$args) };
             my $error = $@;
@@ -171,10 +153,8 @@ sub construct {
             }
         } elsif (!defined $root->{dir} && @$args && !defined $args->[0]
                  && $class->can('new_anon')) {
-            # An anonymous mount passes undef as the path, which every buffer
-            # variant takes into C as NULL and rejects with EFAULT. Those
-            # classes expose new_anon instead. Tried second, not first, so no
-            # class that already accepts new(undef, ...) changes behaviour.
+            # Buffer new(undef, ...) passes NULL to C and fails with EFAULT; use new_anon.
+            # Try the ordinary constructor first to preserve other backends' behavior.
             $handle = eval { $class->$ctor(@$args) };
             if (!$handle) {
                 my $error = $@;

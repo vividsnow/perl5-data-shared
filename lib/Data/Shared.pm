@@ -4,8 +4,7 @@ use warnings;
 
 our $VERSION = '0.01';
 
-# Mount-time croaks run inside Manifest::with_lock, so without this Carp blames
-# the sibling internals instead of the caller's mount() line.
+# Report mount-time errors at the caller across the manifest lock.
 our @CARP_NOT = qw(Data::Shared Data::Shared::Manifest Data::Shared::Storage
                    Data::Shared::Composite);
 
@@ -68,7 +67,7 @@ sub _parse_string_path {
     Carp::croak("path must not be a reference") if ref $path;
     return [] if $path eq '' || $path eq '/';
     my $p = $path;
-    $p =~ s{^/+}{};   # one slash left an empty leading component for "//a/b"
+    $p =~ s{^/+}{};   # /+, or "//a/b" keeps an empty leading component
     return [] if $p eq '';
     return [ split m{/}, $p ] if index($p, '//') < 0 && substr($p, -1) ne '/';
     return [ grep { length } split m{/}, $p ];
@@ -81,16 +80,8 @@ sub _parse_array_path {
     return _check_components([ @$aref ]);
 }
 
-# The string tier refuses an undef or reference path outright. An array
-# component got through unchecked, so undef addressed the empty-string key and
-# a reference addressed its own stringified address -- a different key every
-# run -- both reported as a successful write. An object that overloads
-# stringification is allowed, since the string tier accepts the spelling it
-# produces, but it is resolved here and now: kept as a reference, a mutable
-# object addressed a different key on every use of the same compiled path, and
-# a handler returning undef addressed the empty-string key -- the very case
-# this check exists for. Every caller passes a fresh copy of the list, so
-# replacing the component in place cannot reach the caller's array.
+# Resolve overloaded components now so compiled paths retain a stable spelling.
+# Callers pass a fresh array, so replacing a component in place is safe.
 sub _check_components {
     my ($components) = @_;
     for my $c (@$components) {
@@ -98,12 +89,7 @@ sub _check_components {
         my $stringify = defined $c && overload::Method($c, '""');
         Carp::croak("path component must be a defined string") unless $stringify;
         my $string = $stringify->($c, undef, '');
-        # A handler handing back another stringifiable object is an ordinary
-        # wrapper, resolved here by hand and to a bounded depth. Interpolating
-        # it instead hands the chain to perl, whose fallbacks are the address
-        # for a handler that returns its own object and the empty string for
-        # one that returns undef -- the two unstable addresses this check
-        # exists to refuse -- and whose recursion dies on a cycle.
+        # Bound overload chains explicitly; interpolation can hide undef or self-return.
         for (my $depth = 0; ref $string; $depth++) {
             my $inner = overload::Method($string, '""') or last;
             Carp::croak("path component must be a defined string") if $depth >= 16;
@@ -205,7 +191,6 @@ sub _dispatch_record_pushpop {
 }
 
 sub _dispatch_record_call {
-    # A mount record or a composite child's: both carry the name the path used.
     my ($record, $rest, $method, @args) = @_;
     my $handle = $record->{handle};
     my $label = defined $record->{name} ? "mount '$record->{name}'" : 'handle';
@@ -259,22 +244,15 @@ sub _dispatch_pushpop {
 sub _dispatch_call {
     my ($root, $components, $method, @args) = @_;
     _check_root($root);
-    # Named for the operation, not for one spelling of it: the array, compiled
-    # and cursor tiers share this path, and each told its caller about
-    # shared_call, which is not the function they had called.
     Carp::croak("Data::Shared: a call requires a method name")
         unless defined $method && length $method;
     _check_native_call($root, $method);
     Carp::croak("Data::Shared: a call path must name a mount") unless @$components;
     my ($name, $mount, $rest) = _resolve($root, $components);
-    # Retiring a mount's storage retires the mount with it: removing the files
-    # while the manifest still named them left a store that no later new,
-    # open or open_readonly would accept, in any process.
+    # Remove the manifest entry before retiring its backing storage.
     if ($method eq 'unlink' || $method eq 'destroy') {
         return $root->unmount($name, unlink => 1) unless @$rest;
-        # Below a leaf the remainder is passed to the backend, which takes no
-        # argument for these and removed the mount's whole file anyway, while
-        # the manifest went on naming it. A composite routes it to the child.
+        # Leaf unlink/destroy ignore record suffixes and remove the whole file.
         Carp::croak("Data::Shared: '$method' retires a mount or a composite child,"
             . " not the record at '/" . join('/', @$components) . "';"
             . " use shared_delete to remove a record")
@@ -332,8 +310,7 @@ sub _compiled_code {
     my $gen = $root->{gen} || 0;
     my $addr = refaddr($root);
     my $hit = $cache->{$key};
-    # $hit->[2] is weakened, so check it survived rather than returning undef
-    # as the bound code.
+    # Cached closures are weak references and may have expired.
     return $hit->[2] if $hit && $hit->[2] && $hit->[0] == $addr && $hit->[1] == $gen && $hit->[3] && $hit->[3] == $root;
     my $components = $cp->{components};
     Carp::croak("Data::Shared: cannot use a compiled root path this way") unless @$components;
@@ -432,25 +409,18 @@ sub _dispatch_compiled_pushpop {
     return $bound->(@args);
 }
 
-# A live cache entry already proves this path resolved against this root at this
-# generation, so a hit needs no re-validation beyond identity and generation, and
-# the remaining argument list can be handed to the bound closure without being
-# copied again. Anything else falls through to the full dispatch below. Mutating
-# verbs re-check readonly because this path skips the gate in
-# _dispatch_compiled; the cache is keyed per verb and a read-only root never
-# reaches _compiled_code for a mutating verb, so the check is defensive.
+# A live binding requires the same root identity and generation.
+# Mutating callers must check readonly before taking this shortcut.
 sub _bound_hit {
     my ($root, $cp, $key) = @_;
     return undef unless ref $root && ref $cp eq 'Data::Shared::Compiled';
     my $hit = $cp->{_bc} && $cp->{_bc}{$key} or return undef;
+    # [3] is weakened; test it survived rather than handing back dead code.
     return undef unless $hit->[3] && $hit->[3] == $root && $hit->[1] == ($root->{gen} || 0);
     return $hit->[2];
 }
 
-# @_ is never modified here: the no-parens forms `&name` and `&$ref` share the
-# caller's @_, so splicing it would delete the caller's own arguments on every
-# warm call. A slice is only built when there are arguments to forward, which
-# keeps the argument-less verbs free.
+# Bare &name and &$ref calls alias the caller's @_; never modify it here.
 sub sharedc_get {
     if (my $code = _bound_hit($_[0], $_[1], 'get')) {
         return @_ > 2 ? $code->(@_[2 .. $#_]) : $code->();
@@ -506,8 +476,6 @@ sub sharedc_call {
     _check_compiled($cp);
     Carp::croak("Data::Shared: a call requires a method name") unless defined $m && length $m;
     _check_native_call($r, $m);
-    # As the string tier does: the manifest must stop naming storage that is
-    # being removed, or no process can open the store again.
     if (($m eq 'unlink' || $m eq 'destroy') && @{ $cp->{components} }) {
         my ($name, $mount, $rest) = _resolve($r, $cp->{components});
         return $r->unmount($name, unlink => 1) unless @$rest;
@@ -536,9 +504,7 @@ sub new {
     my $self = _empty_root($class, $dir);
     if (defined $dir) {
         require File::Path;
-        # 0700: the backing files are owner-only, so a group-writable root would
-        # just let another user unlink the manifest. A directory that already
-        # exists keeps its own mode, so sharing stays an explicit choice.
+        # Preserve existing directory modes; sharing a root is an administrator choice.
         File::Path::make_path($dir, { mode => 0700 }) unless -d $dir;
         Carp::croak("Data::Shared: cannot create directory '$dir'") unless -d $dir;
         Data::Shared::Manifest::with_lock($self, 1, sub {
@@ -560,12 +526,7 @@ sub _open_root {
 
 sub open { my ($class, $dir) = @_; return _open_root($class, $dir) }
 
-# A frozen leaf refuses the writable constructor, so once the process that
-# froze a store exits, open() can never succeed again -- and unlink_all, the
-# only verb that reclaims the storage, croaks on a read-only root. The
-# documented lifecycle had no last step for exactly the stores the ship
-# workflow produces. This attaches the sealed leaves read-only so the
-# lifecycle can finish.
+# Attach sealed leaves read-only while allowing lifecycle cleanup.
 sub open_sealed { my ($class, $dir) = @_; return _open_root($class, $dir, frozen_ok => 1) }
 
 sub open_readonly {
@@ -584,11 +545,7 @@ sub _require_class {
     $file .= '.pm';
     eval { require $file };
     if (my $e = $@) {
-        # Name the dist, not just the module: with the leaves recommended rather
-        # than required this is the first error most users meet. The caller
-        # supplies it, because a variant class such as
-        # Data::HashMap::Shared::II lives in the Data-HashMap-Shared dist and
-        # the name cannot be derived. The @INC dump buries the actionable part.
+        # Variant module names do not determine the distribution that provides them.
         $e =~ s/ \(\@INC.*//s;
         $e =~ s/\s+\z//;
         my $how = defined $dist
@@ -627,13 +584,7 @@ sub _check_storage_paths {
     return;
 }
 
-# abs_path lstats every component, and the collision check walks every
-# installed path for every new one. Cached for one manifest operation only:
-# held longer, a symlink retargeted between two mounts hid a real collision,
-# and the store then failed to reopen because replay resolves afresh. So a
-# replay resolves each path once, while mounting one at a time still re-resolves
-# the installed ones -- accepted, since republishing the manifest dominates
-# that path anyway (see the mount-count note under PERFORMANCE).
+# Cache paths for one manifest operation; symlinks may change between operations.
 sub _abs_path {
     my ($self, $path) = @_;
     my $hit = $self->{_abs_cache}{$path};
@@ -651,38 +602,21 @@ sub _track_paths {
     push @{ $self->{_pending_paths} }, grep { defined $_ && !-e $_ } @paths;
 }
 
-# A composite directory is removed while another process may be part-way
-# through opening a child under it, holding that composite's own lock. The
-# sweep ignored that lock, so it could remove the directory between a worker's
-# instance check and its open, and the worker then attached to the replacement
-# that appeared at the same child path. Taking the lock first lets the worker
-# finish against the old instance, which is what the POD allows it to do.
-# Ordering is topology lock then composite lock, the same direction every other
-# path takes, so this cannot deadlock against a worker that holds only the
-# latter.
+# Lock order: topology, then composites from parent to child.
+# Workers may finish opening old children before their directories are removed.
 sub _lock_composite_dirs {
     my ($paths) = @_;
     my @held;
     require Fcntl;
-    # Every lock beneath it, not just its own: a nested composite has a lock of
-    # its own, and a worker part-way through a deep read holds that one while
-    # the outer directory is what gets removed. Descended one level at a time
-    # with the level above already locked, rather than from a list taken up
-    # front: a child composite is only ever created while its parent's lock is
-    # held, so an inventory built before any lock was taken could miss one
-    # created a moment later -- and name one deleted a moment later, which the
-    # open below then failed on.
+    # Discover each level under its parent's lock; children may be created lazily.
     my @queue = @$paths;
     while (my $path = shift @queue) {
         next unless -d $path && !-l $path;
         my $lockfile = "$path/.lock";
         my $fh;
         if (-e $lockfile) {
-            # '<' as a fallback, because a lock file may be read-only and
-            # Linux takes an exclusive flock on a read-only descriptor; and
-            # loud rather than silent, because proceeding without the lock is
-            # the race this whole helper exists to stop. Gone is not a failure:
-            # what the lock was guarding has been removed already.
+            # Linux permits exclusive flock on a read-only descriptor; missing locks need no wait.
+            # Never proceed without the lock: only ENOENT may be skipped.
             unless (CORE::open($fh, '+<', $lockfile)
                     || CORE::open($fh, '<', $lockfile)) {
                 Carp::croak("Data::Shared: cannot open composite lock '$lockfile': $!")
@@ -730,8 +664,7 @@ sub _manifest_data {
         push @mounts, { name => $name, spec => $m->{spec}, args => $m->{args} };
     }
     my $data = { version => 1, revision => $self->{_revision}, mounts => \@mounts };
-    # Only when there is something to say, so a store that never retains keeps
-    # byte-identical manifests.
+    # Omit an empty ledger to preserve manifests from stores that never retained storage.
     $data->{retained} = [ @{ $self->{_retained} } ] if @{ $self->{_retained} };
     return $data;
 }
@@ -746,12 +679,7 @@ sub _write_manifest {
     return 1;
 }
 
-# Which manifest file this root's published state belongs to. The revision and
-# the published bytes cannot tell a root's own store from an identical one
-# built after somebody destroyed it: a teardown and an identical rebuild
-# reproduce both, so a surviving root passed its own staleness check and then
-# retired and reclaimed a successor's storage. Every publication renames a new
-# file into place, so the inode does distinguish them.
+# Rebuilds can reproduce revisions and bytes; the manifest inode distinguishes them.
 sub _stamp_manifest_identity {
     my ($self) = @_;
     @{$self}{qw(_manifest_dev _manifest_ino)} = (stat $self->manifest_path)[0, 1];
@@ -761,8 +689,6 @@ sub _stamp_manifest_identity {
 sub _assert_revision {
     my ($self) = @_;
     return unless defined $self->{dir};
-    # Say which it is: after unlink_all the manifest is gone on purpose, and
-    # reporting that it cannot be read reads as corruption.
     Carp::croak('Data::Shared: this store was unlinked; create or open a root again')
         if defined $self->{_manifest_stamp} && !-e $self->manifest_path;
     my ($current, $stamp) = Data::Shared::Manifest::read($self->manifest_path);
@@ -790,11 +716,7 @@ sub _mutate {
         local $self->{_pending_paths} = [];
         local $self->{_abs_cache} = {};
         local $self->{_changed} = 0;
-        # Separate from _changed: a transient mount changes this root's own
-        # view, so compiled bindings must be invalidated, but it is not in the
-        # manifest. Republishing it bumped the revision for nothing and told
-        # every sibling process its topology was stale -- which broke the
-        # ordinary pattern of forked workers each mounting a scratch handle.
+        # Transient changes invalidate local bindings without publishing a new revision.
         local $self->{_published} = 0;
         my ($mounts, $order, $nested, $revision, $stamp, $retained, $dev, $ino) =
             ({ %{ $self->{mounts} } }, [ @{ $self->{order} } ], $self->{_nested}, $self->{_revision},
@@ -815,21 +737,14 @@ sub _mutate {
                         _manifest_dev _manifest_ino)} =
                 ($mounts, $order, $nested, $revision, $stamp, $retained, $dev, $ino);
             my $cleanup = _cleanup_paths($self->{_pending_paths});
-            # An exception object must reach the caller intact; the rewrite and
-            # re-croak below would stringify it.
+            # Preserve exception objects across rollback.
             die $err if ref $err;
-            # $err already carries "at FILE line N."; re-croaking it appended a
-            # second copy. Strip the last one only -- anchored at the front, or
-            # a message containing its own " at ..." loses everything after it.
+            # Strip only the final Carp location; messages may contain their own " at ...".
             $err =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s;
             Carp::croak($err . (length $cleanup ? " (rollback: $cleanup)" : ''));
         }
         $self->_invalidate_compiled if $self->{_changed};
-        # Still holding the topology lock, and only after the manifest no
-        # longer names the storage. Run outside the lock, a removal raced a
-        # sibling process that had already read the new manifest, mounted the
-        # same name onto the file that was about to go, and published a mount
-        # nothing could ever open.
+        # Retire storage under the topology lock, after publishing its removal.
         $after->() if $after;
         return $ret;
     });
@@ -900,7 +815,7 @@ sub _replay_manifest {
     my ($data, $raw) = Data::Shared::Manifest::read($path);
     local $self->{_opening} = 1;
     local $self->{_abs_cache} = {};     # shared with $check by the copy below
-    # Before the replay, so a mount that adopts retained storage clears it.
+    # Load retained paths before replay so adopted storage can leave the ledger.
     $self->{_retained} = [ @{ $data->{retained} || [] } ];
     my $check = bless { %$self, mounts => {} }, ref $self;
     my @recipes;
@@ -915,8 +830,6 @@ sub _replay_manifest {
     }
     my $ok = eval { $self->_install_recipe($_) for @recipes; 1 };
     unless ($ok) {
-        # Stripped as _mutate and Composite::_rethrow strip it: the inner error
-        # already carries a location, and wrapping it added a second one.
         my $why = $@;
         $why =~ s/\A(.*[^\s])\s*\bat .+ line \d+\.?\s*\z/$1/s unless ref $why;
         Carp::croak("Data::Shared: failed to replay manifest '$path': $why");
@@ -952,10 +865,7 @@ sub _install_recipe {
             node => $recipe->{node}, dir => $recipe->{dir}, path => [split m{/}, $name],
             readonly => $self->{readonly}, strict_readonly => $self->{strict_readonly},
             pending_paths => $self->{_pending_paths}, frozen_ok => $self->{_frozen_ok},
-            # Distinct from opening: adopting storage that is already there is
-            # an open as far as construction goes, but it is still a topology
-            # change the caller chose, and the only moment a changed spec can
-            # be refused while the caller is there to be told.
+            # Adoption must validate the chosen spec; replay tolerates legacy specs.
             replaying => $self->{_opening} ? 1 : 0,
             opening => $self->{_opening} || (defined $recipe->{dir} && -e $recipe->{dir}));
         $handle = $composite;
@@ -974,9 +884,7 @@ sub _install_recipe {
     $self->{_nested} = 1 if index($name, '/') >= 0;
     $self->{_changed} = 1;
     $self->{_published} = 1 unless $recipe->{transient};
-    # A mount adopting retained storage owns it again, so the manifest must
-    # stop offering it to unlink_all as loose storage. Matched in the same form
-    # the ledger records.
+    # Adopted paths must leave the retained-storage ledger.
     if (@{ $self->{_retained} } && @{ $recipe->{storage_paths} }) {
         my %adopted = map { $_ => 1 } map { $self->_ledger_form($_) } @{ $recipe->{storage_paths} };
         my $before = @{ $self->{_retained} };
@@ -992,9 +900,7 @@ sub mount {
     return $self->_mutate(sub { $self->_install_recipe($self->_recipe($name, $spec, @args)) });
 }
 
-# mount accepts '/a/' for 'a', and handle, node and children all canonicalize
-# through _path_components, so unmount and mount_info reading the name verbatim
-# made the symmetric spelling a silent no-op.
+# Canonicalize lookup names as mount does, so '/a/' finds 'a'.
 sub _canon_mount_name {
     my ($name) = @_;
     return undef unless defined $name && !ref $name;
@@ -1017,47 +923,23 @@ sub unmount {
         $self->{_nested} = (grep { index($_, '/') >= 0 } keys %{ $self->{mounts} }) ? 1 : 0;
         $self->{_changed} = 1;
         $self->{_published} = 1 unless $gone->{transient};
-        # Retaining the storage is the documented behaviour, and the manifest
-        # is where it has to be said: recorded in this root's memory only, the
-        # list died with the process that unmounted, so the next process --
-        # the coordinator pattern the POD recommends -- could not reclaim it
-        # with unlink_all, and a same-named remount served the old data back.
-        # Recorded even when it is about to be unlinked, so that the published
-        # manifest names the storage for the moment between losing the mount
-        # and losing the file. A process killed in that window left the file
-        # named by nothing at all: not the manifest, not the ledger, so a later
-        # mount of the same name adopted it and served the old data, and no
-        # call could reclaim it. _retire_storage drops the entry once the file
-        # is actually gone.
+        # Retain paths until unlink succeeds, including the crash window after publication.
         $self->_record_retained($gone->{storage_paths}) unless $gone->{transient};
         return 1;
-    # Only once the manifest no longer names it: unlinked first, a failed
-    # publish would roll the mount back onto storage that is already gone.
     }, $opt{unlink} ? sub { $self->_retire_storage($gone) } : undef);
     return $ret;
 }
 
-# One handle can be mounted under several names on purpose, and the alias is
-# transient, so retiring it published nothing while still removing the file its
-# persistent owner is recorded under: no process could open the store again.
-# Ownership is a property of the storage, not of the object: comparing
-# identities alone let a handle reopened onto the same file -- an alias kept
-# across a remount, or one taken from a second open() of the same directory --
-# unlink a file the manifest still named.
+# Ownership follows backing storage, including aliases held by other handle objects.
 sub _check_unlinkable {
     my ($self, $name) = @_;
-    # A cache of its own: this runs before _mutate localizes the real one, so
-    # resolving a retiring mount's paths here left an entry per retired path in
-    # the root for its lifetime, growing without bound as a rotation ran.
+    # This check precedes _mutate; keep path caching local to it.
     local $self->{_abs_cache} = {};
     my $mount = $self->{mounts}{$name} or return;
     my $handle = $mount->{handle};
     return unless blessed($handle);
     my $addr = refaddr($handle);
-    # Canonicalised, as _check_storage_paths compares them, because two
-    # spellings of one file are one file; and by containment, because a
-    # composite records its whole directory while its children's files live
-    # below it, so a mounted child handle passed an equality test.
+    # Compare canonical paths by containment; composites own their whole directory.
     my @mine = map { $self->_abs_path($_) } _storage_of($mount);
     for my $other (@{ $self->{order} }) {
         next if $other eq $name;
@@ -1080,8 +962,7 @@ sub _covers {
     return index($inner, "$outer/") == 0 ? 1 : 0;
 }
 
-# A transient mount records no storage paths, because the caller built the
-# handle, so ask the handle where it lives.
+# Caller-built transient handles have no recorded storage paths.
 sub _storage_of {
     my ($mount) = @_;
     my @paths = @{ $mount->{storage_paths} || [] };
@@ -1096,20 +977,15 @@ sub _storage_of {
 sub _retire_storage {
     my ($self, $gone) = @_;
     my $handle = $gone && $gone->{handle};
-    # Nothing to remove, so the ledger entry recorded for the crash window has
-    # no file to describe.
     return $self->_forget_retained($gone) unless $handle && $handle->can('unlink');
     unless (eval { $handle->unlink; 1 }) {
         my $err = $@;
-        # Left on the ledger, which already names it: the storage survived the
-        # removal and something has to be able to reclaim it.
+        # Failed retirement leaves storage on the ledger for retry.
         die $err;
     }
     return $self->_forget_retained($gone);
 }
 
-# The file is gone, so the entry that covered the window between the publish
-# and the removal has done its job.
 sub _forget_retained {
     my ($self, $gone) = @_;
     my @paths = @{ ($gone && $gone->{storage_paths}) || [] } or return;
@@ -1122,14 +998,8 @@ sub _forget_retained {
     return;
 }
 
-# Deduplicated, because a mount rotated under one name retains the same path
-# every cycle: the duplicates grew the manifest and the root without bound and
-# made unlink_all report a removal per cycle instead of per file.
-# Storage inside the root is recorded relative to it, and anything outside it
-# absolutely. Absolute throughout, a directory that was renamed or archived
-# cleaned up whatever now sat at the path it had been created under -- another
-# live root's storage -- and left its own behind. Relative to the caller's
-# working directory instead, the next process resolved it against its own.
+# Record paths inside the root relatively so retained storage survives relocation.
+# Paths outside the root remain absolute.
 sub _ledger_form {
     my ($self, $path) = @_;
     my $abs = $self->_abs_path($path);
@@ -1143,11 +1013,7 @@ sub _ledger_resolve {
     my ($self, $entry) = @_;
     return $entry if $entry =~ m{\A/};
     return $entry unless defined $self->{dir};
-    # Both halves as bytes. Cwd gives back bytes, so an entry recorded from a
-    # root whose directory the caller held as characters was concatenated with
-    # a character string: perl upgraded the entry's bytes and the result named
-    # a file that does not exist, so unlink_all skipped the storage and then
-    # dropped its own record of it.
+    # Cwd ledger entries are bytes; encode the root directory before concatenating.
     my $dir = $self->{dir};
     utf8::encode($dir) if utf8::is_utf8($dir);
     return "$dir/$entry";
@@ -1156,6 +1022,7 @@ sub _ledger_resolve {
 sub _record_retained {
     my ($self, $paths) = @_;
     return unless $paths && @$paths;
+    # Deduplicate: rotation can retain the same path every cycle.
     my %have = map { $_ => 1 } @{ $self->{_retained} };
     my @new = grep { !$have{$_}++ } map { $self->_ledger_form($_) } @$paths;
     return unless @new;
@@ -1168,8 +1035,6 @@ sub handle {
     my ($self, $path) = @_;
     _check_root($self);
     return $self if !defined $path || (!ref $path && ($path eq '' || $path eq '/'));
-    # Through the one path parser, so a Node is a path here as it already is
-    # for node() and children(); this was the only entry point that refused it.
     my @components = @{ $self->_path_components($path) };
     return $self unless @components;
     if (!ref $path && $self->{mounts}{$path} && !$self->{mounts}{$path}{composite}) {
@@ -1212,8 +1077,7 @@ sub children {
 sub shared_node { my ($r, @a) = @_; return $r->node(@a) }
 sub shared_children { my ($r, @a) = @_; return $r->children(@a) }
 
-# Through a named array, not `return sort ...`: sort in scalar context is
-# undefined in perl, which made `if ($root->mounts)` false with mounts present.
+# sort has undefined scalar-context behavior; a named array also returns a count.
 sub mounts { my @k = sort keys %{ $_[0]{mounts} }; return @k }
 sub mount_names { my @k = $_[0]->mounts; return @k }
 
@@ -1231,10 +1095,6 @@ sub mount_info {
 sub sync_all {
     my ($self) = @_;
     my $n = 0;
-    # Insertion order and subtree counting, as freeze_all does: hash order made
-    # which mounts were flushed before a croak differ from run to run, and
-    # counting the mount reported 1 for a composite that flushed its parent,
-    # its index and every registered child.
     for my $name (@{ $self->{order} }) {
         my $h = $self->{mounts}{$name}{handle};
         next unless $h->can('sync');
@@ -1247,24 +1107,17 @@ sub sync_all {
 sub freeze_all {
     my ($self) = @_;
     Carp::croak("Data::Shared: cannot freeze a read-only root") if $self->{readonly};
-    # Exclusive: a shared lock let two producers each check a handle unfrozen
-    # and then both seal it, and the shared mode was only ever needed for a
-    # read-only root, which the line above has already refused.
+    # The exclusive topology lock serializes concurrent freeze attempts.
     return Data::Shared::Manifest::with_lock($self, 1, sub {
         $self->_assert_revision;
         my $n = 0;
-        # Insertion order, not hash order: a croak part-way through leaves the
-        # store frozen in part, which opens in neither mode, and hash order
-        # made which mounts were sealed differ from run to run.
+        # Partial freezes follow mount insertion order.
         for my $name (@{ $self->{order} }) {
             my $h = $self->{mounts}{$name}{handle};
             next unless $h->can('freeze');
-            # Already frozen is the goal state, not an error: without this a
-            # second freeze_all, or one after any leaf was frozen directly,
-            # croaked from the backend and could never succeed again.
+            # Backends may reject a second freeze.
             next if $h->can('frozen') && $h->frozen;
-            # A composite seals its parent, its index and every child, and
-            # reports how many; counting the mount instead under-reported it.
+            # The composite's own count, not 1: it seals a whole subtree.
             if ($h->isa('Data::Shared::Composite')) { $n += $h->freeze }
             else { $h->freeze; $n++ }
         }
@@ -1278,9 +1131,7 @@ sub frozen {
         my $mount = $self->{mounts}{$name};
         my $handle = $mount->{handle};
         if ($handle->can('frozen')) { return 0 unless $handle->frozen }
-        # A build-then-load backend needs no sealing. Anything else that
-        # cannot be sealed cannot be opened read-only either, so the
-        # directory would not ship whatever freeze_all did.
+        # Immutable build-then-load backends need no sealing.
         elsif (!($mount->{entry} && $mount->{entry}{immutable})) { return 0 }
     }
     return @{ $self->{order} } ? 1 : 0;
@@ -1290,27 +1141,19 @@ sub unlink_all {
     my ($self) = @_;
     Carp::croak("Data::Shared: root is read-only, cannot unlink") if $self->{readonly};
     return Data::Shared::Manifest::with_lock($self, 1, sub {
-        # Already unlinked is the goal state, as it is for freeze_all and for a
-        # composite destroy: a second call used to croak that the manifest
-        # could not be read.
         my $published = !defined $self->{dir} || -e $self->manifest_path;
-        # Retained storage counts as work left: a cleanup that failed removed
-        # the manifest first, so without this the retry a caller makes after
-        # fixing whatever blocked it returned 0 and looked like success.
+        # Retained paths can survive failed cleanup after the manifest is gone.
+        # Already unlinked is success, not an error to report.
         return 0 unless $published || @{ $self->{order} } || @{ $self->{_retained} };
         $self->_assert_revision if $published;
         my $n = 0;
-        # Insertion order, not hash order: the last iteration over mounts that
-        # left a partial failure's surviving set up to the hash seed.
+        # Insertion order, so a partial failure's survivors stay deterministic.
         for my $name (@{ $self->{order} }) {
             my $mount = $self->{mounts}{$name};
             my $handle = $mount->{handle};
             next unless $handle->can('unlink');
-            # Counted by what left the filesystem, because the leaves cannot
-            # say: unlink returns undef on success in the bitset, queue and
-            # stack families and the handle itself in the bloom, roaring and
-            # radix ones. Counting the attempt credited a second process's
-            # teardown with removals the first one had already made.
+            # Native unlink returns undef for bitset/queue/stack, handles for bloom/roaring/radix.
+            # Count filesystem removals rather than successful calls.
             my @paths = grep { length } @{ $mount->{storage_paths} || [] };
             my $before = grep { -e } @paths;
             $handle->unlink;
@@ -1318,14 +1161,9 @@ sub unlink_all {
         }
         if ($published && defined $self->{dir}) {
             if (CORE::unlink($self->manifest_path)) { $n++ }
-            # Counting it regardless credited a manifest this call did not
-            # remove.
             elsif (!$!{ENOENT}) { Carp::croak("Data::Shared: cannot unlink manifest: $!") }
         }
-        # Storage an unmount retained, by the paths the mount itself recorded
-        # and the manifest published, so any process can reclaim it. Counted by
-        # what this call actually removed, and what resisted stays on the list
-        # for a retry: deleting the list first left paths nothing could name.
+        # Any process may reclaim retained paths; failed removals must remain retryable.
         if (@{ $self->{_retained} }) {
             my %seen;
             my @entries = grep { !$seen{$_}++ } @{ $self->{_retained} };
@@ -1340,11 +1178,7 @@ sub unlink_all {
             @{ $self->{_retained} } = @left;
             Carp::croak("Data::Shared: $failed") if length $failed;
         }
-        # Ours and empty once every composite is gone, except for a directory a
-        # killed producer left unpublished: the POD says unlink_all is what
-        # reclaims those, and an unchecked rmdir on a non-empty .children left
-        # them for ever. The whole store is being torn down here, so anything
-        # still under our own hidden directory goes with it.
+        # Teardown also reclaims unpublished composite storage left by interrupted creation.
         if (defined $self->{dir}) {
             my $children = "$self->{dir}/.children";
             if (opendir my $dh, $children) {
@@ -1359,11 +1193,7 @@ sub unlink_all {
                 }
             }
             rmdir $children;
-            # Derived backing files no mount record names. A coordinator killed
-            # between creating one and publishing the manifest leaves a file
-            # nothing can ever name again: the composite equivalent is swept
-            # just above and documented, so the flat one was the only leak
-            # behind the POD's promise that teardown leaves only the lock.
+            # Interrupted flat mounts can leave unpublished .shm files in the root directory.
             if (opendir my $dh, $self->{dir}) {
                 my @stray = grep { /\.shm\z/ && -f "$self->{dir}/$_" }
                     grep { $_ ne '.' && $_ ne '..' } readdir $dh;
@@ -1455,14 +1285,10 @@ operation:
     /lat/0/5         mount "lat", indices 0, 5 (NDArray)
     /visitors        mount "visitors" (used with shared_call)
 
-A path resolves in two levels, not by walking: there is nothing to walk
-inside an opaque shared-memory handle, so the components select a mount
-and the rest is the adapter's business. Composite mounts
-(L</DEEP PATHS (COMPOSITES)>) add one child address per level. The three
-tiers (string, array, compiled) otherwise mirror L<Data::Path::XS>,
-except that its keyword syntax is not provided: requesting
-C<:keywords> croaks. L</PERFORMANCE> says why dispatch stays in Perl,
-and L<Data::Shared::Cookbook> has a recipe per leaf.
+Paths select a mount and an adapter operation. Composite mounts
+(L</DEEP PATHS (COMPOSITES)>) add one child address per level. The string,
+array and compiled tiers mirror L<Data::Path::XS>; requesting its
+C<:keywords> syntax croaks. See L<Data::Shared::Cookbook> for recipes.
 
 B<Linux only, 64-bit Perl>, matching every leaf. Handles are never
 cloned into ithreads (C<CLONE_SKIP>).
@@ -1496,24 +1322,17 @@ Native backends validate their own file headers.
 
 =head2 Data::Shared->open_sealed($dir)
 
-Opens a store whose leaves have been frozen, attaching each sealed leaf
-read-only so the replay succeeds. C<open> cannot do this -- a frozen
-file refuses the writable constructor -- and C<open_readonly> gives a
-root whose lifecycle verbs croak, so without this a store had no
-reachable teardown once the process that froze it exited. Reads work;
-data writes are refused by the leaves themselves; the reason to open a
-store this way is C<unlink_all>.
+Reopens frozen leaves read-only while allowing lifecycle cleanup with
+C<unlink_all>. Reads work; the leaves refuse data writes. C<open>
+refuses frozen files, and C<open_readonly> refuses lifecycle writes.
 
 =head2 Data::Shared->open_readonly($dir, strict => 1)
 
-Replays the manifest, opening each leaf with C<new_readonly> where the
-leaf supports it and with the normal constructor where it does not. A
-leaf with a native read-only open (21 of the 39 families, the
-C<freeze> entries in L<Data::Shared::Registry>; C<hashmap> and
-C<bloomfilter> among them) requires a frozen file: on a live one its
-C<new_readonly> croaks, which aborts the whole replay with the leaf's
-message nested under C<failed to replay manifest>. Freeze the store in
-the producing process first.
+Freeze the store in the producing process first. The 21 families with
+C<new_readonly> (the C<freeze> entries in L<Data::Shared::Registry>,
+including C<hashmap> and C<bloomfilter>) require frozen files; a live
+file aborts replay with the leaf's error under C<failed to replay manifest>.
+Other leaves use their normal constructor.
 The generic mutating verbs (C<set>, C<delete>, C<incr>, C<push>,
 C<pop>), every root lifecycle write (C<mount>, C<unmount>,
 C<freeze_all>, C<unlink_all>) and native C<unlink>, C<destroy> and
@@ -1521,13 +1340,10 @@ C<freeze> croak on any read-only root. Other native methods, reached through
 C<shared_call> or C<handle>, keep whatever permissions that leaf's own
 file gives them: the root flag by itself does not make them read-only.
 
-C<< strict => 1 >> closes that gap by refusing the store instead.
-Every backend in the declared tree, lazy composite leaves included,
-must provide C<new_readonly> or be immutable (PerfectHash), and is
-rejected before any handle is opened, so the producer has to freeze
-whatever needs a frozen file first. Raw handles still expose their
-backend's own API, and the filesystem still decides what a process may
-write directly.
+C<< strict => 1 >> requires C<new_readonly> or immutability (PerfectHash)
+throughout the declared tree, including lazy composite leaves. Unsupported
+backends are rejected before any handle is opened. Raw handles expose the
+backend's API; filesystem permissions govern direct writes.
 
 =head2 $root->mount($name, $spec, @ctor_args)
 
@@ -1538,9 +1354,8 @@ nested namespaces; longest-prefix wins). C<$spec> may be:
 
 =item * a short spec: C<'hashmap'>, C<'hashmap:ii'>, C<'buffer:i64'>,
 C<'queue:int'>, C<'sync:semaphore'>, C<'sortedset:strings'>, etc.
-Short specs are all-lowercase (mixed case is accepted and resolves
-to the lowercase canonical form). See L<Data::Shared::Registry> for
-the full inventory.
+Short specs accept mixed case and resolve to lowercase. See
+L<Data::Shared::Registry> for the full inventory.
 
 =item * a full class name: C<'Data::HashMap::Shared::SS'>.
 
@@ -1572,11 +1387,9 @@ removes backing paths created by that attempt. Existing files are retained.
 Factories manage their own external side effects. Nested mount mutations
 inside a factory are rejected.
 
-Every argument has to survive the manifest, because replaying it is how
-each later process reopens the store. C<Inf>, C<NaN> and a lone surrogate
-are refused at mount time rather than published as text nothing can parse
-back. Strings are recorded as bytes, and a string held as characters is
-encoded to its UTF-8 bytes first, uniformly from U+0080 up: the character
+Mount arguments must survive manifest replay. C<Inf>, C<NaN> and lone
+surrogates are refused at mount time. Strings are recorded as bytes;
+character strings are encoded to UTF-8 first, uniformly from U+0080 up: the character
 C<"\x{e9}"> and the single byte C<"\xe9"> are therefore two different
 paths naming two different files.
 
@@ -1588,11 +1401,8 @@ without rebuilding. To supply one some other way, pass the factory or
 the loaded handle as the spec, as for any other type. C<sortedset:strings> takes
 C<< mount('names', 'sortedset:strings', { max => 100_000 }) >>;
 C<set>/C<keys> backing paths are auto-filled for file-backed roots.
-A backing path you name yourself must be absolute, because it is
-published in the manifest and resolved again by every process that
-opens the store; a relative one would resolve against each process's own
-working directory. Paths the facade derives from the root directory are
-unaffected, and are relative exactly when that directory is.
+Explicit backing paths must be absolute. Derived paths follow the root's
+directory spelling and are relative exactly when that directory is.
 
 Backing paths already owned by another mount are rejected before
 construction, including aliases produced by filename sanitization
@@ -1610,20 +1420,16 @@ C<mount_names> is a synonym for C<mounts>; C<available_types> (class or
 root method) lists the 39 short spec names and C<registry> returns the
 L<Data::Shared::Registry> table itself.
 
-C<unmount> keeps the mount's storage and records it in the manifest, so
-a later mount of the same name adopts it. To reclaim it while the store
-stays in service, mount the name again and C<unmount> it with
-C<< unlink => 1 >>; C<unlink_all> reclaims it too, from any process that
-opens the root, but takes the whole store with it. That record costs one manifest
-entry per retained store until something reclaims it, and every topology
-change republishes the manifest, so a program that rotates mounts under
-fresh names should pass C<< unlink => 1 >> rather than accumulate them.
-C<< unmount($name, unlink => 1) >> removes the storage instead, under
-the same directory lock that published its removal, and a native
-C<unlink> or C<destroy> reached through C<shared_call> at a mount does
-the same -- a manifest naming storage that is gone makes the store
-refuse to open at all. See L</SHARING A ROOT> for what another process
-sees while this happens.
+C<unmount> retains storage in a manifest ledger; remounting the same name
+adopts it. To reclaim it while serving other mounts, remount it with the
+same spec and C<< unmount($name, unlink => 1) >>. C<unlink_all> also reclaims
+retained storage from any process, but removes the whole store. Each retained
+store costs a manifest entry; use C<< unlink => 1 >> when rotating fresh names.
+
+C<< unmount($name, unlink => 1) >> publishes the removal and retires storage
+under the same directory lock. Native C<unlink> and C<destroy> through
+C<shared_call> at a mount do the same. See L</SHARING A ROOT> for what
+other processes observe.
 
 =head2 $root->dir, $root->readonly, $root->manifest_path
 
@@ -1633,55 +1439,51 @@ C<undef> for an anonymous root.
 
 =head2 $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats, $root->frozen
 
-Proxies applied to every mount whose handle supports the method, in
-mount order. C<stats> returns a hashref per mount: the leaf's own stats
-where it has them, and C<< { class => ref $handle } >> where it does
-not. A composite mount counts as its whole subtree: parent, child index
-and every registered child, open or not. C<freeze_all> returns the number of handles it sealed, so 0 is a
-success: either everything was already sealed, or no mount can be.
-C<frozen> tells those apart -- but only 21 of the 39 families can be
-sealed at all. C<perfecthash> is immutable and needs no sealing, so it
-does not block the predicate; a store holding any of the other 17
+C<sync_all>, C<freeze_all> and C<unlink_all> visit supported handles in
+mount order. Sync and freeze include a composite's parent, child index and
+every registered child, open or not. C<freeze_all> counts newly sealed
+handles; 0 means everything was already sealed or no mount supports it.
+
+C<stats> returns a hashref keyed by mount name, containing native stats or
+C<< { class => ref $handle } >>. Composite stats include child and open counts
+and stats for cached children only; evicted children are absent.
+Stats fields are backend-specific. F<eg/monitoring.pl> walks registered children
+and compares native capacities and configured child budgets with usage.
+
+C<frozen> reports whether a nonempty store is sealed or immutable throughout;
+only 21 of the 39 families can be sealed. C<perfecthash> is immutable and
+needs no sealing; any of the other 17
 (C<buffer>, C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>,
 C<pubsub>, C<reqrep>, C<ringbuffer>, C<sync>, C<timingwheel>,
 C<hiertimingwheel>, C<reservoir>, C<topk>, C<segmenttree>,
 C<disjointset>) or the
-C<sortedset:strings> variant can never report C<frozen>. C<frozen> is a
-predicate and does not say which mount blocks it;
-C<< open_readonly($dir, strict => 1) >> does, by naming the first
-unsupported mount and class it meets. Freezing is also a one-way door for the
-store: afterwards C<open> refuses it for every process, including the
-one that froze it, and C<open_sealed> is how it is reopened. A mounted native handle is sealed with
-the rest, so the caller's own object becomes read-only. C<unlink_all>
-removes the mounts, the manifest, and every retained store the manifest
-names -- whichever process unmounted it, since the ledger is shared --
-but leaves F<.manifest.lock>, which another process may still be
-holding, so the directory is not empty afterwards. C<freeze_all> and
-C<unlink_all> both croak on a read-only root.
+C<sortedset:strings> variant prevents C<frozen>. For a diagnostic after
+freezing, C<< open_readonly($dir, strict => 1) >> names the first unsupported
+mount and class. Freezing is one-way: C<open> then refuses the store in every
+process; use C<open_sealed> to reopen it. A mounted native handle is sealed
+too, making the caller's object read-only.
+
+C<unlink_all> removes mounts, the manifest and all retained storage,
+including storage retained by other processes. It leaves F<.manifest.lock>,
+which another process may still hold. C<freeze_all> and C<unlink_all> croak
+on a read-only root.
 
 =head1 SHARING A ROOT
 
-Topology changes take a directory lock and bump a revision, so they
-serialise between processes. A root that was opened before another
-writer's change gets a C<stale manifest revision> error from C<mount>,
+Topology changes serialize under a directory lock and revision. A root
+opened before another writer's change gets C<stale manifest revision> from C<mount>,
 C<unmount>, C<freeze_all> and C<unlink_all>, raised before any
 constructor or factory runs: reopen the root and retry against the
-current configuration. A store destroyed and rebuilt at the same
-directory is refused the same way, as C<this store was replaced>, since
-an identical rebuild reproduces both the revision and the published
-bytes. Ordinary reads and writes never check the revision, so they
-neither fail nor refresh; a write to a mount another process retired
-with C<< unlink => 1 >> is one of those, and succeeds into a mapping
-whose file is gone, where nothing will read it back.
+current configuration. A store rebuilt at the same directory is refused as
+C<this store was replaced>. Ordinary reads and writes neither check the
+revision nor refresh the namespace. A write to a mount another process
+retired with C<< unlink => 1 >> can succeed into a mapping whose file is gone.
 
-A root keeps its own mount namespace until it is reopened, and a
-composite child it already holds open is part of that namespace. If
-another process destroys and recreates the store, this root goes on
-reading the child it holds, and C<exists> and C<children> go on
-reporting it, until something makes it take the composite lock again and
-the instance check fires. It never crosses into the new store's
-storage -- it is answering for the old one -- so a worker that must
-notice a teardown should reopen rather than wait to be told.
+A root keeps its namespace and cached composite children until reopened.
+After another process rebuilds the store, cached reads, C<exists> and
+C<children> may still report the old instance until a composite lock triggers
+an instance check. They never cross into the replacement store's storage.
+Workers that must notice teardown should reopen.
 
 Configure topology from one coordinator and let the workers open the
 result; that is the pattern the revision protocol is built for.
@@ -1691,8 +1493,7 @@ result; that is the pattern the revision protocol is built for.
 Components are separated by C</>. A leading C</> is optional,
 repeated and trailing slashes are tolerated, and the empty path
 addresses the root (C<shared_get> returns the root, C<shared_exists>
-is true, mutating the root croaks) -- all mirroring
-L<Data::Path::XS>. The first component(s) select the mount (longest
+is true, mutating the root croaks). The first component(s) select the mount (longest
 prefix match); the remainder is interpreted by the mount's adapter:
 
 =over 4
@@ -1715,17 +1516,13 @@ without it. C<ringbuffer>'s C<get> may read one, a sequence number.
 
 =back
 
-Map-, set- and queue-like mounts croak on a path longer than they take,
-rather than using the components they want and discarding the rest. RadixTree, which
-joins, is unaffected.
+Map-, set- and queue-like mounts croak on extra components. RadixTree joins
+them instead.
 
-Mount selection takes the longest name that matches the joined
-components, so a nested mount wins over the same string reached through
-a shorter one: with C<users> and C<users/sales> mounted,
-C</users/sales/eu> addresses the C<users/sales> mount, not the C<sales>
-record or composite child of C<users>. Array paths join the same way, a
-component containing C</> included, so do not give a nested mount a name
-that spells out an address its parent also serves.
+With C<users> and C<users/sales> mounted, C</users/sales/eu> selects
+C<users/sales>, hiding the C<sales> record or child of C<users>. Array paths
+join the same way, including components containing C</>. Avoid nested mount
+names that spell an address their parent also serves.
 
 No escaping is provided in the string tier: keys containing C</> or
 the empty string need the array tier.
@@ -1733,13 +1530,12 @@ the empty string need the array tier.
 =head1 GENERIC VERBS
 
 C<shared_get>, C<shared_set>, C<shared_delete>, C<shared_exists> and
-C<shared_incr> are honest sugar over native methods, defined per type
+C<shared_incr> map to native methods per type
 in L<Data::Shared::Registry> (e.g. HashMap C<put/get/remove/exists>,
 RadixTree C<insert/lookup/delete/exists>, SortedSet C<add/score/remove>,
-Intern C<intern/id_of>). Where a verb would lie (a plain Bloom filter
-has no delete; unkeyed sketches and sync primitives have no keyed
-get/set) it
-croaks with guidance to use C<shared_call> instead of faking it.
+Intern C<intern/id_of>). Unsupported verbs croak with guidance to use
+C<shared_call>: plain Bloom filters have no delete, and unkeyed sketches
+and sync primitives have no keyed get/set.
 
 Each generic verb is also a method on the root, taking the function's
 arguments without the leading C<$root>: C<< $root->get('/cache/42') >>,
@@ -1755,8 +1551,7 @@ supports it; a leaf with neither C<incr_by> nor a delta form of C<incr>
 (most C<buffer> variants) rejects the delta from its own XS, so use
 C<shared_call> there.
 
-These are the leaf's own behaviours showing through, and worth knowing
-before you rely on them:
+Backend semantics:
 
 =over 4
 
@@ -1786,26 +1581,21 @@ C<disjointset>, C<fenwick>, C<fenwick2d>, C<graph>, C<ndarray>,
 C<segmenttree>) refuse it instead; C<bitset>, C<roaringbitmap>,
 C<ringbuffer>'s C<get> and the integer C<hashmap> variants address
 element 0, with a warning under C<-w>; C<pool> croaks, its slot 0 not
-being allocated. C<shared_exists> stands outside all of that and
-answers 0 for any key the structure cannot hold -- in every family that
-has one, which C<ndarray> and C<fenwick2d> do not.
+being allocated. C<shared_exists> returns 0 for keys the structure cannot hold,
+except in C<ndarray> and C<fenwick2d>, which have no such verb.
 
 =back
 
 =head2 shared_call($root, $path, $method, @args)
 
-The escape hatch that guarantees full coverage: resolves C<$path> to
-a mount, prepends any remaining path components to C<@args>, and calls
-the native C<$method>. Every native operation of every leaf is
-reachable this way, including those with no generic verb. On a
-composite mount the first remaining component instead selects the
-child, and the rest are passed to the child's method.
+Resolves C<$path> to a mount, prepends remaining components to C<@args>,
+and calls the native C<$method>, including methods with no generic verb.
+For composites, the first remaining component selects a child; the rest
+are passed to its method.
 
-C<unlink> and C<destroy> are the exception: they retire storage, so they
-are only accepted where a registration can be retired with it, at a
-mount or at a composite child, and are refused at a record below one.
-At a composite child they remove the child's registration too, the same
-as C<shared_delete> on that address.
+C<unlink> and C<destroy> are accepted only at a mount or composite child,
+and refused at a record below one. They retire storage with its registration;
+at a child this is equivalent to C<shared_delete> on that address.
 
     shared_call($root, '/visitors', 'add_many', ['a', 'b']);
     shared_call($root, '/fenwick', 'prefix', 500);
@@ -1829,25 +1619,18 @@ L</PATH FORMAT>.
 
 C<shared_compile($path)> (string or arrayref) returns a
 L<Data::Shared::Compiled> object holding parsed components;
-C<sharedc_*> functions reuse it without re-parsing, mirroring
-C<path_compile>/C<pathc_*> in L<Data::Path::XS>. On first use against
-a root the compiled path also caches the resolved mount, verb and
-key, so later calls go straight to the native method; the cache is
-invalidated automatically when mounts change. Compiled objects are
-still per-process: recompile after C<fork> if the child mounts
-differently.
+C<sharedc_*> functions reuse it without parsing. First use against a root
+caches the resolved mount, verb and key; subsequent calls use the bound native
+method. Mount changes invalidate the cache. Compiled objects are per-process:
+recompile after C<fork> if the child mounts differently.
 
 =head1 DEEP PATHS (COMPOSITES)
 
-A composite mount nests structures: the parent gives each child a
-stable address, and the facade keeps one child instance per address
-(no leaf can physically contain another). Specs are nested
-arrayrefs (constructor arguments exclude the backing path, which the
-facade supplies per child; a leading C<undef> placeholder is
-tolerated) or hashrefs with C<spec>/C<args>/C<child>. In the
-arrayref form a trailing arrayref is always the child spec, so a
-leaf whose constructor takes a trailing arrayref argument (such as
-SpatialHash grid wrapping) must use the hashref form:
+A composite keeps one child structure per stable parent address. Specs are
+nested arrayrefs or hashrefs with C<spec>/C<args>/C<child>. Constructor arguments
+exclude the backing path; a leading C<undef> placeholder is tolerated.
+A trailing arrayref is always a child spec, so constructors taking a trailing
+arrayref (such as SpatialHash grid wrapping) must use the hashref form:
 
     $root->mount('users', ['hashmap:ss', 100_000, ['bloomfilter', 10_000, 0.01]]);
     $root->mount('leaders', ['sortedset:strings', { max => 100_000 }, ['bloomfilter', 10_000, 0.01]]);
@@ -1864,10 +1647,8 @@ and writes its score), plus C<kdtree> and C<graph> as id-parents
 (child per point/node id; geometry is added through
 C<< $root->node('/atlas/europe')->call('add', [$x, $y], $id) >>, and
 a deep write for an id does not require the point to exist).
-Bloom filters, sketches, queues, stacks, logs, sync and timing
-mounts cannot be parents (probabilistic or transient: their members
-cannot be enumerated or stably addressed) and are rejected at mount
-time; use them as child leaves.
+Bloom filters, sketches, queues, stacks, logs, sync and timing mounts are
+rejected as parents at mount time; use them as child leaves.
 
 Semantics at an intermediate path: C<shared_get> returns a
 L<Data::Shared::Node> (for SortedSet, the score instead),
@@ -1878,38 +1659,32 @@ croaks except for the SortedSet score case. C<< $root->node($path) >>
 C<get/set/delete/exists/incr/push/pop/call/call_at/node/children/handle>
 methods; C<< $root->children($path) >> (C<shared_children>) lists
 registered child addresses. C<handle> on a child leaf path returns
-its native handle. Reads of a missing child never create one;
-writes create it lazily, and so does any C<call> there, since the
-method may mutate. Probe with C<shared_exists>, not a read-only
-call, or a loop over candidate addresses will register every one of
-them and exhaust the child budget.
+its native handle. Reads of missing children never create them; writes and
+any C<call> do. Probe with C<shared_exists> to avoid allocating children.
 
 Each composite declares C<max_children> (default 10_000) and
 C<cache_size> open children (default 32, LRU close/reopen) via the
 hashref spec form or a trailing C<{max_children =E<gt> ..., cache_size =E<gt> ...}>
-in the arrayref form. One child instance is one backing segment, so
-high-cardinality parents need an explicit budget. C<cache_size> bounds
+in the arrayref form. Budget explicitly for high-cardinality parents. C<cache_size> bounds
 one composite's own cache; a nested composite is itself a cached entry
 with its own cache plus its parent and index segments, so a deep tree's
 open-segment ceiling multiplies per level. The budget sizes the
 child index when the composite is created and cannot be raised
 afterwards: mounting a name over storage an C<unmount> retained with a
-larger C<max_children> is refused, since the index file cannot grow.
+larger C<max_children> is refused.
 C<< unmount($name, unlink => 1) >> first, and build the subtree again.
-Every child is also an entry in the parent leaf, so whichever of the two
-is smaller is the real ceiling: size the parent for the budget, or a
-C<sortedset> parent of four fills after four children whatever
-C<max_children> says. Both ceilings assume short addresses: a 256-byte
+Every child also consumes a parent entry: size the parent for the budget.
+A C<sortedset> parent of four fills after four children regardless of
+C<max_children>. Both ceilings assume short addresses: a 256-byte
 address exhausts the child index near half of C<max_children>, and a
 string-keyed parent's own arena can bind first. Anonymous composites
 retain all opened children until subtree deletion or root destruction,
 because an anonymous segment cannot be reopened after eviction;
 C<cache_size> bounds only file-backed child caches. Use a file-backed
 root when processes need to discover children created after C<fork>.
-File-backed roots
-store children under F<.children/> next to the manifest and reopen
-them on replay; composite mounts support C<sync_all>, C<stats>
-(with child counts), C<freeze_all>, and subtree deletion. Compiled
+File-backed roots store children under F<.children/> next to the manifest
+and reopen them on demand. Composites support C<sync_all>, C<stats>,
+C<freeze_all> and subtree deletion. Compiled
 paths over composites stay correct across child creation, eviction,
 and deletion because they re-dispatch to the child per call.
 
@@ -1921,20 +1696,14 @@ leaf operations use the backend's own locking. An operation already in
 progress during deletion may complete against the old instance; an explicit
 native handle continues to refer to that instance after recreation.
 
-The shared child counter is maintained under the lifecycle lock, and is
-rebuilt only when an unfinished mutation marker is found: on opening a
-writable composite, or when a lifecycle lock encounters one. A holder
-that dies mid-section releases the lock either way: the kernel releases
-a file-backed composite's file lock, and an anonymous composite's lock
-is recovered from the dead owner, at the cost of about 20 kB of shared
-mapping per anonymous composite instance. Unpublished directories may remain and
-are retained for explicit recovery: each holds its child's storage, no
-API reports them, and only C<unlink_all> reclaims them, so a long-running
-producer that is killed repeatedly accumulates them until the store is
-torn down. A preexisting unpublished directory for
-a reserved child is reported as an error. This provides exception rollback
-and limited interruption recovery, without promising power-loss transactions
-or automatic orphan cleanup.
+The lifecycle lock protects the shared child counter. An unfinished mutation
+marker triggers a rebuild on writable open or the next lifecycle lock.
+After a holder dies, the kernel releases file locks; anonymous locks recover
+the dead owner's lock, costing about 20 kB of shared mapping per composite.
+Unpublished child directories require explicit recovery: no API reports them,
+and only C<unlink_all> reclaims them. A preexisting unpublished directory for
+a reserved child is an error. Recovery covers exceptions and limited
+interruption, without promising power-loss transactions or automatic orphan cleanup.
 
 =head1 PERFORMANCE
 
@@ -1949,34 +1718,26 @@ taken from measured CPU time:
     shared_call      2.8  us/op
     string path      3.1  us/op
 
-Those are one host's figures, taken from three consecutive runs on an
-idle host that agreed within 2%; the ordering is the durable part, not
-the values.
+Three consecutive runs on one idle host agreed within 2%; measure on your hardware.
 
-The string and array tiers pay for path parsing and mount resolution on
-every call. A compiled path skips both: a live binding is checked only
-for root identity and generation, and the remaining arguments reach the
-bound closure without being copied again. Use compiled paths, or the
-native handle from C<handle>, in hot loops. The handle is the floor and
-costs no facade call at all, which is why dispatch is not in XS: an XS
-dispatcher would speed up a middle tier that callers can bypass. Run
-F<bench/benchmark.pl>, F<bench/overhead.pl> and F<bench/mounts.pl> on your
-hardware; every figure quoted here comes from one of them.
+String and array paths parse and resolve on every call. Flat compiled paths
+check root identity and generation, then invoke the binding without copying
+arguments. Use compiled paths or a native C<handle> in hot loops.
+F<bench/benchmark.pl>, F<bench/overhead.pl> and F<bench/mounts.pl> supply
+the measurements here.
 F<bench/composite.pl> measures deep reads with a warm child cache
 and with repeated cache eviction. Composite compiled paths still
 resolve the child registry on every call; their cost differs from
 flat compiled paths.
 
-Creating flat mounts costs quadratic total time in their number: each one
-validates and republishes the whole manifest, so the marginal cost of one
-more doubles as the count doubles. F<bench/mounts.pl> measures this; on the
+Creating flat mounts costs quadratic total time: each validates and republishes
+the whole manifest. F<bench/mounts.pl> measures this; on the
 same host the average was 1.2 ms per mount at 25 mounts and 7.1 ms at 200,
 i.e. 1.4 s to create 200, with the 200th alone costing 17 ms. Keys are not
-affected: writing 10_000 keys into one flat mount took 35 ms and never
-touches the manifest, which that script also asserts. Opening such a root
+affected: writing 10_000 keys into one flat mount took 35 ms without touching
+the manifest. Opening such a root
 is superlinear too, and paid by every process that opens it: 0.14 s to
-replay 400 mounts on the same host, which is the one size that script
-replays.
+replay 400 mounts on the same host.
 A namespace with hundreds of B<mounts> belongs in a composite mount
 (L</DEEP PATHS (COMPOSITES)>) instead, where children are registered in the
 parent and the root manifest stays a single record.
@@ -1988,8 +1749,7 @@ and file-cache LRU updates now take constant time during normal operation.
 Bound compiled dispatch is owned by the root, so retaining a compiled path
 does not retain an unmounted native handle. Backend minimum versions are
 the validated baselines recorded in L<Data::Shared::Registry>; they are
-published as the recommended minima and enforced at first backend use.
-Nothing checks them at installation, because the leaves are not required.
+recommended at installation and enforced at first backend use.
 
 =head1 CLASSIFICATION OF THE 39 LEAVES
 

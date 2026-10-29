@@ -101,30 +101,23 @@ sub _scalar_snapshot {
     # kills the store at the next topology change.
     Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
         if $written =~ /\A-?(?:inf|nan)/i;
-    # An exponent means %.15g, which drops the low digits of a whole number
-    # that arrived as a float -- 2**50 is one, the same digits typed out are
-    # not -- so it came back short of what the store was built with.
-    if ($written =~ /[eE]/ && $value == int($value)) {
-        # Through the decimal spelling, not int(): int() hands back the same
-        # float at the integer bounds, so the conversion did nothing for
-        # exactly the values it was written for.
+    # A whole number that arrived as a float is written the way perl spells
+    # it, and that spelling carries NV_DIG significant digits -- so 2**53 came
+    # back two short of what the store was built with. Asked of perl, not of
+    # the encoder: which of the two forms JSON::PP picks turned out to vary by
+    # its version AND by whether anything had stringified the scalar first, so
+    # three releases disagreed about 2**53 and the test for it could not be
+    # written in terms of either.
+    if ($value == int($value)) {
+        my $copy = $value;              # a copy: stringifying $value would
+        my $short = "$copy";            # set POK and change what JSON::PP does
+        return $value if 0 + $short == $value;
+        # perl's own spelling loses digits here, so publish the digits as a
+        # string. Exact in every JSON::PP on every perl, and the backend
+        # numifies it to the value that was passed.
+        # Decimal spelling, not int(), which is a no-op at the integer bounds.
         my $decimal = sprintf '%.0f', $value;
-        return $value unless $decimal + 0 == $value;
-        my $exact = $decimal + 0;
-        # Bare digits, not merely "no exponent": one JSON::PP writes this
-        # integer as digits, another quotes it, and a third keeps the exponent
-        # whatever the flags say -- and only the first is a number that
-        # reopens as itself.
-        return $exact if _encoder()->encode($exact) =~ /\A-?[0-9]+\z/;
-        # The encoder keeps the exponent whatever the flags say. That only
-        # matters if the exponent form does not come back as the same number,
-        # which is where %.15g drops the low digits of 2**53 -- 1e300 survives
-        # it and stays the short spelling.
-        return $value if _encoder()->decode($written) == $value;
-        # Otherwise publish the digits as a string rather than a number that
-        # reopens as a different one: a JSON string round trips byte for byte
-        # in every JSON::PP, and the backend numifies it to what was passed.
-        return $decimal;
+        return $decimal if $decimal + 0 == $value;
     }
     return $value;
 }
@@ -139,27 +132,19 @@ sub with_lock {
         return $code->() unless -e $path;
         open $fh, '<', $path or Carp::croak("Data::Shared: cannot open manifest lock '$path': $!");
     } else {
-        # 0600, not the umask default: this lock serialises every topology
-        # mutation, so a group-writable one lets another user hold it shut.
-        # An existing lock keeps its own mode.
-        # O_RDWR, not O_WRONLY: perl's fcntl emulation of flock needs read
-        # intent for LOCK_SH, which open() and freeze_all request.
+        # Existing lock modes are preserved; new locks are owner-only.
+        # fcntl-based flock emulation needs O_RDWR for LOCK_SH.
         unless (sysopen($fh, $path, O_RDWR | O_APPEND | O_CREAT, 0600)) {
             my $err = $!;
-            # A shared lock only needs to read. Fall back so a store on a
-            # read-only mount, or with a write-protected lock, can still be
-            # opened; an exclusive lock genuinely needs write access.
+            # Shared locks may use a read-only descriptor on write-protected stores.
             if (!$exclusive && -e $path && open $fh, '<', $path) {
-                # fall through to flock below
             } else {
                 $! = $err;
                 Carp::croak("Data::Shared: cannot open manifest lock '$path': $!");
             }
         }
     }
-    # Retry on EINTR: perl installs signal handlers without SA_RESTART, so any
-    # process with a handler (SIGCHLD in a pre-forking server, an alarm timer)
-    # had a contended lock fail spuriously.
+    # Perl signal handlers can interrupt flock; retry EINTR.
     my $op = $exclusive ? LOCK_EX : LOCK_SH;
     until (flock $fh, $op) {
         Carp::croak("Data::Shared: cannot lock manifest: $!") unless $!{EINTR};
@@ -203,17 +188,10 @@ sub read {
                 unless defined $kept && !ref $kept && length $kept;
         }
     }
-    # Everything decoded from the file is tainted, and the backing path is built
-    # from the mount name, so under -T a leaf with a taint guard refused to
-    # reopen: a store was writable once and dead afterwards. The manifest is
-    # declared trusted input and has just been validated field by field, so
-    # untaint it here. Numbers stay numbers because that is what the backend
-    # constructor is handed.
+    # The validated manifest is trusted input; untaint paths before backend taint guards.
+    # Preserve numeric argument types during untainting.
     _untaint($data);
-    # The published text is the revision fingerprint. Re-encoding the parsed
-    # data is a second pipeline, and any value JSON::PP spells differently on
-    # the way back -- 1e+15 decodes to an integer -- then looked to the writing
-    # process like somebody else's write.
+    # Fingerprint the published bytes; JSON::PP may re-encode decoded numbers differently.
     return wantarray ? ($data, $json) : $data;
 }
 
@@ -229,8 +207,7 @@ sub _untaint_scalar {
     return _untaint($v) if ref $v;
     return $v unless defined $v;
     my ($clean) = "$v" =~ /\A(.*)\z/s;      # a capture is untainted
-    # Restore the bytes snapshot published: decoded back, a byte above 0x7F is
-    # a character whose PV is two bytes, so a path stopped naming its file.
+    # Restore published bytes after JSON decoding, including bytes above 0x7f.
     utf8::downgrade($clean, 1);
     # JSON::PP gives numbers IOK/NOK and strings POK only, so this keeps "007"
     # a string while 1000 stays a number.
@@ -245,15 +222,11 @@ sub write {
     require File::Temp;
     require File::Basename;
     my ($fh, $tmp) = File::Temp::tempfile('.manifest-XXXXXXXX', DIR => File::Basename::dirname($path), UNLINK => 0);
-    # Carried across the replace. File::Temp makes the new file 0600 and rename
-    # takes the mode with it, so a root an administrator had deliberately made
-    # group-readable stopped being readable by the group at the next topology
-    # change -- silently, and the POD calls sharing a root an explicit choice.
+    # Atomic replacement must preserve administrator-set manifest permissions.
     my $mode = (stat $path)[2];
     my $ok = eval {
         chmod $mode & 07777, $tmp or die "cannot set manifest mode: $!" if defined $mode;
-        # A caller's $, would land between the JSON and the newline and $\ after
-        # it, either of which publishes a manifest nothing can parse again.
+        # Isolate JSON output from the caller's $, and $\.
         local ($,, $\);
         print {$fh} $json, "\n" or die "cannot write manifest: $!";
         close $fh or die "cannot close manifest: $!";

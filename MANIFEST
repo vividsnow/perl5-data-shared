@@ -11,9 +11,13 @@ eg/app-shared.pl
 eg/basic.pl
 eg/compiled-hot-loop.pl
 eg/composite.pl
+eg/coordinator-workers.pl
+eg/degraded-install.pl
 eg/freeze-ship.pl
 eg/indexed-arrays.pl
+eg/monitoring.pl
 eg/queues-and-jobs.pl
+eg/retiring-mounts.pl
 eg/sets-and-filters.pl
 eg/sketches.pl
 eg/string-zset.pl
