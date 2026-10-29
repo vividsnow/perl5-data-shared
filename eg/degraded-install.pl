@@ -11,9 +11,10 @@ unless ($topk) {
     my $error = $@;
     die $error unless $error =~ /is not available; install the/;
 }
-print $topk ? "shared TopK estimates\n" : "TopK unavailable: process-local exact counts\n";
+print $topk ? "TopK: bounded estimates\n" : "TopK unavailable: exact counts\n";
 
-# The local fallback grows with distinct keys and is not shared across processes.
+# The fallback grows with distinct keys; a mounted TopK stays within its size.
+# Anonymous root: neither branch outlives this process.
 my %counts;
 for my $key (qw(red blue red green red blue)) {
     if ($topk) { $root->set("/hits/$key") }

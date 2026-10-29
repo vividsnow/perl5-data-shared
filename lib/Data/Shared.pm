@@ -1336,12 +1336,14 @@ Other leaves use their normal constructor.
 The generic mutating verbs (C<set>, C<delete>, C<incr>, C<push>,
 C<pop>), every root lifecycle write (C<mount>, C<unmount>,
 C<freeze_all>, C<unlink_all>) and native C<unlink>, C<destroy> and
-C<freeze> croak on any read-only root. Other native methods, reached through
-C<shared_call> or C<handle>, keep whatever permissions that leaf's own
-file gives them: the root flag by itself does not make them read-only.
+C<freeze> through C<shared_call> croak on any read-only root. A handle
+taken with C<handle> is the leaf itself and carries no root flag: every
+native method on it, those three included, keeps whatever permissions
+that leaf's own file gives it.
 
-C<< strict => 1 >> requires C<new_readonly> or immutability (PerfectHash)
-throughout the declared tree, including lazy composite leaves. Unsupported
+C<< strict => 1 >>, off by default, requires C<new_readonly> or
+immutability (PerfectHash) throughout the declared tree, including lazy
+composite leaves. Unsupported
 backends are rejected before any handle is opened. Raw handles expose the
 backend's API; filesystem permissions govern direct writes.
 
@@ -1381,14 +1383,16 @@ also returns it, and any native method can always be reached that
 way or via C<shared_call>.
 
 Configuration arrays and hashes are copied before construction. Cycles are
-rejected; constructor arguments that cannot be serialized make the mount
-transient. Failed mount publication restores the previous namespace and
+rejected; a constructor argument JSON has no form for at all -- a code
+reference, a blessed object -- makes the mount transient rather than
+refusing it. Failed mount publication restores the previous namespace and
 removes backing paths created by that attempt. Existing files are retained.
 Factories manage their own external side effects. Nested mount mutations
 inside a factory are rejected.
 
-Mount arguments must survive manifest replay. C<Inf>, C<NaN> and lone
-surrogates are refused at mount time. Strings are recorded as bytes;
+Mount arguments must survive manifest replay, so a value JSON would
+record as something else is refused at mount time instead: C<Inf>,
+C<NaN> and lone surrogates. Strings are recorded as bytes;
 character strings are encoded to UTF-8 first, uniformly from U+0080 up: the character
 C<"\x{e9}"> and the single byte C<"\xe9"> are therefore two different
 paths naming two different files.
@@ -1416,6 +1420,10 @@ refused, so retire the aliases first.
 
 Lifecycle and introspection for mounts. Names are canonicalized as
 C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
+C<unmount> returns 1 when it removed a mount and 0 when there was none;
+C<mount_info> returns C<undef> for an absent name, and otherwise a
+hashref of C<name>, C<class>, C<key>, C<dist>, C<path_class>, C<file>,
+C<transient> and C<composite>.
 C<mount_names> is a synonym for C<mounts>; C<available_types> (class or
 root method) lists the 39 short spec names and C<registry> returns the
 L<Data::Shared::Registry> table itself.
@@ -1460,12 +1468,14 @@ C<disjointset>) or the
 C<sortedset:strings> variant prevents C<frozen>. For a diagnostic after
 freezing, C<< open_readonly($dir, strict => 1) >> names the first unsupported
 mount and class. Freezing is one-way: C<open> then refuses the store in every
-process; use C<open_sealed> to reopen it. A mounted native handle is sealed
+process. Readers reopen it with C<open_readonly>; C<open_sealed> is for
+teardown, and gives a writable root over sealed leaves. A mounted native handle is sealed
 too, making the caller's object read-only.
 
 C<unlink_all> removes mounts, the manifest and all retained storage,
-including storage retained by other processes. It leaves F<.manifest.lock>,
-which another process may still hold. C<freeze_all> and C<unlink_all> croak
+including storage retained by other processes, and sweeps the root
+directory of any F<.shm> file an interrupted mount left behind. It
+leaves F<.manifest.lock>, which another process may still hold. C<freeze_all> and C<unlink_all> croak
 on a read-only root.
 
 =head1 SHARING A ROOT
@@ -1475,7 +1485,8 @@ opened before another writer's change gets C<stale manifest revision> from C<mou
 C<unmount>, C<freeze_all> and C<unlink_all>, raised before any
 constructor or factory runs: reopen the root and retry against the
 current configuration. A store rebuilt at the same directory is refused as
-C<this store was replaced>. Ordinary reads and writes neither check the
+C<this store was replaced>, and one another process removed as
+C<this store was unlinked>; C<unlink_all> returns 0 there instead. Ordinary reads and writes neither check the
 revision nor refresh the namespace. A write to a mount another process
 retired with C<< unlink => 1 >> can succeed into a mapping whose file is gone.
 
@@ -1544,12 +1555,15 @@ C<< $root->call($path, $method, @args) >>. C<< $root->compile($path) >>
 is C<shared_compile>.
 
 Where it is defined, C<shared_exists> always returns C<1> or C<0>, an
-index outside the structure included; where a type has no honest
-C<exists> (C<ndarray>, C<fenwick2d>) it croaks like any other absent
+index outside the structure included; the families with no honest
+C<exists> -- the queue-like leaves, the unkeyed sketches, C<ndarray> and
+C<fenwick2d> among them -- croak like any other absent
 verb. C<shared_incr> uses C<incr_by> when a delta is given and the leaf
 supports it; a leaf with neither C<incr_by> nor a delta form of C<incr>
 (most C<buffer> variants) rejects the delta from its own XS, so use
-C<shared_call> there.
+C<shared_call> there. The converse also holds: C<sortedset>, C<pool>,
+C<fenwick>, C<fenwick2d> and C<segmenttree> score or add rather than
+count, so C<shared_incr> there needs a delta and croaks without one.
 
 Backend semantics:
 
@@ -1573,16 +1587,18 @@ does a C<shared_set> past the end of a C<buffer>.
 =item * Keys cross into XS as bytes, so encode wide characters first. A
 character above U+00FF is accepted by the HashMap family and the integer
 SortedSet, and fatal in RadixTree, Intern, the filter family,
-CountMinSketch and C<sortedset:strings> (whose every verb dies).
+CountMinSketch, TopK, PerfectHash and C<sortedset:strings> (whose every
+verb dies).
 
 =item * An integer-addressed leaf numifies a non-integer key, so
 C<'abc'> addresses element 0. The C<key_int> families (C<buffer>,
 C<disjointset>, C<fenwick>, C<fenwick2d>, C<graph>, C<ndarray>,
 C<segmenttree>) refuse it instead; C<bitset>, C<roaringbitmap>,
-C<ringbuffer>'s C<get> and the integer C<hashmap> variants address
-element 0, with a warning under C<-w>; C<pool> croaks, its slot 0 not
-being allocated. C<shared_exists> returns 0 for keys the structure cannot hold,
-except in C<ndarray> and C<fenwick2d>, which have no such verb.
+C<ringbuffer>'s C<get> and the integer C<hashmap> and C<sortedset>
+variants address element 0, with a warning under C<-w>; C<pool> croaks,
+its slot 0 not being allocated. C<shared_exists> returns 0 for keys the
+structure cannot hold, and croaks where the family has no C<exists> of
+its own.
 
 =back
 
@@ -1659,8 +1675,9 @@ croaks except for the SortedSet score case. C<< $root->node($path) >>
 C<get/set/delete/exists/incr/push/pop/call/call_at/node/children/handle>
 methods; C<< $root->children($path) >> (C<shared_children>) lists
 registered child addresses. C<handle> on a child leaf path returns
-its native handle. Reads of missing children never create them; writes and
-any C<call> do. Probe with C<shared_exists> to avoid allocating children.
+its native handle. Reads of missing children never create them; writes
+and any C<call> but C<unlink> and C<destroy> do. Probe with
+C<shared_exists> to avoid allocating children.
 
 Each composite declares C<max_children> (default 10_000) and
 C<cache_size> open children (default 32, LRU close/reopen) via the
@@ -1680,7 +1697,9 @@ address exhausts the child index near half of C<max_children>, and a
 string-keyed parent's own arena can bind first. Anonymous composites
 retain all opened children until subtree deletion or root destruction,
 because an anonymous segment cannot be reopened after eviction;
-C<cache_size> bounds only file-backed child caches. Use a file-backed
+C<cache_size> bounds only file-backed child caches, so a long-lived
+anonymous composite keeps one mapping per address it has touched, up to
+C<max_children>. Use a file-backed
 root when processes need to discover children created after C<fork>.
 File-backed roots store children under F<.children/> next to the manifest
 and reopen them on demand. Composites support C<sync_all>, C<stats>,

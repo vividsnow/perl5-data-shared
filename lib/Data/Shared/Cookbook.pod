@@ -16,7 +16,10 @@ Run each recipe on a fresh root with this preamble:
     # or: my $root = Data::Shared->new;   # anonymous
 
 Other processes can reopen file-backed roots with C<< Data::Shared->open($dir) >>
-before freezing; see L</FREEZE AND SHIP> for sealed stores.
+before freezing; see L</FREEZE AND SHIP> for sealed stores. A recipe that
+reopens a path the facade supplied needs the file-backed root -- L</ReqRep
+(request and response)> and L</FREEZE AND SHIP> -- since an anonymous mount
+leaves no file under F<$dir>.
 
 =head1 MAP-LIKE
 

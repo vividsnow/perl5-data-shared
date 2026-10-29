@@ -159,4 +159,21 @@ subtest 'a full parent leaf names itself as the ceiling' => sub {
     is $index->get('p:'), undef, 'the marker is cleared';
 }
 
+# Every other call at a missing child allocates it, so the two that retire
+# storage would have had to create a child before deleting it -- and would
+# have failed on a composite whose budget is already spent.
+subtest 'retiring a missing child allocates nothing' => sub {
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+    $root->mount('t', ['hashmap:ss', 100, ['hashmap:si', 64], { max_children => 1 }]);
+    shared_set($root, '/t/alice/hits', 1);
+    is scalar(() = $root->children('/t')), 1, 'the budget of one is spent';
+    for my $verb (qw(unlink destroy)) {
+        ok eval { $root->call("/t/bob", $verb); 1 }, "$verb at a missing child is accepted";
+        is scalar(() = $root->children('/t')), 1, "and registered no child for $verb";
+    }
+    ok !eval { shared_set($root, '/t/carol/hits', 1); 1 },
+        'while a write at a missing child still wants one';
+    like $@, qr/child limit exceeded/, 'and says the budget is spent';
+};
+
 done_testing;

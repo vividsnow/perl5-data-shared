@@ -64,7 +64,11 @@ sub _scalar_snapshot {
         # published, and the reader cannot tell them apart, so a byte path
         # came back as characters and named a different file. Record the bytes
         # the filesystem and the leaf's SvPV already see.
-        my $bytes = $value;
+        # Copied through a stringification, not assigned: a plain copy carries
+        # the numeric flags a string used in numeric context has, and the
+        # encoder then writes this string as a bare number -- '123' replayed as
+        # 123, and one numifying to Inf as text no manifest reader accepts.
+        my $bytes = "$value";
         utf8::encode($bytes);
         return $bytes;
     }
@@ -75,9 +79,10 @@ sub _scalar_snapshot {
     return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
     # Inf and NaN by value, not by how the encoder spells them: JSON::PP has
     # two code paths and the one selected by PERL_JSON_PP_USE_B quotes a real
-    # Inf that has been stringified, which let it through. A float that has
-    # never been an integer is the only shape either can be.
-    if (($flags & (B::SVp_NOK() | B::SVp_IOK())) == B::SVp_NOK()) {
+    # Inf that has been stringified, which let it through. Any NV may be one:
+    # int() on an Inf sets IOK too, and requiring NOK alone let every Inf that
+    # had been printed or rounded first past this guard.
+    if ($flags & B::SVp_NOK()) {
         my $number = 0 + $value;
         if ($number != $number || $number == $INFINITY || $number == -$INFINITY) {
             # The string 'inf' used once in numeric context is not a real Inf,
@@ -91,17 +96,21 @@ sub _scalar_snapshot {
                 unless ($flags & B::SVp_POK()) && "$value" ne "$number";
         }
     }
-    # A whole number with no string half of its own: its spelling is ours to
+    # A number with no string half of its own: its spelling is ours to
     # settle, before the encoder is consulted at all. Asked of perl, because
     # which form JSON::PP picks varies by version, by flag history, and -- as
     # four attempts at this established -- by whatever cpanm resolved that
     # day. perl's own spelling carries NV_DIG significant digits, so 2**53
-    # comes back two short of what the store was built with.
-    if (!($flags & B::SVp_POK()) && $value == int($value)) {
+    # comes back two short of what the store was built with, and 1+2**-52
+    # comes back as 1.
+    if (!($flags & B::SVp_POK())) {
         my $copy = $value;              # a copy: stringifying $value would
         my $short = "$copy";            # set POK and change what follows
         if (0 + $short != $value) {
-            my $decimal = sprintf '%.0f', $value;   # not int(), a no-op at the bounds
+            # %.0f at the integer bounds, where int() is a no-op; %.17g is the
+            # shortest width that round trips every other finite double.
+            my $decimal = $value == int($value) ? sprintf('%.0f', $value)
+                                                : sprintf('%.17g', $value);
             # Numified on a copy so $decimal keeps a string's flags: given
             # numeric ones, one JSON::PP writes digits and another the
             # exponent form back again.

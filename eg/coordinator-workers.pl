@@ -14,7 +14,12 @@ $root->mount('totals', 'hashmap:ii', undef, 100);
 $root->set('/totals/42', 0);
 print "coordinator: topology published\n";
 
+my %running;
 my @workers;
+# A worker must not outlive the coordinator: the temporary directory goes with
+# it, and the next write lands in a store nobody can reopen.
+END { kill 'TERM', keys %running }
+
 for my $number (1 .. 2) {
     my $pid = fork();
     die "fork: $!" unless defined $pid;
@@ -31,10 +36,12 @@ for my $number (1 .. 2) {
         POSIX::_exit($ok ? 0 : 1);
     }
     push @workers, $pid;
+    $running{$pid} = 1;
 }
 my $failed = 0;
 for my $pid (@workers) {
     waitpid($pid, 0) == $pid or die "waitpid: $!";
+    delete $running{$pid};
     $failed++ if $?;
 }
 die "worker failed\n" if $failed;

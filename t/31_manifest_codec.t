@@ -10,6 +10,17 @@ my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
 eval { $probe->mount('p', 'hashmap:ss', undef, 8); 1 }
     or plan skip_all => "hashmap backend unavailable: $@";
 
+# Which spelling JSON::PP picks varies by version and by PERL_JSON_PP_USE_B,
+# so the codec's own answers are checked against an encoder that quotes
+# everything: the assertions below then hold on every supported perl instead
+# of only on the mode this one happens to have selected.
+my $QUOTING = do {
+    package Data::Shared::Test::QuotingEncoder;
+    sub new { bless {}, shift }
+    sub encode { my (undef, $v) = @_; return qq{"$v"} }
+    __PACKAGE__->new;
+};
+
 # The manifest carries codepoints, so a path of bytes and its character
 # spelling published the same text and the reader could not tell them apart:
 # every reopen looked for a different file and refused to recreate it, leaving
@@ -132,18 +143,60 @@ subtest 'only a real Inf or NaN is refused, not a string that looks like one' =>
     ok !eval { Data::Shared::Manifest::snapshot($real_inf); 1 },
         'a real Inf is refused even after being stringified';
     ok !eval { Data::Shared::Manifest::snapshot('NaN' + 0); 1 }, 'and a real NaN';
+    # int() sets IOK on the NV it rounds, so an Inf that had been through any
+    # integer context no longer looked like a float to the guard; the encoder
+    # then quoted it and the quoted-value shortcut took that for a string.
+    my $rounded = 9**9**9;
+    my $rounded_iv = int($rounded);
+    my $rounded_pv = "$rounded";
+    my $rounded_nan = 'NaN' + 0;
+    my $nan_iv = int($rounded_nan);
+    my $nan_pv = "$rounded_nan";
+    my $lookalike = 'inf';
+    my $lookalike_nv = $lookalike + 0;
+    {
+        no warnings 'redefine';
+        local *Data::Shared::Manifest::_encoder = sub { $QUOTING };
+        ok !eval { Data::Shared::Manifest::snapshot($rounded); 1 },
+            'an Inf that has been rounded and printed is refused too';
+        ok !eval { Data::Shared::Manifest::snapshot($rounded_nan); 1 }, 'and such a NaN';
+        my ($still) = Data::Shared::Manifest::snapshot($lookalike);
+        is $still, 'inf', 'while the lookalike string is still kept';
+    }
+};
+
+# The byte conversion copied the scalar, and a copy carries the numeric flags a
+# string used in numeric context has. The encoder then wrote the string as a
+# bare number: '123' came back as 123, and one numifying to Inf produced a
+# manifest the reader refuses.
+subtest 'an upgraded string argument is published as a string' => sub {
+    for my $text ('123', '1e9999', 'Infinity') {
+        my $value = $text;
+        my $numified = 0 + $value;
+        no warnings 'numeric';
+        utf8::upgrade($value);
+        my ($stored) = Data::Shared::Manifest::snapshot($value);
+        my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
+        like $json, qr/\A\["/, "'$text' upgraded and numified is published quoted";
+        is(JSON::PP->new->decode($json)->[0], $text, "and reads back as '$text'");
+    }
 };
 
 subtest 'a numeric mount argument survives the round trip exactly' => sub {
     # The bounds matter most: int() hands back the same float at IV_MIN and
     # above IV_MAX, so a conversion written with it did nothing for exactly
     # the values it was written for.
+    # A fraction needs 17 significant digits to survive; perl's own spelling
+    # carries NV_DIG, so 1+2**-52 was replayed as 1 and pi as a shorter pi.
     for my $value (2**50, 2**53, 2**62, -(2**63), 2**63, 1e15,
-                   1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300) {
+                   1125899906842624, 3600000000, 0.1, 1.5, -2**50, 1e300,
+                   1 + 2**-52, 4 * atan2(1, 1), 1.2345678901234567,
+                   2**-1074, 1 / 3) {
         my ($stored) = Data::Shared::Manifest::snapshot($value);
         my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
         my $back = JSON::PP->new->decode($json)->[0];
         cmp_ok $back, '==', $value, "$value round trips exactly";
+        is pack('d', $back), pack('d', $value), "$value keeps every bit";
     }
 };
 
@@ -154,12 +207,7 @@ subtest 'a numeric mount argument survives the round trip exactly' => sub {
 # A pristine number's spelling must be settled before the encoder is asked
 # anything, so this stands in an encoder that quotes everything.
 subtest 'an exact integer survives an encoder that quotes every number' => sub {
-    my $quoting = do {
-        package Data::Shared::Test::QuotingEncoder;
-        sub new { bless {}, shift }
-        sub encode { my (undef, $v) = @_; return qq{"$v"} }
-        __PACKAGE__->new;
-    };
+    my $quoting = $QUOTING;
     my $real = \&Data::Shared::Manifest::_encoder;
     my ($stored, $pristine);
     {

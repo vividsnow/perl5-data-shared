@@ -587,9 +587,10 @@ Lookups by short name or by Perl class (including variants).
 =head2 resolve_spec($spec)
 
 Resolves C<'hashmap'>, C<'hashmap:ii'>, a full class name, or any
-C<Data::*> class (unknown classes get a generic call-only entry)
+C<Data::*> class (unknown classes resolve with C<entry> undef, and
+L<Data::Shared> dispatches them call-only)
 to C<{entry, class, load, ctor, variant}>, or undef for unknown
-short specs. Short specs are all-lowercase; the returned C<variant>
-is always lowercase.
+short specs. Short specs resolve case-insensitively to a lowercase key,
+and the returned C<variant> is always lowercase.
 
 =cut

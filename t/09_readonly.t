@@ -47,4 +47,18 @@ subtest 'the strict refusal names the mount, not only the class' => sub {
     like $@, qr/at mount 'counters'/, 'and so is the mount';
 };
 
+# The POD promises the three destructive native methods croak on a read-only
+# root, and that a raw handle keeps only its file's permissions. Nothing
+# asserted either half, and the promise covered a route the root cannot see.
+subtest 'the read-only guard covers dispatch, not a raw handle' => sub {
+    for my $verb (qw(unlink destroy freeze)) {
+        ok !eval { shared_call($ro, '/cache', $verb); 1 }, "native $verb croaks through shared_call";
+        like $@, qr/read-only/, "and says why for $verb";
+    }
+    my $raw = $ro->handle('/cache');
+    ok $raw, 'a handle is still available on a read-only root';
+    ok $raw->can('unlink'), 'and carries its own native unlink';
+    is shared_get($ro, '/cache/42'), 100, 'the store is intact after the refusals';
+};
+
 done_testing;
