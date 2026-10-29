@@ -150,7 +150,7 @@ sub new {
         name => $o{name}, readonly => $o{readonly} ? 1 : 0,
         _cleanup => $o{cleanup} ? 1 : 0, _frozen_ok => $o{frozen_ok} ? 1 : 0,
         strict_readonly => $o{strict_readonly} ? 1 : 0,
-        cache => {}, lru_prev => {}, lru_next => {}, gen => 0 }, $class;
+        cache => {}, lru_prev => {}, lru_next => {} }, $class;
     $self->{root_weak} = $o{root};
     weaken($self->{root_weak}) if $self->{root_weak};
     _preflight($self, $node, $self->{dir}, $o{opening});
@@ -740,13 +740,13 @@ sub _open_child {
     if ($node->{child}) {
         my $comp = Data::Shared::Composite->new(root => $root, name => $addr, node => $node, dir => $dir,
             path => [ @{ $self->{path} }, $addr ], readonly => $self->{readonly}, %mode);
-        $rt = { kind => 'composite', comp => $comp, id => $id, addr => $addr };
+        $rt = { kind => 'composite', comp => $comp, addr => $addr };
     } else {
         my ($handle) = construct_node($dir, $self->{readonly}, $node->{resolved}, 'child', $node->{args},
             { %mode, frozen_ok => $mode{frozen_ok} || $mode{sealed_ok} });
         my $record = { name => $addr, handle => $handle, entry => $node->{resolved}{entry}
             || { key => $node->{resolved}{class}, dist => 'unknown', path_class => 'map', verbs => {} }, dt => {} };
-        $rt = { kind => 'leaf', record => $record, handle => $handle, id => $id, addr => $addr };
+        $rt = { kind => 'leaf', record => $record, handle => $handle, addr => $addr };
     }
     return $rt if $cleanup || $self->{_frozen_ok};
     $self->{cache}{$id} = $rt;
@@ -816,11 +816,6 @@ sub _ensure_child {
     }, 1);
 }
 
-sub _node_for {
-    my ($self, $root, $addr) = @_;
-    return Data::Shared::Node->new($root, [ @{ $self->{path} }, $addr ]);
-}
-
 sub dispatch_verb {
     my ($self, $root, $verb, $rest, @args) = @_;
     $root = $self->_root($root);
@@ -833,22 +828,13 @@ sub dispatch_verb {
     if (!@child_rest) {
         return $self->_verb_at_child($root, $verb, $addr, @args);
     }
-    if ($verb eq 'exists') {
-        my $rt = $self->_existing_child($root, $addr);
-        return 0 unless $rt;
-        return $self->_child_dispatch_verb($root, $rt, 'exists', \@child_rest, @args);
+    my $rt;
+    if ($verb eq 'exists' || $verb eq 'get' || $verb eq 'delete') {
+        $rt = $self->_existing_child($root, $addr);
+        return $verb eq 'exists' ? 0 : undef unless $rt;
+    } else {
+        $rt = $self->_ensure_child($root, $addr);
     }
-    if ($verb eq 'get') {
-        my $rt = $self->_existing_child($root, $addr);
-        return undef unless $rt;
-        return $self->_child_dispatch_verb($root, $rt, 'get', \@child_rest, @args);
-    }
-    if ($verb eq 'delete') {
-        my $rt = $self->_existing_child($root, $addr);
-        return undef unless $rt;
-        return $self->_child_dispatch_verb($root, $rt, 'delete', \@child_rest, @args);
-    }
-    my $rt = $self->_ensure_child($root, $addr);
     return $self->_child_dispatch_verb($root, $rt, $verb, \@child_rest, @args);
 }
 
@@ -868,7 +854,7 @@ sub _verb_at_child {
         # registered needs no index lookup.
         return undef unless $self->_valid_address($addr);
         return undef unless defined $self->_reg_id($addr);
-        return $self->_node_for($root, $addr);
+        return Data::Shared::Node->new($root, [ @{ $self->{path} }, $addr ]);
     }
     if ($verb eq 'set' || $verb eq 'incr') {
         Carp::croak("Data::Shared: cannot $verb a composite child of $self->{node}{spec}; $verb a path inside it")
@@ -1017,6 +1003,13 @@ sub handle_at {
     return $rt->{handle};
 }
 
+sub _retire_child {
+    my ($rt) = @_;
+    if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
+    elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
+    return;
+}
+
 sub delete_subtree {
     my ($self, $root, $addr) = @_;
     $root = $self->_root($root);
@@ -1067,8 +1060,7 @@ sub delete_subtree {
                 # delete had failed, while the very next failure point reported
                 # the same state accurately.
                 my $ok = eval {
-                    if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
-                    elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
+                    _retire_child($rt);
                     1;
                 };
                 unless ($ok) {
@@ -1101,7 +1093,7 @@ sub destroy {
     # and refused, leaving the directory and the manifest for ever.
     local $self->{_cleanup} = 1;
     return $self->_with_lock(sub {
-        my $frozen = $self->{index}->can('frozen') && $self->{index}->frozen;
+        my $frozen = $self->_index_frozen;
         if (!$frozen) {
             # Waiters keep their old mapped index after unlink. Retire it before
             # removing directories so they cannot reconstruct a deleted subtree.
@@ -1115,17 +1107,13 @@ sub destroy {
                 $self->_index_remove('a:' . $addr);
                 $self->_index_remove('c:' . $addr);
                 $self->_forget($id);
-                if ($rt) {
-                    if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
-                    elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
-                }
+                _retire_child($rt) if $rt;
             }
             $self->_index_put('s:', 0);
         } else {
             # Frozen indexes already reject the mutation marker before any creation.
             for my $rt (values %{ $self->{cache} }) {
-                if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
-                elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
+                _retire_child($rt);
             }
         }
         $self->{parent_handle}->unlink if $self->{parent_handle} && $self->{parent_handle}->can('unlink');
@@ -1260,7 +1248,6 @@ sub unlink {
 
 sub stats {
     my ($self) = @_;
-    my $root = $self->{root_weak};
     my %children;
     for my $id (sort { $a <=> $b } keys %{ $self->{cache} }) {
         my $rt = $self->{cache}{$id};

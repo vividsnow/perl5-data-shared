@@ -31,7 +31,7 @@ sub _assert_index {
     return $idx;
 }
 
-sub _buf_exists {
+sub _capacity_exists {
     return sub {
         my ($h, $idx) = @_;
         return 0 unless _index_shape_ok($idx);
@@ -56,7 +56,7 @@ sub _bounded_exists {
 our %REGISTRY = (
     bitset => {
         key => 'bitset', dist => 'Data-BitSet-Shared',
-        class => 'Data::BitSet::Shared', path_class => 'set', freeze => 1,
+        class => 'Data::BitSet::Shared', path_class => 'set',
         verbs => {
             get    => 'test',
             exists => _bounded_exists('test'),
@@ -71,7 +71,7 @@ our %REGISTRY = (
     },
     bloomfilter => {
         key => 'bloomfilter', dist => 'Data-BloomFilter-Shared',
-        class => 'Data::BloomFilter::Shared', path_class => 'set', freeze => 1,
+        class => 'Data::BloomFilter::Shared', path_class => 'set',
         verbs => {
             get => 'contains', exists => 'contains',
             set => sub { my ($h, $k, $v) = @_; return $h->add($k) },
@@ -79,20 +79,20 @@ our %REGISTRY = (
     },
     buffer => {
         key => 'buffer', dist => 'Data-Buffer-Shared',
-        class => 'Data::Buffer::Shared::I64', path_class => 'map', freeze => 0,
+        class => 'Data::Buffer::Shared::I64', path_class => 'map',
         key_int => 1,
         variants => { map { $_ => { class => "Data::Buffer::Shared::$_", load => "Data::Buffer::Shared::$_" } }
                       qw(I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Str) },
         verbs => {
             get => 'get', set => 'set',
-            exists => _buf_exists(),
+            exists => _capacity_exists(),
             delete => sub { my ($h, $idx) = @_; return $h->set($idx, 0) },
             incr => 'incr',
         },
     },
     countingbloomfilter => {
         key => 'countingbloomfilter', dist => 'Data-CountingBloomFilter-Shared',
-        class => 'Data::CountingBloomFilter::Shared', path_class => 'set', freeze => 1,
+        class => 'Data::CountingBloomFilter::Shared', path_class => 'set',
         verbs => {
             get => 'count_of', exists => 'contains',
             set => sub { my ($h, $k, $v) = @_; return $h->add($k) },
@@ -101,7 +101,7 @@ our %REGISTRY = (
     },
     countminsketch => {
         key => 'countminsketch', dist => 'Data-CountMinSketch-Shared',
-        class => 'Data::CountMinSketch::Shared', path_class => 'sketch', freeze => 0,
+        class => 'Data::CountMinSketch::Shared', path_class => 'sketch',
         verbs => {
             get => 'estimate',
             exists => sub { my ($h, $k) = @_; return $h->estimate($k) > 0 ? 1 : 0 },
@@ -110,7 +110,7 @@ our %REGISTRY = (
     },
     cuckoofilter => {
         key => 'cuckoofilter', dist => 'Data-CuckooFilter-Shared',
-        class => 'Data::CuckooFilter::Shared', path_class => 'set', freeze => 1,
+        class => 'Data::CuckooFilter::Shared', path_class => 'set',
         verbs => {
             get => 'count_of', exists => 'contains',
             set => sub { my ($h, $k, $v) = @_; return $h->add($k) },
@@ -119,13 +119,13 @@ our %REGISTRY = (
     },
     ddsketch => {
         key => 'ddsketch', dist => 'Data-DDSketch-Shared',
-        class => 'Data::DDSketch::Shared', path_class => 'sketch', freeze => 1,
+        class => 'Data::DDSketch::Shared', path_class => 'sketch',
         verbs => {},
     },
     deque => {
         key => 'deque', dist => 'Data-Deque-Shared',
         class => 'Data::Deque::Shared::Int', load => 'Data::Deque::Shared',
-        path_class => 'queue', freeze => 0,
+        path_class => 'queue',
         variants => {
             Int => { class => 'Data::Deque::Shared::Int', load => 'Data::Deque::Shared' },
             Str => { class => 'Data::Deque::Shared::Str', load => 'Data::Deque::Shared' },
@@ -134,12 +134,11 @@ our %REGISTRY = (
     },
     disjointset => {
         key => 'disjointset', dist => 'Data-DisjointSet-Shared',
-        class => 'Data::DisjointSet::Shared', path_class => 'set', freeze => 0,
+        class => 'Data::DisjointSet::Shared', path_class => 'set',
         key_int => 1,
         verbs => {
             get => 'find',
-            exists => sub { my ($h, $m) = @_;
-                return (_index_shape_ok($m) && $m >= 0 && $m < $h->capacity) ? 1 : 0 },
+            exists => _capacity_exists(),
             # Without the guard a missing second member numified to 0 and
             # unioned the member with element 0. DisjointSet has no split, so
             # that merge is permanent.
@@ -153,7 +152,7 @@ our %REGISTRY = (
     },
     fenwick => {
         key => 'fenwick', dist => 'Data-Fenwick-Shared',
-        class => 'Data::Fenwick::Shared', path_class => 'indexed', freeze => 1,
+        class => 'Data::Fenwick::Shared', path_class => 'indexed',
         key_int => 1,
         verbs => {
             get => 'point', set => 'set', incr => 'update',
@@ -164,13 +163,13 @@ our %REGISTRY = (
     },
     fenwick2d => {
         key => 'fenwick2d', dist => 'Data-Fenwick2D-Shared',
-        class => 'Data::Fenwick2D::Shared', path_class => 'indexed', freeze => 1,
+        class => 'Data::Fenwick2D::Shared', path_class => 'indexed',
         key_int => 1,
         verbs => { get => 'point', set => 'set', incr => 'update' },
     },
     graph => {
         key => 'graph', dist => 'Data-Graph-Shared',
-        class => 'Data::Graph::Shared', path_class => 'indexed', freeze => 0,
+        class => 'Data::Graph::Shared', path_class => 'indexed',
         key_int => 1,
         # has_node is an honest exists, and get croaks on a node that is not
         # there, so without it a caller had no probe that answers rather than
@@ -179,7 +178,7 @@ our %REGISTRY = (
     },
     hashmap => {
         key => 'hashmap', dist => 'Data-HashMap-Shared',
-        class => 'Data::HashMap::Shared::II', path_class => 'map', freeze => 1,
+        class => 'Data::HashMap::Shared::II', path_class => 'map',
         variants => { map { $_ => { class => "Data::HashMap::Shared::$_", load => "Data::HashMap::Shared::$_" } }
                       qw(I16 I16S I32 I32S II IS SI SI16 SI32 SS) },
         verbs => {
@@ -189,27 +188,27 @@ our %REGISTRY = (
     },
     heap => {
         key => 'heap', dist => 'Data-Heap-Shared',
-        class => 'Data::Heap::Shared', path_class => 'queue', freeze => 0,
+        class => 'Data::Heap::Shared', path_class => 'queue',
         verbs => {}, push => 'push', pop => 'pop',
     },
     hiertimingwheel => {
         key => 'hiertimingwheel', dist => 'Data-HierTimingWheel-Shared',
-        class => 'Data::HierTimingWheel::Shared', path_class => 'sync', freeze => 0,
+        class => 'Data::HierTimingWheel::Shared', path_class => 'sync',
         verbs => {},
     },
     histogram => {
         key => 'histogram', dist => 'Data-Histogram-Shared',
-        class => 'Data::Histogram::Shared', path_class => 'sketch', freeze => 1,
+        class => 'Data::Histogram::Shared', path_class => 'sketch',
         verbs => {},
     },
     hyperloglog => {
         key => 'hyperloglog', dist => 'Data-HyperLogLog-Shared',
-        class => 'Data::HyperLogLog::Shared', path_class => 'sketch', freeze => 1,
+        class => 'Data::HyperLogLog::Shared', path_class => 'sketch',
         verbs => {},
     },
     intern => {
         key => 'intern', dist => 'Data-Intern-Shared',
-        class => 'Data::Intern::Shared', path_class => 'map', freeze => 0,
+        class => 'Data::Intern::Shared', path_class => 'map',
         verbs => {
             get => 'id_of',
             set => sub { my ($h, $k, $v) = @_; return $h->intern($k) },
@@ -218,40 +217,40 @@ our %REGISTRY = (
     },
     intervaltree => {
         key => 'intervaltree', dist => 'Data-IntervalTree-Shared',
-        class => 'Data::IntervalTree::Shared', path_class => 'indexed', freeze => 0,
+        class => 'Data::IntervalTree::Shared', path_class => 'indexed',
         verbs => {},
     },
     kdtree => {
         key => 'kdtree', dist => 'Data-KDTree-Shared',
-        class => 'Data::KDTree::Shared', path_class => 'indexed', freeze => 0,
+        class => 'Data::KDTree::Shared', path_class => 'indexed',
         verbs => {},
     },
     log => {
         key => 'log', dist => 'Data-Log-Shared',
-        class => 'Data::Log::Shared', path_class => 'queue', freeze => 0,
+        class => 'Data::Log::Shared', path_class => 'queue',
         verbs => {}, push => 'append',
     },
     minhash => {
         key => 'minhash', dist => 'Data-MinHash-Shared',
-        class => 'Data::MinHash::Shared', path_class => 'sketch', freeze => 1,
+        class => 'Data::MinHash::Shared', path_class => 'sketch',
         verbs => {},
     },
     ndarray => {
         key => 'ndarray', dist => 'Data-NDArray-Shared',
-        class => 'Data::NDArray::Shared', path_class => 'indexed', freeze => 1,
+        class => 'Data::NDArray::Shared', path_class => 'indexed',
         key_int => 1,
         verbs => { get => 'get', set => 'set' },
     },
     perfecthash => {
         key => 'perfecthash', dist => 'Data-PerfectHash-Shared',
-        class => 'Data::PerfectHash::Shared', path_class => 'map', freeze => 0,
+        class => 'Data::PerfectHash::Shared', path_class => 'map',
         ctor => 'handle_only', immutable => 1,
         verbs => { get => 'has', exists => 'has' },
     },
     pool => {
         key => 'pool', dist => 'Data-Pool-Shared',
         class => 'Data::Pool::Shared', load => 'Data::Pool::Shared',
-        path_class => 'map', freeze => 0,
+        path_class => 'map',
         variants => {
             I64 => { class => 'Data::Pool::Shared::I64', load => 'Data::Pool::Shared' },
             I32 => { class => 'Data::Pool::Shared::I32', load => 'Data::Pool::Shared' },
@@ -275,21 +274,21 @@ our %REGISTRY = (
     },
     pubsub => {
         key => 'pubsub', dist => 'Data-PubSub-Shared',
-        class => 'Data::PubSub::Shared::Int', path_class => 'queue', freeze => 0,
+        class => 'Data::PubSub::Shared::Int', path_class => 'queue',
         variants => { map { $_ => { class => "Data::PubSub::Shared::$_", load => "Data::PubSub::Shared::$_" } }
                       qw(Int Int32 Int16 Str) },
         verbs => {}, push => 'publish',
     },
     queue => {
         key => 'queue', dist => 'Data-Queue-Shared',
-        class => 'Data::Queue::Shared::Int', path_class => 'queue', freeze => 0,
+        class => 'Data::Queue::Shared::Int', path_class => 'queue',
         variants => { map { $_ => { class => "Data::Queue::Shared::$_", load => "Data::Queue::Shared::$_" } }
                       qw(Int Int32 Int16 Str) },
         verbs => {}, push => 'push', pop => 'pop',
     },
     radixtree => {
         key => 'radixtree', dist => 'Data-RadixTree-Shared',
-        class => 'Data::RadixTree::Shared', path_class => 'map', freeze => 1,
+        class => 'Data::RadixTree::Shared', path_class => 'map',
         key_join => '/',
         verbs => {
             get => 'lookup',
@@ -301,7 +300,7 @@ our %REGISTRY = (
     },
     reqrep => {
         key => 'reqrep', dist => 'Data-ReqRep-Shared',
-        class => 'Data::ReqRep::Shared', path_class => 'sync', freeze => 0,
+        class => 'Data::ReqRep::Shared', path_class => 'sync',
         variants => {
             Int => { class => 'Data::ReqRep::Shared::Int', load => 'Data::ReqRep::Shared::Int' },
         },
@@ -309,7 +308,7 @@ our %REGISTRY = (
     },
     reservoir => {
         key => 'reservoir', dist => 'Data-Reservoir-Shared',
-        class => 'Data::Reservoir::Shared', path_class => 'sketch', freeze => 0,
+        class => 'Data::Reservoir::Shared', path_class => 'sketch',
         variants => {
             weighted => { class => 'Data::Reservoir::Shared', load => 'Data::Reservoir::Shared', ctor => 'new_weighted' },
         },
@@ -318,7 +317,7 @@ our %REGISTRY = (
     ringbuffer => {
         key => 'ringbuffer', dist => 'Data-RingBuffer-Shared',
         class => 'Data::RingBuffer::Shared::Int', load => 'Data::RingBuffer::Shared',
-        path_class => 'queue', freeze => 0,
+        path_class => 'queue',
         variants => {
             Int => { class => 'Data::RingBuffer::Shared::Int', load => 'Data::RingBuffer::Shared' },
             F64 => { class => 'Data::RingBuffer::Shared::F64', load => 'Data::RingBuffer::Shared' },
@@ -330,7 +329,7 @@ our %REGISTRY = (
     },
     roaringbitmap => {
         key => 'roaringbitmap', dist => 'Data-RoaringBitmap-Shared',
-        class => 'Data::RoaringBitmap::Shared', path_class => 'set', freeze => 0,
+        class => 'Data::RoaringBitmap::Shared', path_class => 'set',
         verbs => {
             get => 'contains', exists => 'contains',
             set => sub { my ($h, $m, $v) = @_; return $h->add($m) },
@@ -339,7 +338,7 @@ our %REGISTRY = (
     },
     segmenttree => {
         key => 'segmenttree', dist => 'Data-SegmentTree-Shared',
-        class => 'Data::SegmentTree::Shared', path_class => 'indexed', freeze => 0,
+        class => 'Data::SegmentTree::Shared', path_class => 'indexed',
         key_int => 1,
         verbs => {
             # One index, as every other verb of a 1-D leaf takes: dropping the
@@ -359,7 +358,7 @@ our %REGISTRY = (
     },
     sortedset => {
         key => 'sortedset', dist => 'Data-SortedSet-Shared',
-        class => 'Data::SortedSet::Shared', path_class => 'set', freeze => 0,
+        class => 'Data::SortedSet::Shared', path_class => 'set',
         variants => {
             Strings => { class => 'Data::SortedSet::Shared::Strings', load => 'Data::SortedSet::Shared::Strings' },
         },
@@ -381,13 +380,13 @@ our %REGISTRY = (
     },
     spatialhash => {
         key => 'spatialhash', dist => 'Data-SpatialHash-Shared',
-        class => 'Data::SpatialHash::Shared', path_class => 'indexed', freeze => 0,
+        class => 'Data::SpatialHash::Shared', path_class => 'indexed',
         verbs => {},
     },
     stack => {
         key => 'stack', dist => 'Data-Stack-Shared',
         class => 'Data::Stack::Shared::Int', load => 'Data::Stack::Shared',
-        path_class => 'queue', freeze => 0,
+        path_class => 'queue',
         variants => {
             Int => { class => 'Data::Stack::Shared::Int', load => 'Data::Stack::Shared' },
             Str => { class => 'Data::Stack::Shared::Str', load => 'Data::Stack::Shared' },
@@ -396,19 +395,19 @@ our %REGISTRY = (
     },
     sync => {
         key => 'sync', dist => 'Data-Sync-Shared',
-        class => 'Data::Sync::Shared::Semaphore', path_class => 'sync', freeze => 0,
+        class => 'Data::Sync::Shared::Semaphore', path_class => 'sync',
         variants => { map { $_ => { class => "Data::Sync::Shared::$_", load => "Data::Sync::Shared::$_" } }
                       qw(Semaphore Barrier RWLock Condvar Once) },
         verbs => {},
     },
     timingwheel => {
         key => 'timingwheel', dist => 'Data-TimingWheel-Shared',
-        class => 'Data::TimingWheel::Shared', path_class => 'sync', freeze => 0,
+        class => 'Data::TimingWheel::Shared', path_class => 'sync',
         verbs => {},
     },
     topk => {
         key => 'topk', dist => 'Data-TopK-Shared',
-        class => 'Data::TopK::Shared', path_class => 'sketch', freeze => 0,
+        class => 'Data::TopK::Shared', path_class => 'sketch',
         variants => {
             decayed => { class => 'Data::TopK::Shared', load => 'Data::TopK::Shared', ctor => 'new_decayed' },
         },

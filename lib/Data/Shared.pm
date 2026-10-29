@@ -234,7 +234,7 @@ sub _dispatch {
     if ($root->{readonly} && $MUTATING{$verb}) {
         Carp::croak("Data::Shared: root is read-only, cannot $verb");
     }
-    my ($name, $mount, $rest) = _resolve($root, $components);
+    my (undef, $mount, $rest) = _resolve($root, $components);
     if (my $comp = $mount->{composite}) {
         return $comp->dispatch_verb($root, $verb, $rest, @args);
     }
@@ -248,7 +248,7 @@ sub _dispatch_pushpop {
     if ($root->{readonly}) {
         Carp::croak("Data::Shared: root is read-only, cannot $which");
     }
-    my ($name, $mount, $rest) = _resolve($root, $components);
+    my (undef, $mount, $rest) = _resolve($root, $components);
     if (my $comp = $mount->{composite}) {
         return $comp->dispatch_pushpop($root, $which, $rest, @args);
     }
@@ -282,11 +282,7 @@ sub _dispatch_call {
     if (my $comp = $mount->{composite}) {
         return $comp->dispatch_call($root, $rest, $method, @args);
     }
-    my $handle = $mount->{handle};
-    Carp::croak("Data::Shared: mount '$name' (" . ref($handle) . ") has no method '$method'")
-        unless $handle->can($method);
-    my @full = (@$rest, @args);
-    return $handle->$method(@full);
+    return _dispatch_record_call($mount, $rest, $method, @args);
 }
 
 sub shared_get    { my ($r, $p, @a) = @_; return _dispatch('get',    $r, _parse_string_path($p), @a) }
@@ -602,19 +598,21 @@ sub _require_class {
     return 1;
 }
 
-sub _file_for {
-    my ($self, $name) = @_;
-    my $safe = $name;
+sub _storage_name {
+    my ($safe) = @_;
     $safe =~ s{/}{__}g;
     $safe =~ s{[^A-Za-z0-9_.-]}{_}g;
-    return "$self->{dir}/$safe.shm";
+    return $safe;
+}
+
+sub _file_for {
+    my ($self, $name) = @_;
+    return "$self->{dir}/" . _storage_name($name) . '.shm';
 }
 
 sub _check_storage_paths {
     my ($self, $name, @paths) = @_;
     return unless keys %{ $self->{mounts} };
-    require Cwd;
-    require File::Spec;
     for my $path (grep { defined $_ } @paths) {
         my $abs = $self->_abs_path($path);
         for my $mount (values %{ $self->{mounts} }) {
@@ -849,7 +847,7 @@ sub _recipe {
     }
     my ($copy, $serializable) = Data::Shared::Manifest::snapshot([$spec, \@args]);
     ($spec, my $args) = @$copy;
-    my $recipe = { name => $name, source => $spec, spec => $spec, manifest_args => $args,
+    my $recipe = { name => $name, spec => $spec, manifest_args => $args,
         transient => !$serializable, kind => 'leaf' };
     if (ref $spec eq 'ARRAY' || (ref $spec eq 'HASH' && exists $spec->{child})) {
         my $node = Data::Shared::Composite::parse_node($spec);
@@ -860,9 +858,7 @@ sub _recipe {
         if ($node->{child}) {
             $recipe->{kind} = 'composite';
             if (defined $self->{dir}) {
-                my $safe = $name;
-                $safe =~ s{/}{__}g;
-                $safe =~ s{[^A-Za-z0-9_.-]}{_}g;
+                my $safe = _storage_name($name);
                 $recipe->{dir} = "$self->{dir}/.children/$safe";
             }
         }
@@ -889,10 +885,10 @@ sub _recipe {
         Data::Shared::Composite::_preflight($self, $recipe->{node}, $recipe->{dir}, $self->{_opening});
         $recipe->{storage_paths} = [defined $recipe->{dir} ? $recipe->{dir} : ()];
     } else {
-        $recipe->{plan} = Data::Shared::Storage::plan($self, $recipe->{resolved}, $name, $recipe->{args});
-        Data::Shared::Storage::require_files($recipe->{plan}) if $self->{_opening};
+        my $plan = Data::Shared::Storage::plan($self, $recipe->{resolved}, $name, $recipe->{args});
+        Data::Shared::Storage::require_files($plan) if $self->{_opening};
         Data::Shared::Storage::check_readonly($recipe->{resolved}) if $self->{strict_readonly};
-        $recipe->{storage_paths} = $recipe->{plan}{paths};
+        $recipe->{storage_paths} = $plan->{paths};
     }
     return $recipe;
 }
@@ -901,7 +897,6 @@ sub _replay_manifest {
     my ($self) = @_;
     my $path = $self->manifest_path;
     my ($data, $raw) = Data::Shared::Manifest::read($path);
-    local $self->{_replaying} = 1;
     local $self->{_opening} = 1;
     local $self->{_abs_cache} = {};     # shared with $check by the copy below
     # Before the replay, so a mount that adopts retained storage clears it.
@@ -1179,7 +1174,7 @@ sub handle {
     if (!ref $path && $self->{mounts}{$path} && !$self->{mounts}{$path}{composite}) {
         return $self->{mounts}{$path}{handle};
     }
-    my ($name, $mount, $rest) = _resolve($self, \@components);
+    my (undef, $mount, $rest) = _resolve($self, \@components);
     if (my $comp = $mount->{composite}) {
         return $comp->handle_at($self, $rest);
     }
