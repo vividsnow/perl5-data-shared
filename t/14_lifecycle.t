@@ -175,4 +175,24 @@ subtest 'full class names use the declared loader and constructor' => sub {
     }
 }
 
+# Teardown reclaims unpublished storage by extension, so it reaches a file the
+# facade never created. Documented, and pinned here: the blast radius is every
+# .shm directly in the root directory, and nothing else.
+subtest 'teardown sweeps the root directory by extension' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('m', 'hashmap:ii', undef, 64); 1 }
+        or plan skip_all => "hashmap unavailable: $@";
+    for my $leaf (qw(not-ours.shm notes.txt)) {
+        open my $fh, '>', "$dir/$leaf" or die $!;
+        print {$fh} 'x';
+        close $fh or die $!;
+    }
+    mkdir "$dir/keep.shm" or die $!;
+    ok $root->unlink_all, 'teardown removed something';
+    ok !-e "$dir/not-ours.shm", 'a foreign .shm in the root directory goes too';
+    ok -e "$dir/notes.txt", 'a file with another extension is left alone';
+    ok -d "$dir/keep.shm", 'and a directory named like one is not unlinked';
+};
+
 done_testing;

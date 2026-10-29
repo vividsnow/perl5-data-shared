@@ -1473,9 +1473,10 @@ teardown, and gives a writable root over sealed leaves. A mounted native handle 
 too, making the caller's object read-only.
 
 C<unlink_all> removes mounts, the manifest and all retained storage,
-including storage retained by other processes, and sweeps the root
-directory of any F<.shm> file an interrupted mount left behind. It
-leaves F<.manifest.lock>, which another process may still hold. C<freeze_all> and C<unlink_all> croak
+including storage retained by other processes. It also unlinks every
+F<.shm> file directly in the root directory, which reclaims what an
+interrupted mount left but takes any other F<.shm> kept there with it.
+It leaves F<.manifest.lock>, which another process may still hold. C<freeze_all> and C<unlink_all> croak
 on a read-only root.
 
 =head1 SHARING A ROOT

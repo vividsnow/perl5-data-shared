@@ -218,10 +218,11 @@ ROOT AND MOUNTS
     making the caller's object read-only.
 
     "unlink_all" removes mounts, the manifest and all retained storage,
-    including storage retained by other processes, and sweeps the root
-    directory of any .shm file an interrupted mount left behind. It leaves
-    .manifest.lock, which another process may still hold. "freeze_all" and
-    "unlink_all" croak on a read-only root.
+    including storage retained by other processes. It also unlinks every
+    .shm file directly in the root directory, which reclaims what an
+    interrupted mount left but takes any other .shm kept there with it. It
+    leaves .manifest.lock, which another process may still hold.
+    "freeze_all" and "unlink_all" croak on a read-only root.
 
 SHARING A ROOT
     Topology changes serialize under a directory lock and revision. A root
