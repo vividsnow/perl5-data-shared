@@ -71,7 +71,7 @@ pass an explicit path/factory; a file-backed root handles it.
 =head2 PerfectHash (immutable exact set)
 
     # build elsewhere (or via the hashref mount form), then:
-    $root->mount('words', 'perfecthash', { build_str => ['apple', 'banana'], path => '/tmp/words.phs' });
+    $root->mount('words', 'perfecthash', { build_str => ['apple', 'banana'], path => "$dir/words.phs" });
     shared_exists($root, '/words/banana');          # 1
 
 =head1 SET-LIKE

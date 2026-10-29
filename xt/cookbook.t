@@ -41,7 +41,8 @@ use File::Temp qw(tempdir);
 use Data::Shared qw(shared_get shared_set shared_delete shared_exists shared_incr
     shared_call shared_push shared_pop shared_compile shared_node shared_children
     shareda_get shareda_set shareda_call sharedc_get sharedc_set sharedc_call);
-my $root = Data::Shared->new(tempdir(CLEANUP => 1));
+my $dir = tempdir(CLEANUP => 1);
+my $root = Data::Shared->new($dir);
 PRE
 
 for my $section (@sections) {

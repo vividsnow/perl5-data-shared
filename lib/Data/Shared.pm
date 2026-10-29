@@ -1715,8 +1715,8 @@ without it. C<ringbuffer>'s C<get> may read one, a sequence number.
 
 =back
 
-Map-, set- and queue-like mounts croak on a longer path rather than
-using the first component and discarding the rest. RadixTree, which
+Map-, set- and queue-like mounts croak on a path longer than they take,
+rather than using the components they want and discarding the rest. RadixTree, which
 joins, is unaffected.
 
 Mount selection takes the longest name that matches the joined
@@ -1783,10 +1783,12 @@ CountMinSketch and C<sortedset:strings> (whose every verb dies).
 =item * An integer-addressed leaf numifies a non-integer key, so
 C<'abc'> addresses element 0. The C<key_int> families (C<buffer>,
 C<disjointset>, C<fenwick>, C<fenwick2d>, C<graph>, C<ndarray>,
-C<segmenttree>) refuse it, on every verb but C<exists>; C<bitset>,
-C<roaringbitmap>, C<ringbuffer>'s C<get> and the integer C<hashmap>
-variants address element 0, with a warning under C<-w>; C<pool> croaks,
-its slot 0 not being allocated.
+C<segmenttree>) refuse it instead; C<bitset>, C<roaringbitmap>,
+C<ringbuffer>'s C<get> and the integer C<hashmap> variants address
+element 0, with a warning under C<-w>; C<pool> croaks, its slot 0 not
+being allocated. C<shared_exists> stands outside all of that and
+answers 0 for any key the structure cannot hold -- in every family that
+has one, which C<ndarray> and C<fenwick2d> do not.
 
 =back
 
