@@ -1575,7 +1575,7 @@ Backend semantics:
 =over 4
 
 =item * C<shared_set($path, 0)> clears for BitSet, but counts as an add
-for RoaringBitmap and the Cuckoo and counting Bloom filters, whose value
+for RoaringBitmap, TopK and the Cuckoo and counting Bloom filters, whose value
 argument is ignored. Use C<shared_delete> to remove.
 
 =item * C<shared_delete> on a C<buffer> writes the variant's zero, which
@@ -1599,7 +1599,8 @@ verb dies).
 C<'abc'> addresses element 0. The C<key_int> families (C<buffer>,
 C<disjointset>, C<fenwick>, C<fenwick2d>, C<graph>, C<ndarray>,
 C<segmenttree>) refuse it instead; C<bitset>, C<roaringbitmap>,
-C<ringbuffer>'s C<get> and the integer C<hashmap> and C<sortedset>
+C<ringbuffer>'s C<get>, a C<perfecthash> built with C<build_int> and the
+integer C<hashmap> and C<sortedset>
 variants address element 0, with a warning under C<-w>; C<pool> croaks,
 its slot 0 not being allocated. C<shared_exists> returns 0 for keys the
 structure cannot hold, and croaks where the family has no C<exists> of

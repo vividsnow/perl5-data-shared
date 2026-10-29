@@ -312,8 +312,8 @@ GENERIC VERBS
     Backend semantics:
 
     *   "shared_set($path, 0)" clears for BitSet, but counts as an add for
-        RoaringBitmap and the Cuckoo and counting Bloom filters, whose value
-        argument is ignored. Use "shared_delete" to remove.
+        RoaringBitmap, TopK and the Cuckoo and counting Bloom filters, whose
+        value argument is ignored. Use "shared_delete" to remove.
 
     *   "shared_delete" on a "buffer" writes the variant's zero, which for
         "buffer:str" is the one-character string "0".
@@ -336,11 +336,11 @@ GENERIC VERBS
         addresses element 0. The "key_int" families ("buffer",
         "disjointset", "fenwick", "fenwick2d", "graph", "ndarray",
         "segmenttree") refuse it instead; "bitset", "roaringbitmap",
-        "ringbuffer"'s "get" and the integer "hashmap" and "sortedset"
-        variants address element 0, with a warning under "-w"; "pool"
-        croaks, its slot 0 not being allocated. "shared_exists" returns 0
-        for keys the structure cannot hold, and croaks where the family has
-        no "exists" of its own.
+        "ringbuffer"'s "get", a "perfecthash" built with "build_int" and the
+        integer "hashmap" and "sortedset" variants address element 0, with a
+        warning under "-w"; "pool" croaks, its slot 0 not being allocated.
+        "shared_exists" returns 0 for keys the structure cannot hold, and
+        croaks where the family has no "exists" of its own.
 
   shared_call($root, $path, $method, @args)
     Resolves $path to a mount, prepends remaining components to @args, and
