@@ -1388,7 +1388,9 @@ reference, or an object that is not a JSON::PP boolean -- makes the mount
 transient rather than refusing it. Failed mount publication restores the previous namespace and
 removes backing paths created by that attempt. Existing files are retained.
 Factories manage their own external side effects. Nested mount mutations
-inside a factory are rejected.
+inside a factory are rejected, and so is reopening the same root: the
+factory runs while its caller holds the manifest lock, which no second
+root in the same process can acquire. Use the C<$root> it is given.
 
 Mount arguments must survive manifest replay, so a value JSON would
 record as something else is refused at mount time instead: C<Inf>,

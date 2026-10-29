@@ -74,6 +74,7 @@ t/29_freeze_ship.t
 t/30_values.t
 t/31_manifest_codec.t
 t/32_retained.t
+t/33_host_boundary.t
 xt/cookbook.t
 xt/eg_runs.t
 xt/kwalitee.t

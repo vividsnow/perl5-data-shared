@@ -45,6 +45,8 @@ sub snapshot {
 my $ENCODER;
 sub _encoder { return $ENCODER ||= JSON::PP->new->allow_nonref(1) }
 
+my %HELD;       # manifest lock path => { exclusive }, for this process only
+
 my $INFINITY = 9**9**9;
 
 # Inf and NaN by value, not by how the encoder spells them: JSON::PP has two
@@ -147,6 +149,15 @@ sub with_lock {
     my ($root, $exclusive, $code) = @_;
     return $code->() unless defined $root->{dir};
     my $path = "$root->{dir}/.manifest.lock";
+    # flock does not nest across descriptors, so a second root object for the
+    # same directory inside a factory or a $SIG{__DIE__} observer waits for a
+    # lock only its own caller can release. Refuse instead of hanging: two
+    # shared holders are the one combination that cannot deadlock.
+    if (my $held = $HELD{$path}) {
+        Carp::croak("Data::Shared: this process already holds the manifest lock for"
+            . " '$root->{dir}'; use the root you were given rather than opening it again")
+            if $exclusive || $held->{exclusive};
+    }
     my $fh;
     if ($root->{readonly}) {
         # Legacy frozen roots may predate the lock file. Never create it here.
@@ -170,13 +181,18 @@ sub with_lock {
     until (flock $fh, $op) {
         Carp::croak("Data::Shared: cannot lock manifest: $!") unless $!{EINTR};
     }
+    local $HELD{$path} = { exclusive => $exclusive ? 1 : 0 };
     return $code->(); # lexical filehandle releases the lock on return or exception
 }
 
 sub read {
     my ($path) = @_;
     open my $fh, '<', $path or Carp::croak("Data::Shared: cannot read manifest '$path': $!");
-    my $json = do { local $/; <$fh> };
+    # $. too, not just $/: localizing it restores the caller's notion of the
+    # last read handle, which this read otherwise leaves pointing at a handle
+    # it then closes. A host looping over `while (<>) { close ARGV if eof }`
+    # saw bare eof go true on its first record and discarded the rest.
+    my $json = do { local ($/, $.); <$fh> };
     close $fh or Carp::croak("Data::Shared: cannot close manifest '$path': $!");
     my $data = eval { JSON::PP->new->decode($json) };
     Carp::croak("Data::Shared: invalid manifest '$path': $@") if $@;
