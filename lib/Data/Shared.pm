@@ -1429,10 +1429,11 @@ Data::Shared - Path-addressed facade over the Data-*-Shared family
     shared_push($root, '/jobs', 42);
     shared_pop($root, '/jobs');                # 42
 
-    my $app = Data::Shared->new('/tmp/app.shared');
-    $app->mount('cache', 'hashmap:ii', undef, 100_000);
+    my $app = Data::Shared->new('/tmp/demo.shared');
+    $app->mount('cache', 'hashmap:ii', undef, 100_000)
+        unless $app->mount_info('cache');      # a mount is one-time topology
     shared_set($app, '/cache/42', 100);
-    my $same = Data::Shared->open('/tmp/app.shared');
+    my $same = Data::Shared->open('/tmp/demo.shared');
     shared_get($same, '/cache/42');            # 100, from another handle
 
     my $cp = shared_compile('/cache/42');
@@ -1460,7 +1461,8 @@ and the rest is the adapter's business. Composite mounts
 (L</DEEP PATHS (COMPOSITES)>) add one child address per level. The three
 tiers (string, array, compiled) otherwise mirror L<Data::Path::XS>,
 except that its keyword syntax is not provided: requesting
-C<:keywords> croaks. L</PERFORMANCE> says why dispatch stays in Perl.
+C<:keywords> croaks. L</PERFORMANCE> says why dispatch stays in Perl,
+and L<Data::Shared::Cookbook> has a recipe per leaf.
 
 B<Linux only, 64-bit Perl>, matching every leaf. Handles are never
 cloned into ithreads (C<CLONE_SKIP>).
@@ -1505,7 +1507,13 @@ store this way is C<unlink_all>.
 =head2 Data::Shared->open_readonly($dir, strict => 1)
 
 Replays the manifest, opening each leaf with C<new_readonly> where the
-leaf supports it and with the normal constructor where it does not.
+leaf supports it and with the normal constructor where it does not. A
+leaf with a native read-only open (21 of the 39 families, the
+C<freeze> entries in L<Data::Shared::Registry>; C<hashmap> and
+C<bloomfilter> among them) requires a frozen file: on a live one its
+C<new_readonly> croaks, which aborts the whole replay with the leaf's
+message nested under C<failed to replay manifest>. Freeze the store in
+the producing process first.
 The generic mutating verbs (C<set>, C<delete>, C<incr>, C<push>,
 C<pop>), every root lifecycle write (C<mount>, C<unmount>,
 C<freeze_all>, C<unlink_all>) and native C<unlink>, C<destroy> and
@@ -1598,6 +1606,9 @@ refused, so retire the aliases first.
 
 Lifecycle and introspection for mounts. Names are canonicalized as
 C<mount> canonicalizes them, so C</a/> and C<a> name one mount.
+C<mount_names> is a synonym for C<mounts>; C<available_types> (class or
+root method) lists the 39 short spec names and C<registry> returns the
+L<Data::Shared::Registry> table itself.
 
 C<unmount> keeps the mount's storage and records it in the manifest, so
 a later mount of the same name adopts it. To reclaim it while the store
@@ -1628,8 +1639,7 @@ where it has them, and C<< { class => ref $handle } >> where it does
 not. A composite mount counts as its whole subtree: parent, child index
 and every registered child, open or not. C<freeze_all> returns the number of handles it sealed, so 0 is a
 success: either everything was already sealed, or no mount can be.
-C<frozen> tells those apart, and is what a producer should assert
-before shipping the directory -- but only 21 of the 39 families can be
+C<frozen> tells those apart -- but only 21 of the 39 families can be
 sealed at all. C<perfecthash> is immutable and needs no sealing, so it
 does not block the predicate; a store holding any of the other 17
 (C<buffer>, C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>,
@@ -1639,7 +1649,7 @@ C<disjointset>) or the
 C<sortedset:strings> variant can never report C<frozen>. C<frozen> is a
 predicate and does not say which mount blocks it;
 C<< open_readonly($dir, strict => 1) >> does, by naming the first
-unsupported class it meets. Freezing is also a one-way door for the
+unsupported mount and class it meets. Freezing is also a one-way door for the
 store: afterwards C<open> refuses it for every process, including the
 one that froze it, and C<open_sealed> is how it is reopened. A mounted native handle is sealed with
 the rest, so the caller's own object becomes read-only. C<unlink_all>
@@ -1699,8 +1709,9 @@ all remaining components are indices/coordinates.
 
 =item * Queue-, sketch- and sync-like: no remainder; use
 C<shared_push>/C<shared_pop>/C<shared_call>, which take the value as an
-argument. C<ringbuffer>'s C<get> is the one exception and reads one
-component, its sequence number.
+argument. The keyed sketches C<countminsketch> and C<topk> are the
+exception: they require exactly one component, the item, and croak
+without it. C<ringbuffer>'s C<get> may read one, a sequence number.
 
 =back
 
@@ -1726,8 +1737,15 @@ C<shared_incr> are honest sugar over native methods, defined per type
 in L<Data::Shared::Registry> (e.g. HashMap C<put/get/remove/exists>,
 RadixTree C<insert/lookup/delete/exists>, SortedSet C<add/score/remove>,
 Intern C<intern/id_of>). Where a verb would lie (a plain Bloom filter
-has no delete; sketches and sync primitives have no keyed get/set) it
+has no delete; unkeyed sketches and sync primitives have no keyed
+get/set) it
 croaks with guidance to use C<shared_call> instead of faking it.
+
+Each generic verb is also a method on the root, taking the function's
+arguments without the leading C<$root>: C<< $root->get('/cache/42') >>,
+C<set>, C<delete>, C<exists>, C<incr>, C<push>, C<pop> and
+C<< $root->call($path, $method, @args) >>. C<< $root->compile($path) >>
+is C<shared_compile>.
 
 Where it is defined, C<shared_exists> always returns C<1> or C<0>, an
 index outside the structure included; where a type has no honest
@@ -1758,14 +1776,17 @@ C<deque>, C<stack> or C<heap> drops a C<shared_push> the same way, as
 does a C<shared_set> past the end of a C<buffer>.
 
 =item * Keys cross into XS as bytes, so encode wide characters first. A
-character above U+00FF is accepted by the HashMap and SortedSet families
-and fatal in RadixTree, Intern and the filter family.
+character above U+00FF is accepted by the HashMap family and the integer
+SortedSet, and fatal in RadixTree, Intern, the filter family,
+CountMinSketch and C<sortedset:strings> (whose every verb dies).
 
 =item * An integer-addressed leaf numifies a non-integer key, so
-C<'abc'> addresses element 0. C<buffer>, C<fenwick>, C<segmenttree> and
-C<disjointset> refuse it; C<bitset>, C<roaringbitmap>, C<pool>,
-C<ndarray>, C<graph>, C<fenwick2d>, C<ringbuffer>'s C<get> and the
-integer C<hashmap> variants write element 0, with a warning under C<-w>.
+C<'abc'> addresses element 0. The C<key_int> families (C<buffer>,
+C<disjointset>, C<fenwick>, C<fenwick2d>, C<graph>, C<ndarray>,
+C<segmenttree>) refuse it, on every verb but C<exists>; C<bitset>,
+C<roaringbitmap>, C<ringbuffer>'s C<get> and the integer C<hashmap>
+variants address element 0, with a warning under C<-w>; C<pool> croaks,
+its slot 0 not being allocated.
 
 =back
 
@@ -1791,9 +1812,9 @@ as C<shared_delete> on that address.
 =head2 shared_push($root, $path, @values) / shared_pop($root, $path, @args)
 
 Queue sugar mapping to the native pair per type (Queue C<push/pop>,
-Deque C<push_back/pop_front>, Heap C<push/pop> with priority+value,
-Log C<append> (no pop), PubSub C<publish> (no pop), RingBuffer
-C<write> (no pop)). Unsupported directions croak.
+Deque C<push_back/pop_front>, Stack C<push/pop>, Heap C<push/pop> with
+priority+value, Log C<append> (no pop), PubSub C<publish> (no pop),
+RingBuffer C<write> (no pop)). Unsupported directions croak.
 
 =head1 ARRAY PATH API
 
@@ -1865,7 +1886,10 @@ Each composite declares C<max_children> (default 10_000) and
 C<cache_size> open children (default 32, LRU close/reopen) via the
 hashref spec form or a trailing C<{max_children =E<gt> ..., cache_size =E<gt> ...}>
 in the arrayref form. One child instance is one backing segment, so
-high-cardinality parents need an explicit budget. The budget sizes the
+high-cardinality parents need an explicit budget. C<cache_size> bounds
+one composite's own cache; a nested composite is itself a cached entry
+with its own cache plus its parent and index segments, so a deep tree's
+open-segment ceiling multiplies per level. The budget sizes the
 child index when the composite is created and cannot be raised
 afterwards: mounting a name over storage an C<unmount> retained with a
 larger C<max_children> is refused, since the index file cannot grow.
@@ -1873,7 +1897,9 @@ C<< unmount($name, unlink => 1) >> first, and build the subtree again.
 Every child is also an entry in the parent leaf, so whichever of the two
 is smaller is the real ceiling: size the parent for the budget, or a
 C<sortedset> parent of four fills after four children whatever
-C<max_children> says. Anonymous composites
+C<max_children> says. Both ceilings assume short addresses: a 256-byte
+address exhausts the child index near half of C<max_children>, and a
+string-keyed parent's own arena can bind first. Anonymous composites
 retain all opened children until subtree deletion or root destruction,
 because an anonymous segment cannot be reopened after eviction;
 C<cache_size> bounds only file-backed child caches. Use a file-backed

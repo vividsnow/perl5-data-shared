@@ -587,7 +587,9 @@ C<indexed>, C<sketch> or C<sync>), C<verbs> (generic verb to native
 method name or coderef receiving C<($handle, $key, @args)>, or
 C<($handle, @indices, @args)> for indexed leaves), optional
 C<push>/C<pop> native method names, optional C<key_join> (join
-remaining components with C</> to form the key), optional C<ctor>
+remaining components with C</> to form the key), optional C<key_int>
+(integer-addressed: a non-integer key croaks on every verb but
+C<exists>), optional C<ctor>
 (C<new> by default; C<handle_only> for PerfectHash), and C<freeze>
 (whether the leaf supports freeze/new_readonly).
 

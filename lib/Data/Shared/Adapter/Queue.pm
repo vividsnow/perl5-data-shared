@@ -128,8 +128,8 @@ Data::Shared::Adapter::Queue - Internal adapter for queue-like mounts (Data::Sha
 
 Internal to L<Data::Shared>; not a public API. Maps C<push>/C<pop>
 sugar to each leaf's native pair (Queue C<push/pop>, Deque
-C<push_back/pop_front>, Heap C<push/pop>, Log C<append>, PubSub
-C<publish>, RingBuffer C<write>) and serves the few generic verbs
-queue mounts honestly support.
+C<push_back/pop_front>, Stack C<push/pop>, Heap C<push/pop>, Log
+C<append>, PubSub C<publish>, RingBuffer C<write>) and serves the few
+generic verbs queue mounts honestly support.
 
 =cut

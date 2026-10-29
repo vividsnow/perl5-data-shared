@@ -645,6 +645,9 @@ sub _parent_register {
     # composite sized only by max_children filled at a fraction of it with a
     # message that read like an internal error.
     my $s = ($self->{parent_handle}->can('stats') ? $self->{parent_handle}->stats : undef) || {};
+    # SortedSet::Strings nests its report as { keys => ..., set => ... }; the
+    # member count a child registration spends is the set half.
+    $s = $s->{set} if ref $s->{set} eq 'HASH';
     my $size = $s->{size} // $s->{count};
     my $cap = $s->{capacity} // $s->{max_entries} // $s->{max};
     Carp::croak(sprintf

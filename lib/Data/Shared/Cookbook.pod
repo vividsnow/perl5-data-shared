@@ -10,11 +10,13 @@ One small recipe per leaf. Every recipe assumes:
 
     use Data::Shared qw(shared_get shared_set shared_delete shared_exists
                         shared_incr shared_call shared_push shared_pop);
-    my $root = Data::Shared->new('/tmp/app.shared');   # file-backed
-    # or: my $root = Data::Shared->new;                # anonymous
+    use File::Temp ();
+    my $dir = File::Temp::tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);   # file-backed
+    # or: my $root = Data::Shared->new;   # anonymous
 
 and that another process can reopen everything with
-C<< Data::Shared->open('/tmp/app.shared') >>.
+C<< Data::Shared->open($dir) >>.
 
 =head1 MAP-LIKE
 
@@ -26,7 +28,7 @@ C<< Data::Shared->open('/tmp/app.shared') >>.
     shared_get($root, '/cache/42');
     shared_incr($root, '/cache/42');          # native incr
     shared_incr($root, '/cache/42', 10);      # native incr_by
-    shared_call($root, '/cache', 'cas', 42, 110, 200);
+    shared_call($root, '/cache', 'cas', 42, 111, 200);   # 1: 100+1+10 -> 200
     shared_delete($root, '/cache/42');
 
 =head2 Buffer (typed shared array)
@@ -43,8 +45,9 @@ pass an explicit path/factory; a file-backed root handles it.
 
     $root->mount('routes', 'radixtree', undef, 65536, 1 << 20);
     shared_set($root, '/routes/10.0.0.0/8', 100);   # remainder is joined
-    shared_get($root, '/routes/10.0.0.0/8');
-    shared_call($root, '/routes', 'longest_prefix', '10.0.0.5');
+    shared_get($root, '/routes/10.0.0.0/8');        # 100
+    shared_set($root, '/routes/10.0', 200);
+    shared_call($root, '/routes', 'longest_prefix', '10.0.0.5');   # 200: byte prefix, not CIDR
 
 =head2 Intern + SortedSet Strings (string-keyed ZSET)
 
@@ -77,6 +80,15 @@ pass an explicit path/factory; a file-backed root handles it.
     shared_set($root, '/seen/event-42');            # add
     shared_exists($root, '/seen/event-42');
 
+    $root->mount('edge', 'cuckoofilter', undef, 1_000_000);
+    shared_set($root, '/edge/event-42');
+    shared_delete($root, '/edge/event-42');         # filters with delete
+
+    $root->mount('multi', 'countingbloomfilter', undef, 1_000_000, 0.01);
+    shared_set($root, '/multi/event-42');           # add
+    shared_get($root, '/multi/event-42');           # count_of
+    shared_delete($root, '/multi/event-42');        # remove
+
     $root->mount('bits', 'bitset', undef, 256);
     shared_set($root, '/bits/10', 1);
     shared_get($root, '/bits/10');                  # test
@@ -101,6 +113,16 @@ pass an explicit path/factory; a file-backed root handles it.
     $root->mount('stack', 'stack:str', undef, 50, 256);
     shared_push($root, '/stack', 'hello');
     shared_pop($root, '/stack');
+
+    $root->mount('dq', 'deque:int', undef, 1024);
+    shared_push($root, '/dq', 42);              # push_back
+    shared_call($root, '/dq', 'push_front', 1);
+    shared_pop($root, '/dq');                   # pop_front: 1
+
+    $root->mount('rb', 'ringbuffer:int', undef, 16);
+    shared_push($root, '/rb', 42);              # write
+    shared_get($root, '/rb/0');                 # sequence number
+    shared_call($root, '/rb', 'latest');
 
     $root->mount('tasks', 'heap', undef, 1000);
     shared_push($root, '/tasks', 3, 300);           # priority, value
@@ -136,11 +158,25 @@ pass an explicit path/factory; a file-backed root handles it.
     shared_incr($root, '/arr/10', 5);
     shared_call($root, '/arr', 'sum', 0, 99);
 
-KDTree, IntervalTree, SpatialHash and Graph are call-driven:
+KDTree, IntervalTree and SpatialHash are call-driven; Graph is
+path-addressable by node id:
 
     $root->mount('cities', 'kdtree', undef, 2, 100_000);
     shared_call($root, '/cities', 'add', [10.5, 20.5], 42);
     shared_call($root, '/cities', 'nearest', [10.0, 20.0]);
+
+    $root->mount('bookings', 'intervaltree', undef, 100_000);
+    shared_call($root, '/bookings', 'add', 10, 20, 7);      # interval, payload id
+    shared_call($root, '/bookings', 'stab', 15);
+
+    $root->mount('geo', 'spatialhash', undef, 100_000, 0, 1.0);
+    shared_call($root, '/geo', 'insert', 10.5, 20.5, 42);
+    shared_call($root, '/geo', 'query_radius', 10, 20, 5);
+
+    $root->mount('net', 'graph', undef, 1000, 10_000);
+    my $id = shared_call($root, '/net', 'add_node', 42);    # returns the id
+    shared_get($root, "/net/$id");                          # node data
+    shared_exists($root, "/net/$id");                       # 1
 
 =head1 SKETCHES AND STATS
 
@@ -184,8 +220,14 @@ Keyed sketches accept generic verbs; the rest are call-driven.
     my $id = shared_call($root, '/timers', 'add', 30, 42);       # 42 is the job
     shared_call($root, '/timers', 'advance', 1);
 
+    $root->mount('htimers', 'hiertimingwheel', undef, 256, 4, 100_000);
+    my $hid = shared_call($root, '/htimers', 'add', 5_000_000, 42);
+    shared_call($root, '/htimers', 'advance', 1);
+
 ReqRep is likewise call-driven (server C<recv_wait>/C<reply>, client
-objects obtained from the native handle).
+objects obtained from the native handle):
+
+    $root->mount('rpc', 'reqrep:int', undef, 1024, 64);
 
 =head1 COMPOSITES (DEEP PATHS)
 
@@ -218,12 +260,12 @@ See the DEEP PATHS section of L<Data::Shared>.
 =head1 FREEZE AND SHIP
 
     $root->freeze_all;                               # where leaves support it
-    # The gate: it croaks naming the first mount that cannot be sealed, which
-    # is what "not shippable" really means. Do not gate on $root->frozen -- it
-    # is false for any store holding an unsealable leaf, including ones that
-    # read back perfectly well in place. A store built from the recipes above
-    # does NOT pass this gate; see below for why.
-    my $ro = Data::Shared->open_readonly('/tmp/app.shared', strict => 1);
+    # The gate: it croaks naming the class and mount that cannot be sealed,
+    # which is what "not shippable" really means. Do not gate on
+    # $root->frozen -- it is false for any store holding an unsealable leaf,
+    # including ones that read back perfectly well in place. A store built
+    # from the recipes above does NOT pass this gate; see below for why.
+    my $ro = Data::Shared->open_readonly($dir, strict => 1);
     shared_get($ro, '/cache/42');                    # lock-free reads
     # shared_set($ro, ...) croaks: root is read-only
 
@@ -231,16 +273,16 @@ Shipping the directory read-only needs every mount to be freezable or
 immutable, and 17 of the 39 families are neither -- including C<buffer>
 and the C<sortedset:strings> variant, which the recipes above mount.
 (C<perfecthash> is immutable: it ships without being sealed.) A store holding
-any of them never reports C<frozen>, so the C<die> above fires; and a
+any of them never reports C<frozen>, and a
 write-protected copy of it cannot be opened at all, because an
 unfreezable leaf is reopened with its ordinary constructor, which needs
 to map the file read-write. Such a store can be read in place, where
 the files are still writable, but it is not a shippable artifact.
 C<< open_readonly($dir, strict => 1) >> is the diagnostic, because it
-names the first unsupported class, where C<frozen> only answers yes or
-no and a plain C<open_readonly> of a composite may not object until the
-first read deep enough to open the offending leaf. Tear a shipped store
-down with C<< Data::Shared->open_sealed($dir) >>: once the leaves are
-frozen, C<open> refuses the directory for good.
+names the first unsupported class and mount, where C<frozen> only
+answers yes or no and a plain C<open_readonly> of a composite may not
+object until the first read deep enough to open the offending leaf.
+Tear a shipped store down with C<< Data::Shared->open_sealed($dir) >>:
+once the leaves are frozen, C<open> refuses the directory for good.
 
 =cut

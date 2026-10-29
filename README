@@ -1,53 +1,595 @@
-Data-Shared
+NAME
+    Data::Shared - Path-addressed facade over the Data-*-Shared family
 
-Path-addressed facade over the 39 Data-*-Shared distributions,
-with an API inspired by Data::Path::XS (string, array and compiled
-path tiers). A root object holds named mounts; a slash path such as
-/cache/42 resolves to a mount plus an intra-structure operation.
+SYNOPSIS
+        use Data::Shared qw(shared_get shared_set shared_exists shared_call
+                            shared_push shared_pop shared_compile sharedc_get);
 
-    use Data::Shared qw(shared_get shared_set shared_call);
-    my $root = Data::Shared->new('/tmp/app.shared');
-    $root->mount('cache', 'hashmap:ii', undef, 100_000);
-    shared_set($root, '/cache/42', 100);
-    shared_get($root, '/cache/42');
+        my $root = Data::Shared->new;
+        $root->mount('cache', 'hashmap:ii', undef, 100_000);
+        $root->mount('visitors', 'hyperloglog', undef, 14);
+        $root->mount('jobs', 'queue:int', undef, 1024);
 
-See lib/Data/Shared.pm for the full documentation and
-lib/Data/Shared/Cookbook.pod for per-dist recipes.
+        shared_set($root, '/cache/42', 100);
+        shared_get($root, '/cache/42');            # 100
+        shared_exists($root, '/cache/42');         # 1
 
-Linux only, 64-bit Perl. Pure Perl; all operations execute in the
-underlying XS of each leaf.
+        shared_call($root, '/visitors', 'add', 'alice');
+        shared_call($root, '/visitors', 'count');  # ~1
 
-Architecture: Data::Shared owns roots, lifecycle coordination, and path dispatch.
-Manifest validates/publishes configuration; Storage plans paths and constructs
-backends with explicit creation/reopening rules.
-Registry declares backend classes and operation mappings; six adapters
-translate generic operations to native methods. Compiled paths cache
-dispatch and invalidate it when mounts change. Composite mounts keep
-a hidden child registry and lazily open one backend per child; Node
-provides a relative-path cursor.
+        shared_push($root, '/jobs', 42);
+        shared_pop($root, '/jobs');                # 42
 
-Use compiled paths for repeated access and native handles or backend
-batch methods for tight loops. File-backed composites bound their
-open-child cache; anonymous composites retain children to preserve data.
-Configure mount topology in one coordinator before starting workers.
-Read-only native access depends on backend support for new_readonly.
+        my $app = Data::Shared->new('/tmp/demo.shared');
+        $app->mount('cache', 'hashmap:ii', undef, 100_000)
+            unless $app->mount_info('cache');      # a mount is one-time topology
+        shared_set($app, '/cache/42', 100);
+        my $same = Data::Shared->open('/tmp/demo.shared');
+        shared_get($same, '/cache/42');            # 100, from another handle
 
-Reopening requires every mount backing file to exist; missing child files
-also fail when opened lazily. PerfectHash files are built once and then loaded.
-Manifest updates are locked and revision checked: reopen a stale root before
-retrying a topology change. Failed construction/publication rolls back new
-registrations and files. Lifecycle locks coordinate child creation/deletion;
-ordinary leaf calls retain backend locking.
+        my $cp = shared_compile('/cache/42');
+        sharedc_get($root, $cp);
 
-For native data-write protection, use
-Data::Shared->open_readonly($dir, strict => 1). This rejects unsupported
-backends throughout the declared tree. The default retains compatibility
-fallbacks. Native minimum versions are recorded in Registry.pm.
+        use Data::Shared qw(shareda_get shareda_set);
+        $root->mount('names', 'hashmap:ss', undef, 100_000);
+        shareda_set($root, ['names', 'a/b'], 1);   # a component may contain '/'
+        shareda_get($root, ['names', 'a/b']);
 
-Benchmarks: bench/benchmark.pl (flat paths), bench/overhead.pl
-(dispatch costs), bench/composite.pl (warm versus evicted children).
-Set DS_BENCH_TIME to the minimum CPU seconds per benchmark case.
-bench/scaling.pl also measures creation scaling, RSS, cache working sets,
-and multiprocess latency; see bench/scaling-results.txt for a recorded run.
+DESCRIPTION
+    Data::Shared wraps all 39 "Data-*-Shared" distributions behind one
+    path-based API inspired by Data::Path::XS. A root object holds named
+    mounts; a slash path resolves to a mount plus an intra-structure
+    operation:
 
-Install: perl Makefile.PL && make && make test && make install
+        /cache/42        mount "cache", key 42
+        /lat/0/5         mount "lat", indices 0, 5 (NDArray)
+        /visitors        mount "visitors" (used with shared_call)
+
+    A path resolves in two levels, not by walking: there is nothing to walk
+    inside an opaque shared-memory handle, so the components select a mount
+    and the rest is the adapter's business. Composite mounts ("DEEP PATHS
+    (COMPOSITES)") add one child address per level. The three tiers (string,
+    array, compiled) otherwise mirror Data::Path::XS, except that its
+    keyword syntax is not provided: requesting ":keywords" croaks.
+    "PERFORMANCE" says why dispatch stays in Perl, and
+    Data::Shared::Cookbook has a recipe per leaf.
+
+    Linux only, 64-bit Perl, matching every leaf. Handles are never cloned
+    into ithreads ("CLONE_SKIP").
+
+    The leaf dists are recommended rather than required, so installing this
+    facade does not compile all 39 of them. Install the ones you mount;
+    mounting a type whose dist is absent croaks naming the dist to install.
+    "cpanm --with-recommends Data::Shared" installs every leaf. One
+    dependency is not implied by what you mount: a composite on an anonymous
+    root locks its children with Data-Sync-Shared, so install that dist too.
+    File-backed composites use the directory lock and do not need it.
+
+ROOT AND MOUNTS
+  Data::Shared->new([$dir])
+    Without a directory, creates an anonymous root. With a directory,
+    creates it if needed; if a manifest.json already exists there it is
+    replayed (every mount reopened), otherwise an empty manifest is written.
+    When the root is file-backed and a mount's constructor arguments are
+    empty, start with "undef", or start with ':file', the facade supplies
+    "$dir/<name>.shm" as the backing file.
+
+  Data::Shared->open($dir)
+    Requires an existing directory and manifest. The complete manifest
+    schema, mount specs, and mount backing paths are checked before
+    constructing handles. Missing storage is an error; opening never
+    recreates an empty backing file. Composite descendant files are checked
+    when the child is opened lazily. Native backends validate their own file
+    headers.
+
+  Data::Shared->open_sealed($dir)
+    Opens a store whose leaves have been frozen, attaching each sealed leaf
+    read-only so the replay succeeds. "open" cannot do this -- a frozen file
+    refuses the writable constructor -- and "open_readonly" gives a root
+    whose lifecycle verbs croak, so without this a store had no reachable
+    teardown once the process that froze it exited. Reads work; data writes
+    are refused by the leaves themselves; the reason to open a store this
+    way is "unlink_all".
+
+  Data::Shared->open_readonly($dir, strict => 1)
+    Replays the manifest, opening each leaf with "new_readonly" where the
+    leaf supports it and with the normal constructor where it does not. A
+    leaf with a native read-only open (21 of the 39 families, the "freeze"
+    entries in Data::Shared::Registry; "hashmap" and "bloomfilter" among
+    them) requires a frozen file: on a live one its "new_readonly" croaks,
+    which aborts the whole replay with the leaf's message nested under
+    "failed to replay manifest". Freeze the store in the producing process
+    first. The generic mutating verbs ("set", "delete", "incr", "push",
+    "pop"), every root lifecycle write ("mount", "unmount", "freeze_all",
+    "unlink_all") and native "unlink", "destroy" and "freeze" croak on any
+    read-only root. Other native methods, reached through "shared_call" or
+    "handle", keep whatever permissions that leaf's own file gives them: the
+    root flag by itself does not make them read-only.
+
+    "strict => 1" closes that gap by refusing the store instead. Every
+    backend in the declared tree, lazy composite leaves included, must
+    provide "new_readonly" or be immutable (PerfectHash), and is rejected
+    before any handle is opened, so the producer has to freeze whatever
+    needs a frozen file first. Raw handles still expose their backend's own
+    API, and the filesystem still decides what a process may write directly.
+
+  $root->mount($name, $spec, @ctor_args)
+    Mounts a structure under $name (which may itself contain "/", for nested
+    namespaces; longest-prefix wins). $spec may be:
+
+    *   a short spec: 'hashmap', 'hashmap:ii', 'buffer:i64', 'queue:int',
+        'sync:semaphore', 'sortedset:strings', etc. Short specs are
+        all-lowercase (mixed case is accepted and resolves to the lowercase
+        canonical form). See Data::Shared::Registry for the full inventory.
+
+    *   a full class name: 'Data::HashMap::Shared::SS'.
+
+    *   a hashref: "{ spec => 'hashmap:ss', args => [...] }" or with an
+        explicit "ctor" (for "new_weighted"/"new_decayed" style
+        constructors, also available as 'reservoir:weighted' /
+        'topk:decayed').
+
+    *   an already-constructed handle (transient; not written to the
+        manifest).
+
+    *   a coderef factory called as "$factory->($root, $name)" (transient).
+
+    *   a composite spec (arrayref or hashref with "child"): see "DEEP PATHS
+        (COMPOSITES)".
+
+    Returns the native handle (for a composite mount, a Data::Shared::Node
+    for the mount). "$root->handle($path)" also returns it, and any native
+    method can always be reached that way or via "shared_call".
+
+    Configuration arrays and hashes are copied before construction. Cycles
+    are rejected; constructor arguments that cannot be serialized make the
+    mount transient. Failed mount publication restores the previous
+    namespace and removes backing paths created by that attempt. Existing
+    files are retained. Factories manage their own external side effects.
+    Nested mount mutations inside a factory are rejected.
+
+    Every argument has to survive the manifest, because replaying it is how
+    each later process reopens the store. "Inf", "NaN" and a lone surrogate
+    are refused at mount time rather than published as text nothing can
+    parse back. Strings are recorded as bytes, and a string held as
+    characters is encoded to its UTF-8 bytes first, uniformly from U+0080
+    up: the character "\x{e9}" and the single byte "\xe9" are therefore two
+    different paths naming two different files.
+
+    Special cases: "perfecthash" is an immutable build-then-load structure,
+    so a 'perfecthash' spec takes either a built file path or a "{ build_int
+    => \@keys, path => $file }" / "build_str" hashref. A build spec creates
+    a missing file once; an existing file is loaded without rebuilding. To
+    supply one some other way, pass the factory or the loaded handle as the
+    spec, as for any other type. "sortedset:strings" takes "mount('names',
+    'sortedset:strings', { max => 100_000 })"; "set"/"keys" backing paths
+    are auto-filled for file-backed roots. A backing path you name yourself
+    must be absolute, because it is published in the manifest and resolved
+    again by every process that opens the store; a relative one would
+    resolve against each process's own working directory. Paths the facade
+    derives from the root directory are unaffected, and are relative exactly
+    when that directory is.
+
+    Backing paths already owned by another mount are rejected before
+    construction, including aliases produced by filename sanitization (e.g.
+    "a/b" and "a__b") and string SortedSet sidecars. Mount the same native
+    handle under another name to share it intentionally; an "unmount" that
+    would unlink storage another mount still names is refused, so retire the
+    aliases first.
+
+  $root->unmount($name), $root->mounts, $root->mount_info($name)
+    Lifecycle and introspection for mounts. Names are canonicalized as
+    "mount" canonicalizes them, so "/a/" and "a" name one mount.
+    "mount_names" is a synonym for "mounts"; "available_types" (class or
+    root method) lists the 39 short spec names and "registry" returns the
+    Data::Shared::Registry table itself.
+
+    "unmount" keeps the mount's storage and records it in the manifest, so a
+    later mount of the same name adopts it. To reclaim it while the store
+    stays in service, mount the name again and "unmount" it with "unlink =>
+    1"; "unlink_all" reclaims it too, from any process that opens the root,
+    but takes the whole store with it. That record costs one manifest entry
+    per retained store until something reclaims it, and every topology
+    change republishes the manifest, so a program that rotates mounts under
+    fresh names should pass "unlink => 1" rather than accumulate them.
+    "unmount($name, unlink => 1)" removes the storage instead, under the
+    same directory lock that published its removal, and a native "unlink" or
+    "destroy" reached through "shared_call" at a mount does the same -- a
+    manifest naming storage that is gone makes the store refuse to open at
+    all. See "SHARING A ROOT" for what another process sees while this
+    happens.
+
+  $root->dir, $root->readonly, $root->manifest_path
+    Accessors: the root's directory, whether it was opened read-only, and
+    the path of its manifest. The directory and the manifest path are both
+    "undef" for an anonymous root.
+
+  $root->sync_all, $root->freeze_all, $root->unlink_all, $root->stats, $root->frozen
+    Proxies applied to every mount whose handle supports the method, in
+    mount order. "stats" returns a hashref per mount: the leaf's own stats
+    where it has them, and "{ class => ref $handle }" where it does not. A
+    composite mount counts as its whole subtree: parent, child index and
+    every registered child, open or not. "freeze_all" returns the number of
+    handles it sealed, so 0 is a success: either everything was already
+    sealed, or no mount can be. "frozen" tells those apart -- but only 21 of
+    the 39 families can be sealed at all. "perfecthash" is immutable and
+    needs no sealing, so it does not block the predicate; a store holding
+    any of the other 17 ("buffer", "queue", "stack", "deque", "heap", "log",
+    "pool", "pubsub", "reqrep", "ringbuffer", "sync", "timingwheel",
+    "hiertimingwheel", "reservoir", "topk", "segmenttree", "disjointset") or
+    the "sortedset:strings" variant can never report "frozen". "frozen" is a
+    predicate and does not say which mount blocks it; "open_readonly($dir,
+    strict => 1)" does, by naming the first unsupported mount and class it
+    meets. Freezing is also a one-way door for the store: afterwards "open"
+    refuses it for every process, including the one that froze it, and
+    "open_sealed" is how it is reopened. A mounted native handle is sealed
+    with the rest, so the caller's own object becomes read-only.
+    "unlink_all" removes the mounts, the manifest, and every retained store
+    the manifest names -- whichever process unmounted it, since the ledger
+    is shared -- but leaves .manifest.lock, which another process may still
+    be holding, so the directory is not empty afterwards. "freeze_all" and
+    "unlink_all" both croak on a read-only root.
+
+SHARING A ROOT
+    Topology changes take a directory lock and bump a revision, so they
+    serialise between processes. A root that was opened before another
+    writer's change gets a "stale manifest revision" error from "mount",
+    "unmount", "freeze_all" and "unlink_all", raised before any constructor
+    or factory runs: reopen the root and retry against the current
+    configuration. A store destroyed and rebuilt at the same directory is
+    refused the same way, as "this store was replaced", since an identical
+    rebuild reproduces both the revision and the published bytes. Ordinary
+    reads and writes never check the revision, so they neither fail nor
+    refresh; a write to a mount another process retired with "unlink => 1"
+    is one of those, and succeeds into a mapping whose file is gone, where
+    nothing will read it back.
+
+    A root keeps its own mount namespace until it is reopened, and a
+    composite child it already holds open is part of that namespace. If
+    another process destroys and recreates the store, this root goes on
+    reading the child it holds, and "exists" and "children" go on reporting
+    it, until something makes it take the composite lock again and the
+    instance check fires. It never crosses into the new store's storage --
+    it is answering for the old one -- so a worker that must notice a
+    teardown should reopen rather than wait to be told.
+
+    Configure topology from one coordinator and let the workers open the
+    result; that is the pattern the revision protocol is built for.
+
+PATH FORMAT
+    Components are separated by "/". A leading "/" is optional, repeated and
+    trailing slashes are tolerated, and the empty path addresses the root
+    ("shared_get" returns the root, "shared_exists" is true, mutating the
+    root croaks) -- all mirroring Data::Path::XS. The first component(s)
+    select the mount (longest prefix match); the remainder is interpreted by
+    the mount's adapter:
+
+    *   Map-like (HashMap, Buffer, RadixTree, Intern, Pool, PerfectHash):
+        one key/index component. RadixTree instead joins the remainder with
+        "/" so route-style keys work in string paths.
+
+    *   Set-like (Bloom family, BitSet, RoaringBitmap, SortedSet,
+        DisjointSet): one member component.
+
+    *   Indexed (NDArray, Fenwick, Fenwick2D, SegmentTree, Graph): all
+        remaining components are indices/coordinates.
+
+    *   Queue-, sketch- and sync-like: no remainder; use
+        "shared_push"/"shared_pop"/"shared_call", which take the value as an
+        argument. The keyed sketches "countminsketch" and "topk" are the
+        exception: they require exactly one component, the item, and croak
+        without it. "ringbuffer"'s "get" may read one, a sequence number.
+
+    Map-, set- and queue-like mounts croak on a longer path rather than
+    using the first component and discarding the rest. RadixTree, which
+    joins, is unaffected.
+
+    Mount selection takes the longest name that matches the joined
+    components, so a nested mount wins over the same string reached through
+    a shorter one: with "users" and "users/sales" mounted, "/users/sales/eu"
+    addresses the "users/sales" mount, not the "sales" record or composite
+    child of "users". Array paths join the same way, a component containing
+    "/" included, so do not give a nested mount a name that spells out an
+    address its parent also serves.
+
+    No escaping is provided in the string tier: keys containing "/" or the
+    empty string need the array tier.
+
+GENERIC VERBS
+    "shared_get", "shared_set", "shared_delete", "shared_exists" and
+    "shared_incr" are honest sugar over native methods, defined per type in
+    Data::Shared::Registry (e.g. HashMap "put/get/remove/exists", RadixTree
+    "insert/lookup/delete/exists", SortedSet "add/score/remove", Intern
+    "intern/id_of"). Where a verb would lie (a plain Bloom filter has no
+    delete; unkeyed sketches and sync primitives have no keyed get/set) it
+    croaks with guidance to use "shared_call" instead of faking it.
+
+    Each generic verb is also a method on the root, taking the function's
+    arguments without the leading $root: "$root->get('/cache/42')", "set",
+    "delete", "exists", "incr", "push", "pop" and "$root->call($path,
+    $method, @args)". "$root->compile($path)" is "shared_compile".
+
+    Where it is defined, "shared_exists" always returns 1 or 0, an index
+    outside the structure included; where a type has no honest "exists"
+    ("ndarray", "fenwick2d") it croaks like any other absent verb.
+    "shared_incr" uses "incr_by" when a delta is given and the leaf supports
+    it; a leaf with neither "incr_by" nor a delta form of "incr" (most
+    "buffer" variants) rejects the delta from its own XS, so use
+    "shared_call" there.
+
+    These are the leaf's own behaviours showing through, and worth knowing
+    before you rely on them:
+
+    *   "shared_set($path, 0)" clears for BitSet, but counts as an add for
+        RoaringBitmap and the Cuckoo and counting Bloom filters, whose value
+        argument is ignored. Use "shared_delete" to remove.
+
+    *   "shared_delete" on a "buffer" writes the variant's zero, which for
+        "buffer:str" is the one-character string "0".
+
+    *   A write can fail by returning false instead of croaking:
+        "sortedset:strings" and "intern" derive a string arena of 32 bytes
+        per declared entry, so longer members exhaust it early and
+        "shared_set" returns "undef". Pass a larger "arena", or a larger
+        third constructor argument for "intern", and check the return value.
+        A full "queue", "deque", "stack" or "heap" drops a "shared_push" the
+        same way, as does a "shared_set" past the end of a "buffer".
+
+    *   Keys cross into XS as bytes, so encode wide characters first. A
+        character above U+00FF is accepted by the HashMap family and the
+        integer SortedSet, and fatal in RadixTree, Intern, the filter
+        family, CountMinSketch and "sortedset:strings" (whose every verb
+        dies).
+
+    *   An integer-addressed leaf numifies a non-integer key, so 'abc'
+        addresses element 0. The "key_int" families ("buffer",
+        "disjointset", "fenwick", "fenwick2d", "graph", "ndarray",
+        "segmenttree") refuse it, on every verb but "exists"; "bitset",
+        "roaringbitmap", "ringbuffer"'s "get" and the integer "hashmap"
+        variants address element 0, with a warning under "-w"; "pool"
+        croaks, its slot 0 not being allocated.
+
+  shared_call($root, $path, $method, @args)
+    The escape hatch that guarantees full coverage: resolves $path to a
+    mount, prepends any remaining path components to @args, and calls the
+    native $method. Every native operation of every leaf is reachable this
+    way, including those with no generic verb. On a composite mount the
+    first remaining component instead selects the child, and the rest are
+    passed to the child's method.
+
+    "unlink" and "destroy" are the exception: they retire storage, so they
+    are only accepted where a registration can be retired with it, at a
+    mount or at a composite child, and are refused at a record below one. At
+    a composite child they remove the child's registration too, the same as
+    "shared_delete" on that address.
+
+        shared_call($root, '/visitors', 'add_many', ['a', 'b']);
+        shared_call($root, '/fenwick', 'prefix', 500);
+        shared_call($root, '/sem', 'acquire', 1.5);
+
+  shared_push($root, $path, @values) / shared_pop($root, $path, @args)
+    Queue sugar mapping to the native pair per type (Queue "push/pop", Deque
+    "push_back/pop_front", Stack "push/pop", Heap "push/pop" with
+    priority+value, Log "append" (no pop), PubSub "publish" (no pop),
+    RingBuffer "write" (no pop)). Unsupported directions croak.
+
+ARRAY PATH API
+    "shareda_get/set/delete/exists/incr/call/push/pop" take an arrayref of
+    components instead of a slash string. Binary-safe; components may
+    contain "/" or be empty strings, subject to the resolution rule in "PATH
+    FORMAT".
+
+COMPILED PATH API
+    shared_compile($path) (string or arrayref) returns a
+    Data::Shared::Compiled object holding parsed components; "sharedc_*"
+    functions reuse it without re-parsing, mirroring
+    "path_compile"/"pathc_*" in Data::Path::XS. On first use against a root
+    the compiled path also caches the resolved mount, verb and key, so later
+    calls go straight to the native method; the cache is invalidated
+    automatically when mounts change. Compiled objects are still
+    per-process: recompile after "fork" if the child mounts differently.
+
+DEEP PATHS (COMPOSITES)
+    A composite mount nests structures: the parent gives each child a stable
+    address, and the facade keeps one child instance per address (no leaf
+    can physically contain another). Specs are nested arrayrefs (constructor
+    arguments exclude the backing path, which the facade supplies per child;
+    a leading "undef" placeholder is tolerated) or hashrefs with
+    "spec"/"args"/"child". In the arrayref form a trailing arrayref is
+    always the child spec, so a leaf whose constructor takes a trailing
+    arrayref argument (such as SpatialHash grid wrapping) must use the
+    hashref form:
+
+        $root->mount('users', ['hashmap:ss', 100_000, ['bloomfilter', 10_000, 0.01]]);
+        $root->mount('leaders', ['sortedset:strings', { max => 100_000 }, ['bloomfilter', 10_000, 0.01]]);
+        $root->mount('atlas', ['hashmap:ss', 100_000, ['kdtree', 2, 100_000, ['hashmap:ss', 10_000]]]);
+
+        shared_set($root, '/users/alice/event-42', 1);
+        shared_exists($root, '/users/alice/event-42');
+        shared_set($root, '/leaders/alice', 1500);           # SortedSet score
+        shared_get($root, '/atlas/europe/42/name');
+
+    Parents must be addressable: "hashmap" and "sortedset" (child per
+    key/member; for SortedSet the path ending at the child still reads and
+    writes its score), plus "kdtree" and "graph" as id-parents (child per
+    point/node id; geometry is added through
+    "$root->node('/atlas/europe')->call('add', [$x, $y], $id)", and a deep
+    write for an id does not require the point to exist). Bloom filters,
+    sketches, queues, stacks, logs, sync and timing mounts cannot be parents
+    (probabilistic or transient: their members cannot be enumerated or
+    stably addressed) and are rejected at mount time; use them as child
+    leaves.
+
+    Semantics at an intermediate path: "shared_get" returns a
+    Data::Shared::Node (for SortedSet, the score instead), "shared_exists"
+    reports whether a child is registered, "shared_delete" deletes the whole
+    subtree, and "shared_set" croaks except for the SortedSet score case.
+    "$root->node($path)" (also exported as "shared_node") returns a cursor
+    with relative-path
+    "get/set/delete/exists/incr/push/pop/call/call_at/node/children/handle"
+    methods; "$root->children($path)" ("shared_children") lists registered
+    child addresses. "handle" on a child leaf path returns its native
+    handle. Reads of a missing child never create one; writes create it
+    lazily, and so does any "call" there, since the method may mutate. Probe
+    with "shared_exists", not a read-only call, or a loop over candidate
+    addresses will register every one of them and exhaust the child budget.
+
+    Each composite declares "max_children" (default 10_000) and "cache_size"
+    open children (default 32, LRU close/reopen) via the hashref spec form
+    or a trailing "{max_children => ..., cache_size => ...}" in the arrayref
+    form. One child instance is one backing segment, so high-cardinality
+    parents need an explicit budget. "cache_size" bounds one composite's own
+    cache; a nested composite is itself a cached entry with its own cache
+    plus its parent and index segments, so a deep tree's open-segment
+    ceiling multiplies per level. The budget sizes the child index when the
+    composite is created and cannot be raised afterwards: mounting a name
+    over storage an "unmount" retained with a larger "max_children" is
+    refused, since the index file cannot grow. "unmount($name, unlink => 1)"
+    first, and build the subtree again. Every child is also an entry in the
+    parent leaf, so whichever of the two is smaller is the real ceiling:
+    size the parent for the budget, or a "sortedset" parent of four fills
+    after four children whatever "max_children" says. Both ceilings assume
+    short addresses: a 256-byte address exhausts the child index near half
+    of "max_children", and a string-keyed parent's own arena can bind first.
+    Anonymous composites retain all opened children until subtree deletion
+    or root destruction, because an anonymous segment cannot be reopened
+    after eviction; "cache_size" bounds only file-backed child caches. Use a
+    file-backed root when processes need to discover children created after
+    "fork". File-backed roots store children under .children/ next to the
+    manifest and reopen them on replay; composite mounts support "sync_all",
+    "stats" (with child counts), "freeze_all", and subtree deletion.
+    Compiled paths over composites stay correct across child creation,
+    eviction, and deletion because they re-dispatch to the child per call.
+
+    Allocation, construction, publication, score-only registration, and
+    subtree deletion use the composite lifecycle lock. Failed construction
+    rolls back new registrations, counts, and newly created paths; existing
+    scores and reservations are preserved. Allocated child IDs are never
+    reused. Cached leaf operations use the backend's own locking. An
+    operation already in progress during deletion may complete against the
+    old instance; an explicit native handle continues to refer to that
+    instance after recreation.
+
+    The shared child counter is maintained under the lifecycle lock, and is
+    rebuilt only when an unfinished mutation marker is found: on opening a
+    writable composite, or when a lifecycle lock encounters one. A holder
+    that dies mid-section releases the lock either way: the kernel releases
+    a file-backed composite's file lock, and an anonymous composite's lock
+    is recovered from the dead owner, at the cost of about 20 kB of shared
+    mapping per anonymous composite instance. Unpublished directories may
+    remain and are retained for explicit recovery: each holds its child's
+    storage, no API reports them, and only "unlink_all" reclaims them, so a
+    long-running producer that is killed repeatedly accumulates them until
+    the store is torn down. A preexisting unpublished directory for a
+    reserved child is reported as an error. This provides exception rollback
+    and limited interruption recovery, without promising power-loss
+    transactions or automatic orphan cleanup.
+
+PERFORMANCE
+    The facade is pure Perl; every operation ends in the leaf's XS, so
+    per-call overhead depends on the tier. A sample run of bench/overhead.pl
+    on one x86_64 host, reading one integer key, rates taken from measured
+    CPU time:
+
+        native handle    0.08 us/op
+        compiled         0.65 us/op
+        array path       2.60 us/op
+        shared_call      2.60 us/op
+        string path      3.40 us/op
+
+    Those are one host's figures and the string tier varied by about 15% run
+    to run; the ordering is the durable part, not the values.
+
+    The string and array tiers pay for path parsing and mount resolution on
+    every call. A compiled path skips both: a live binding is checked only
+    for root identity and generation, and the remaining arguments reach the
+    bound closure without being copied again. Use compiled paths, or the
+    native handle from "handle", in hot loops. The handle is the floor and
+    costs no facade call at all, which is why dispatch is not in XS: an XS
+    dispatcher would speed up a middle tier that callers can bypass. Run
+    bench/benchmark.pl, bench/overhead.pl and bench/mounts.pl on your
+    hardware; every figure quoted here comes from one of them.
+    bench/composite.pl measures deep reads with a warm child cache and with
+    repeated cache eviction. Composite compiled paths still resolve the
+    child registry on every call; their cost differs from flat compiled
+    paths.
+
+    Creating flat mounts costs quadratic total time in their number: each
+    one validates and republishes the whole manifest, so the marginal cost
+    of one more doubles as the count doubles. bench/mounts.pl measures this;
+    on the same host the average was 1.4 ms per mount at 25 mounts and 8.0
+    ms at 200, i.e. 1.6 s to create 200, with the 200th alone costing 16 ms.
+    Keys are not affected: writing 10_000 keys into one flat mount took 38
+    ms and never touches the manifest, which that script also asserts.
+    Opening such a root is superlinear too, and paid by every process that
+    opens it: 0.15 s to replay 400 mounts on the same host. A namespace with
+    hundreds of mounts belongs in a composite mount ("DEEP PATHS
+    (COMPOSITES)") instead, where children are registered in the parent and
+    the root manifest stays a single record.
+
+    bench/scaling.pl records child-creation scaling, working-set cache
+    costs, process RSS, and wall-time latency percentiles for concurrent
+    increments. Its samples are workload measurements, not latency
+    guarantees. Child counts and file-cache LRU updates now take constant
+    time during normal operation. Bound compiled dispatch is owned by the
+    root, so retaining a compiled path does not retain an unmounted native
+    handle. Backend minimum versions are the validated baselines recorded in
+    Data::Shared::Registry; they are published as the recommended minima and
+    enforced at first backend use. Nothing checks them at installation,
+    because the leaves are not required.
+
+CLASSIFICATION OF THE 39 LEAVES
+    Map-like: HashMap (10 variants), Buffer (11), RadixTree, Intern, Pool
+    (+I64/I32/F64/Str), PerfectHash (read-only). Set-like: BloomFilter,
+    CountingBloomFilter, CuckooFilter, BitSet, RoaringBitmap, SortedSet
+    (+Strings), DisjointSet. Queue-like: Queue, Deque, Stack, Heap,
+    RingBuffer, Log, PubSub. Indexed: NDArray, Fenwick, Fenwick2D,
+    SegmentTree, KDTree, IntervalTree, SpatialHash, Graph. Sketch/stats:
+    HyperLogLog, CountMinSketch, MinHash, TopK, DDSketch, Histogram,
+    Reservoir. Sync/timing (call-only): Sync (Semaphore, Barrier, RWLock,
+    Condvar, Once), TimingWheel, HierTimingWheel, ReqRep.
+
+SECURITY
+    A file-backed root is created mode 0700, and the manifest and the
+    ".manifest.lock" that serialises topology changes are created 0600.
+    Republishing the manifest keeps whatever mode it already had, so a root
+    you widened on purpose stays widened. Backing files come from the
+    leaves, which create them 0600 with "O_NOFOLLOW" and "O_EXCL". A
+    directory or lock that already exists keeps its own mode, so sharing a
+    root between users stays an explicit choice; the facade does not offer a
+    mode argument for it, and a group-writable root lets any member of that
+    group unlink the manifest.
+
+    The manifest is trusted input. Whatever can write it chooses which
+    mounts this process opens and which backing files it maps, so a writer
+    who also controls those files controls what the process attaches to: a
+    recorded argument list is not re-applied to a file that already exists,
+    and the leaf rejects a file whose header does not match the declared
+    type, but the file itself decides the mapping. An "args" entry naming an
+    absolute path is honoured, so a manifest can reach a file outside the
+    root.
+
+    Put the root where only its trusted writers can create it. Because an
+    existing directory keeps its own mode and the manifest inside it is
+    trusted, a root named under a world-writable directory -- /tmp on a
+    shared host, as the examples here spell it for brevity -- can be
+    pre-created by anyone, who then chooses what the first real process
+    attaches to.
+
+    Mount names are sanitised into the root directory, so a name containing
+    ".." or "/" cannot place a backing file outside it. Anything you grant
+    write access to a shared mapping is trusted not to corrupt it while
+    others are attached, as with the leaves.
+
+SEE ALSO
+    Data::Path::XS (the API model), Data::Shared::Registry (the inventory
+    and verb tables), Data::Shared::Cookbook (per-dist recipes), and each
+    "Data::*::Shared" leaf for its native semantics.
+
+AUTHOR
+    vividsnow
+
+LICENSE
+    This is free software; you can redistribute it and/or modify it under
+    the same terms as Perl itself.
+
