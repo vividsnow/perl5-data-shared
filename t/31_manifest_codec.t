@@ -6,9 +6,12 @@ use JSON::PP ();
 use Data::Shared qw(shared_get shared_set);
 use Data::Shared::Manifest ();
 
+# The codec is pure Perl and its defects have all been version-dependent, so
+# none of it may hang off a backend: skipping the file wholesale meant the part
+# most likely to break was the one part a bare perl never ran.
 my $probe = Data::Shared->new(tempdir(CLEANUP => 1));
-eval { $probe->mount('p', 'hashmap:ss', undef, 8); 1 }
-    or plan skip_all => "hashmap backend unavailable: $@";
+my $HASHMAP = eval { $probe->mount('p', 'hashmap:ss', undef, 8); 1 }
+    ? '' : "hashmap backend unavailable: $@";
 
 # Which spelling JSON::PP picks varies by version and by PERL_JSON_PP_USE_B,
 # so the codec's own answers are checked against an encoder that quotes
@@ -26,6 +29,7 @@ my $QUOTING = do {
 # every reopen looked for a different file and refused to recreate it, leaving
 # the store intact on disk and unreachable through any API.
 subtest 'a non-ASCII backing path survives a round trip' => sub {
+    plan skip_all => $HASHMAP if $HASHMAP;
     my @forms = (
         ['ASCII',        'store.shm'],
         ['UTF-8 bytes',  "caf\xc3\xa9.shm"],
@@ -65,6 +69,7 @@ subtest 'a non-ASCII backing path survives a round trip' => sub {
 # manifest only hand-editing could repair. Refused while the caller is still
 # there to be told.
 subtest 'an unrepresentable mount argument is refused at mount time' => sub {
+    plan skip_all => $HASHMAP if $HASHMAP;
     my @bad = (
         ['NaN capacity', sub { $_[0]->mount('x', 'hashmap:ss', undef, 'NaN' + 0) },
          qr/not a serializable mount argument/],
@@ -196,7 +201,10 @@ subtest 'a numeric mount argument survives the round trip exactly' => sub {
         my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
         my $back = JSON::PP->new->decode($json)->[0];
         cmp_ok $back, '==', $value, "$value round trips exactly";
-        is pack('d', $back), pack('d', $value), "$value keeps every bit";
+        # 'F' is the native NV; 'd' truncates to a double, so on a
+        # -Duselongdouble perl it compared two values it had just rounded
+        # together and passed while the published digits were short.
+        is pack('F', $back), pack('F', $value), "$value keeps every bit";
     }
 };
 
@@ -225,6 +233,7 @@ subtest 'an exact integer survives an encoder that quotes every number' => sub {
 
 # \d matches non-ASCII digits, which numify to a prefix of the value.
 subtest 'a non-ASCII digit is not a composite option' => sub {
+    plan skip_all => $HASHMAP if $HASHMAP;
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));
     ok !eval {
         $root->mount('m', ['hashmap:ss', 1000, ['hashmap:ss', 16],

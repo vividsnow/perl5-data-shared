@@ -129,3 +129,25 @@ jobs:
           is shared_get($root, '/cache/1'), 42, 'parent root still works';
           done_testing;
           PERL
+
+  longdouble:
+    name: long double NV / codec only
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # No prebuilt flavour carries a wide NV, so this one is compiled. The
+      # manifest codec picks a decimal width that must round trip the perl's
+      # own NV, and every defect in it so far has been representation
+      # dependent; the leaf dists are not needed to exercise it.
+      - run: |
+          curl -fsSL https://www.cpan.org/src/5.0/perl-5.40.2.tar.gz | tar xz
+          cd perl-5.40.2
+          ./Configure -des -Duselongdouble -Dprefix="$HOME/perl-ld"
+          make -j4 && make install
+      # Every module these tests need is core, so nothing is installed here.
+      - run: |
+          export PATH="$HOME/perl-ld/bin:$PATH"
+          perl -MConfig -e 'die "not a wide NV\n" unless $Config{nvsize} > 8;
+              printf "nvtype=%s nvsize=%s\n", $Config{nvtype}, $Config{nvsize}'
+          perl Makefile.PL && make && make test

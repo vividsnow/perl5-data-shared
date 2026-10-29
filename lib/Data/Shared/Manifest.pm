@@ -107,15 +107,21 @@ sub _scalar_snapshot {
         my $copy = $value;              # a copy: stringifying $value would
         my $short = "$copy";            # set POK and change what follows
         if (0 + $short != $value) {
-            # %.0f at the integer bounds, where int() is a no-op; %.17g is the
-            # shortest width that round trips every other finite double.
-            my $decimal = $value == int($value) ? sprintf('%.0f', $value)
-                                                : sprintf('%.17g', $value);
-            # Numified on a copy so $decimal keeps a string's flags: given
-            # numeric ones, one JSON::PP writes digits and another the
-            # exponent form back again.
-            my $check = $decimal;
-            return $decimal if $check + 0 == $value;
+            # %.0f at the integer bounds, where int() is a no-op. Otherwise the
+            # width that round trips this perl's NV: 17 significant digits for a
+            # double, 21 for an 80-bit long double, 36 for __float128. Tried in
+            # order rather than read from Config, because the reparse below is
+            # the only answer that counts.
+            my @widths = $value == int($value) ? (0) : (17, 21, 36);
+            for my $digits (@widths) {
+                my $decimal = $digits ? sprintf('%.*g', $digits, $value)
+                                      : sprintf('%.0f', $value);
+                # Numified on a copy so $decimal keeps a string's flags: given
+                # numeric ones, one JSON::PP writes digits and another the
+                # exponent form back again.
+                my $check = $decimal;
+                return $decimal if $check + 0 == $value;
+            }
         }
     }
     # Which of the two it writes depends on flag history the caller cannot see,
