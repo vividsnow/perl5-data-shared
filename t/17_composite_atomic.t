@@ -20,7 +20,10 @@ sub map_store {
 }
 
 sub hold_lock {
-    my ($path, $mode, $lock, $signal) = @_;
+    # $seconds is passed at every call site rather than defaulted: each caller
+    # then asserts it waited for less than it, and the two numbers belong
+    # together where a flake has to be read.
+    my ($path, $mode, $lock, $signal, $seconds) = @_;
     pipe my $held_r, my $held_w or die $!;
     my $pid = fork;
     plan skip_all => 'cannot fork' unless defined $pid;
@@ -29,7 +32,7 @@ sub hold_lock {
         my $fh;
         my $ok = CORE::open($fh, $mode, $path) && flock $fh, $lock;
         syswrite $held_w, $ok ? $signal : "failed\n";
-        select undef, undef, undef, 1.5;
+        select undef, undef, undef, $seconds;
         POSIX::_exit($ok ? 0 : 1);
     }
     close $held_w;
@@ -488,7 +491,7 @@ subtest 'teardown respects a read-only composite lock' => sub {
     my $lockfile = "$dir/.children/users/.lock";
     chmod 0400, $lockfile or die $!;
 
-    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_EX(), "held\n");
+    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_EX(), "held\n", 1.5);
     is scalar <$held_r>, "held\n", 'a worker holds the read-only lock';
     my $start = Time::HiRes::time();
     $root->unmount('users');
@@ -511,7 +514,7 @@ subtest 'teardown waits for a nested composite lock' => sub {
     my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
     ok $nested, 'the nested composite has its own lock' or plan skip_all => 'no nested lock';
 
-    my ($pid, $held_r) = hold_lock($nested, '+<', Fcntl::LOCK_EX(), "held\n");
+    my ($pid, $held_r) = hold_lock($nested, '+<', Fcntl::LOCK_EX(), "held\n", 1.5);
     is scalar <$held_r>, "held\n", 'a worker holds the nested lock';
     my $start = Time::HiRes::time();
     $root->unmount('atlas');
@@ -539,7 +542,7 @@ subtest 'tearing down a sealed store waits for a nested lock it never cached' =>
     my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
     ok $nested, 'the sealed store has a nested lock' or plan skip_all => 'no nested lock';
 
-    my ($pid, $held_r) = hold_lock($nested, '<', Fcntl::LOCK_EX(), "held\n");
+    my ($pid, $held_r) = hold_lock($nested, '<', Fcntl::LOCK_EX(), "held\n", 1.5);
     is scalar <$held_r>, "held\n", 'a reader holds the nested lock';
 
     my $sealed = Data::Shared->open_sealed($dir);
@@ -619,7 +622,7 @@ subtest 'teardown waits for a shared holder, not only an exclusive one' => sub {
     $root->set('/users/alice/k', 'v');
     my $lockfile = "$dir/.children/users/.lock";
 
-    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_SH(), "shared\n");
+    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_SH(), "shared\n", 1.5);
     is scalar <$held_r>, "shared\n", 'a reader holds it shared';
     my $start = Time::HiRes::time();
     $root->unmount('users');
@@ -639,7 +642,7 @@ subtest 'teardown waits for a composite lock it does not hold' => sub {
     my $lockfile = "$dir/.children/users/.lock";
     ok -e $lockfile, 'the composite has its own lock';
 
-    my ($pid, $held_r) = hold_lock($lockfile, '+<', Fcntl::LOCK_EX(), "held\n");
+    my ($pid, $held_r) = hold_lock($lockfile, '+<', Fcntl::LOCK_EX(), "held\n", 1.5);
     my $ack = <$held_r>;
     is $ack, "held\n", 'a worker holds it';
 

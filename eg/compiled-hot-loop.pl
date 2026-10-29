@@ -18,12 +18,13 @@ for my $name (qw(string compiled)) {
     die "mismatch" unless $v == 5000;
 }
 
+# Both loops written out, not driven through a coderef: this is the one thing
+# the script measures, and a closure call per iteration lands in both numbers.
 my $n = 50_000;
-for my $case (['string', sub { shared_get($root, '/cache/500') }],
-              ['compiled', sub { sharedc_get($root, $cp) }]) {
-    my ($name, $get) = @$case;
-    my $start = time();
-    $get->() for 1 .. $n;
-    printf "%-8s %d gets in %.2fs\n", $name, $n, time() - $start;
-}
+my $start = time();
+shared_get($root, '/cache/500') for 1 .. $n;
+printf "string   %d gets in %.2fs\n", $n, time() - $start;
+$start = time();
+sharedc_get($root, $cp) for 1 .. $n;
+printf "compiled %d gets in %.2fs\n", $n, time() - $start;
 print "see bench/ for stable numbers; \$root->handle('/cache') gives the native handle\n";

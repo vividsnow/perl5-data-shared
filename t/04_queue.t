@@ -4,7 +4,9 @@ use Test::More;
 use Data::Shared qw(shared_push shared_pop shared_call shared_get
                     shared_compile sharedc_push sharedc_get);
 
-sub queue_root {
+# Named for the skip, as t/13's mount_or_skip is: plan skip_all inside a
+# subtest ends it, so this does not return when the backend is missing.
+sub root_or_skip {
     my ($name, @spec) = @_;
     my $root = Data::Shared->new;
     eval { $root->mount($name, @spec) };
@@ -13,7 +15,7 @@ sub queue_root {
 }
 
 subtest 'queue Int' => sub {
-    my $r = queue_root('jobs', 'queue:int', undef, 1024);
+    my $r = root_or_skip('jobs', 'queue:int', undef, 1024);
     shared_push($r, '/jobs', 42);
     shared_push($r, '/jobs', 43);
     is shared_pop($r, '/jobs'), 42, 'fifo 1';
@@ -24,7 +26,7 @@ subtest 'queue Int' => sub {
 };
 
 subtest 'stack Str' => sub {
-    my $r = queue_root('s', 'stack:str', undef, 50, 256);
+    my $r = root_or_skip('s', 'stack:str', undef, 50, 256);
     shared_push($r, '/s', 'hello');
     shared_push($r, '/s', 'world');
     is shared_pop($r, '/s'), 'world', 'lifo 1';
@@ -32,7 +34,7 @@ subtest 'stack Str' => sub {
 };
 
 subtest 'deque Int' => sub {
-    my $r = queue_root('dq', 'deque:int', undef, 100);
+    my $r = root_or_skip('dq', 'deque:int', undef, 100);
     shared_push($r, '/dq', 1);
     shared_push($r, '/dq', 2);
     shared_call($r, '/dq', 'push_front', 0);
@@ -40,7 +42,7 @@ subtest 'deque Int' => sub {
 };
 
 subtest 'heap priority' => sub {
-    my $r = queue_root('tasks', 'heap', undef, 100);
+    my $r = root_or_skip('tasks', 'heap', undef, 100);
     shared_push($r, '/tasks', 3, 300);
     shared_push($r, '/tasks', 1, 100);
     my ($pri, $val) = shared_pop($r, '/tasks');
@@ -49,14 +51,14 @@ subtest 'heap priority' => sub {
 };
 
 subtest 'log append only' => sub {
-    my $r = queue_root('audit', 'log', undef, 100000);
+    my $r = root_or_skip('audit', 'log', undef, 100000);
     shared_push($r, '/audit', 'first');
     is shared_call($r, '/audit', 'entry_count'), 1, 'entry_count';
     ok !eval { shared_pop($r, '/audit'); 1 }, 'log pop croaks';
 };
 
 subtest 'ringbuffer' => sub {
-    my $r = queue_root('ring', 'ringbuffer:int', undef, 100);
+    my $r = root_or_skip('ring', 'ringbuffer:int', undef, 100);
     shared_push($r, '/ring', 42);
     shared_push($r, '/ring', 99);
     is shared_get($r, '/ring'), 99, 'latest via get without index';
@@ -65,7 +67,7 @@ subtest 'ringbuffer' => sub {
 };
 
 subtest 'pubsub publish' => sub {
-    my $r = queue_root('ev', 'pubsub:int', undef, 1024);
+    my $r = root_or_skip('ev', 'pubsub:int', undef, 1024);
     my $sub = shared_call($r, '/ev', 'subscribe');
     shared_push($r, '/ev', 42);
     is $sub->poll, 42, 'subscriber sees published value';
