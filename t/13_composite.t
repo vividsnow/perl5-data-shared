@@ -319,4 +319,43 @@ subtest 'queue child under hashmap' => sub {
     is_deeply [$r->children('/queues')], ['alice'], 'queue child registered';
 };
 
+# One spec serves every child, so a path in it named one file for all of them:
+# two sortedset children shared a file and read each other's members, and a
+# perfecthash child's file landed in the root directory, outside the subtree
+# teardown walks. The families whose options carry a path are the only ones
+# that can say it, and for them the facade derives one per child.
+subtest 'a composite child cannot name its own backing path' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    plan skip_all => 'sortedset:strings unavailable'
+        unless eval { $root->mount('probe', 'sortedset:strings', { max => 8 }); 1 };
+
+    for my $case (['set alone', { max => 8, set => "$dir/s.set" }],
+                  ['keys alone', { max => 8, keys => "$dir/s.keys" }],
+                  ['both', { max => 8, set => "$dir/t.set", keys => "$dir/t.keys" }]) {
+        my ($label, $opt) = @$case;
+        ok !eval { $root->mount("z$label", ['hashmap:ss', 64,
+                       ['sortedset:strings', $opt], { max_children => 4 }]); 1 },
+            "$label is refused in a child spec";
+        like $@, qr/cannot name its own backing path/, "$label says why";
+    }
+
+    ok !eval { $root->mount('nested', ['hashmap:ss', 64,
+                   ['hashmap:ss', 32, ['sortedset:strings', { max => 8, set => "$dir/n.set" }]],
+                   { max_children => 4 }]); 1 },
+        'a grandchild spec is refused too';
+
+    ok eval { $root->mount('fine', ['hashmap:ss', 64, ['sortedset:strings', { max => 8 }],
+                   { max_children => 4 }]); 1 }, 'the derived form still mounts' or diag $@;
+    shared_call($root, '/fine/alice', 'add', 'x', 1);
+    shared_call($root, '/fine/bob', 'add', 'y', 2);
+    is shared_call($root, '/fine/bob', 'score', 'x'), undef,
+        'and each child keeps its own members';
+
+    # A flat mount is one store, so naming its path stays legal.
+    ok eval { $root->mount('flat', 'sortedset:strings',
+                  { max => 8, set => "$dir/f.set", keys => "$dir/f.keys" }); 1 },
+        'a flat mount may still name its path' or diag $@;
+};
+
 done_testing;

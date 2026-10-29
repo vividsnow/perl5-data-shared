@@ -47,6 +47,26 @@ sub _encoder { return $ENCODER ||= JSON::PP->new->allow_nonref(1) }
 
 my $INFINITY = 9**9**9;
 
+# Inf and NaN by value, not by how the encoder spells them: JSON::PP has two
+# code paths and the one selected by PERL_JSON_PP_USE_B quotes a real Inf that
+# has been stringified, which let it through. Any NV may be one: int() on an
+# Inf sets IOK too, so requiring NOK alone let every Inf that had been printed
+# or rounded first past this guard.
+sub _refuse_nonfinite {
+    my ($value, $flags) = @_;
+    my $number = 0 + $value;
+    return unless $number != $number || $number == $INFINITY || $number == -$INFINITY;
+    # The string 'inf' used once in numeric context is not a real Inf, and
+    # before perl 5.40 the two carry identical flags, so the flags cannot tell
+    # them apart -- which refused that string on every perl this dist supports
+    # but the newest. The PV can: a real one spells itself the way perl does,
+    # and a string keeps whatever the caller wrote. Checked only when there is
+    # a PV to read, so a never-stringified Inf is still refused here.
+    Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
+        unless ($flags & B::SVp_POK()) && "$value" ne "$number";
+    return;
+}
+
 # The manifest is a codec, and JSON is total over neither of these. Both the
 # backend constructor and the manifest see what this returns, so a path
 # recorded here is the one the file was created under.
@@ -54,6 +74,10 @@ sub _scalar_snapshot {
     my ($value) = @_;
     return $value unless defined $value;
     if (utf8::is_utf8($value)) {
+        # Before the byte conversion returns: an Inf stringified and then
+        # upgraded is UTF-8, and took that exit without ever being refused.
+        my $wide = B::svref_2object(\$value)->FLAGS;
+        _refuse_nonfinite($value, $wide) if $wide & B::SVp_NOK();
         # Encoded to JSON a lone surrogate, or a codepoint above the Unicode
         # range, produces text JSON::PP cannot parse again: the mount
         # succeeded and every later open croaked on a manifest only hand
@@ -77,25 +101,7 @@ sub _scalar_snapshot {
     # encode. A perfecthash build passes its whole key list through here.
     my $flags = B::svref_2object(\$value)->FLAGS;
     return $value unless $flags & (B::SVp_IOK() | B::SVp_NOK());
-    # Inf and NaN by value, not by how the encoder spells them: JSON::PP has
-    # two code paths and the one selected by PERL_JSON_PP_USE_B quotes a real
-    # Inf that has been stringified, which let it through. Any NV may be one:
-    # int() on an Inf sets IOK too, and requiring NOK alone let every Inf that
-    # had been printed or rounded first past this guard.
-    if ($flags & B::SVp_NOK()) {
-        my $number = 0 + $value;
-        if ($number != $number || $number == $INFINITY || $number == -$INFINITY) {
-            # The string 'inf' used once in numeric context is not a real Inf,
-            # and before perl 5.40 the two carry identical flags, so the flags
-            # cannot tell them apart -- which refused that string on every
-            # perl this dist supports but the newest. The PV can: a real one
-            # spells itself the way perl does, and a string keeps whatever the
-            # caller wrote. Checked only when there is a PV to read, so a
-            # never-stringified Inf is still refused here.
-            Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
-                unless ($flags & B::SVp_POK()) && "$value" ne "$number";
-        }
-    }
+    _refuse_nonfinite($value, $flags) if $flags & B::SVp_NOK();
     # A number with no string half of its own: its spelling is ours to
     # settle, before the encoder is consulted at all. Asked of perl, because
     # which form JSON::PP picks varies by version, by flag history, and -- as

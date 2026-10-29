@@ -134,6 +134,35 @@ sub _validate_node {
             unless defined $node->{$option} && !ref $node->{$option}
                 && $node->{$option} =~ /\A[1-9][0-9]*\z/;   # [0-9], not \d: see Registry
     }
+    _refuse_shared_child_path($node->{child});
+}
+
+# One spec serves every child, so a path written into it names one file for all
+# of them: two children shared a sortedset and read each other's members, and a
+# perfecthash child's file landed in the root directory where teardown sweeps
+# it. The families that take a path in their options are the only ones that can
+# express this; the facade derives a path per child for all of them.
+sub _refuse_shared_child_path {
+    my ($child) = @_;
+    my $args = $child->{args} || [];
+    my $resolved = $child->{resolved};
+    my @named;
+    if (($resolved->{class} // '') eq 'Data::SortedSet::Shared::Strings') {
+        my %opt = @$args == 1 && ref $args->[0] eq 'HASH' ? %{ $args->[0] }
+                : @$args % 2                              ? ()
+                :                                           @$args;
+        @named = grep { defined $opt{$_} } qw(set keys);
+    }
+    elsif ($resolved->{entry} && ($resolved->{entry}{ctor} // '') eq 'handle_only') {
+        @named = 'path' if @$args == 1 && ref $args->[0] eq 'HASH'
+                        && defined $args->[0]{path};
+        @named = 'path' if @$args && defined $args->[0] && !ref $args->[0];
+    }
+    Carp::croak("Data::Shared: a composite child cannot name its own backing path ("
+        . join(', ', @named) . "): one spec serves every child, so they would"
+        . " share one file. Leave it out and the facade derives one per child")
+        if @named;
+    return;
 }
 
 sub new {

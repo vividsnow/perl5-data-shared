@@ -103,6 +103,7 @@ subtest 'an unrepresentable mount argument is refused at mount time' => sub {
 subtest 'a float argument does not fake a stale revision' => sub {
     plan skip_all => 'histogram backend unavailable'
         unless eval { require Data::Histogram::Shared; 1 };
+    plan skip_all => $HASHMAP if $HASHMAP;      # the later mount below needs it
     for my $value (1e15, 1000000000000000, 2**50) {
         my $dir = tempdir(CLEANUP => 1);
         my $root = Data::Shared->new($dir);
@@ -175,6 +176,16 @@ subtest 'only a real Inf or NaN is refused, not a string that looks like one' =>
 # bare number: '123' came back as 123, and one numifying to Inf produced a
 # manifest the reader refuses.
 subtest 'an upgraded string argument is published as a string' => sub {
+    # The byte conversion returns before the nonfinite guard, so upgrading an
+    # argument used to decide whether it was refused: the canonical spelling
+    # was kept here and croaked one branch over. (A real Inf cannot reach this
+    # branch -- utf8::upgrade drops the NV, leaving the string "Inf" and
+    # nothing to tell it from a caller's own.)
+    my $canonical = 'Inf';
+    my $forced = $canonical + 0;
+    utf8::upgrade($canonical);
+    ok !eval { Data::Shared::Manifest::snapshot($canonical); 1 },
+        'an upgraded canonical Inf spelling is refused like the downgraded one';
     for my $text ('123', '1e9999', 'Infinity') {
         my $value = $text;
         my $numified = 0 + $value;

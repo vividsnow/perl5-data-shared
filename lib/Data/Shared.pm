@@ -1384,15 +1384,17 @@ way or via C<shared_call>.
 
 Configuration arrays and hashes are copied before construction. Cycles are
 rejected; a constructor argument JSON has no form for at all -- a code
-reference, a blessed object -- makes the mount transient rather than
-refusing it. Failed mount publication restores the previous namespace and
+reference, or an object that is not a JSON::PP boolean -- makes the mount
+transient rather than refusing it. Failed mount publication restores the previous namespace and
 removes backing paths created by that attempt. Existing files are retained.
 Factories manage their own external side effects. Nested mount mutations
 inside a factory are rejected.
 
 Mount arguments must survive manifest replay, so a value JSON would
 record as something else is refused at mount time instead: C<Inf>,
-C<NaN> and lone surrogates. Strings are recorded as bytes;
+C<NaN> and lone surrogates. A string spelled exactly as perl spells one
+of those is refused with it, since nothing distinguishes the two once a
+number has been stringified. Strings are recorded as bytes;
 character strings are encoded to UTF-8 first, uniformly from U+0080 up: the character
 C<"\x{e9}"> and the single byte C<"\xe9"> are therefore two different
 paths naming two different files.
