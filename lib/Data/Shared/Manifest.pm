@@ -76,12 +76,20 @@ sub _scalar_snapshot {
     # Inf and NaN by value, not by how the encoder spells them: JSON::PP has
     # two code paths and the one selected by PERL_JSON_PP_USE_B quotes a real
     # Inf that has been stringified, which let it through. A float that has
-    # never been an integer is the only shape either can be; a string numified
-    # once carries the integer flag too, so it stays a string.
+    # never been an integer is the only shape either can be.
     if (($flags & (B::SVp_NOK() | B::SVp_IOK())) == B::SVp_NOK()) {
         my $number = 0 + $value;
-        Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
-            if $number != $number || $number == $INFINITY || $number == -$INFINITY;
+        if ($number != $number || $number == $INFINITY || $number == -$INFINITY) {
+            # The string 'inf' used once in numeric context is not a real Inf,
+            # and before perl 5.40 the two carry identical flags, so the flags
+            # cannot tell them apart -- which refused that string on every
+            # perl this dist supports but the newest. The PV can: a real one
+            # spells itself the way perl does, and a string keeps whatever the
+            # caller wrote. Checked only when there is a PV to read, so a
+            # never-stringified Inf is still refused here.
+            Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
+                unless ($flags & B::SVp_POK()) && "$value" ne "$number";
+        }
     }
     # Which of the two it writes depends on flag history the caller cannot see,
     # so ask the encoder rather than the flags: a string used once in numeric

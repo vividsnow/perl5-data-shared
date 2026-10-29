@@ -104,10 +104,25 @@ subtest 'a float argument does not fake a stale revision' => sub {
 # cannot see: a string used once in numeric context carries numeric flags and
 # is still quoted, so a flag test refused a legitimate string argument.
 subtest 'only a real Inf or NaN is refused, not a string that looks like one' => sub {
+    # Before perl 5.40 a string used in numeric context and a real Inf that
+    # has been stringified carry identical flags, so this subtest died on its
+    # first call -- on nine of the ten perls the dist supports -- and reported
+    # itself as "No tests run". The telling apart is by PV now, so the answers
+    # below are the same on every supported perl.
     my $looks_numeric = 'inf';
     my $forced = $looks_numeric + 0;
     my ($kept) = Data::Shared::Manifest::snapshot($looks_numeric);
     is $kept, 'inf', 'a string used numerically is kept as a string';
+    my $lower_nan = 'nan';
+    my $forced_nan = $lower_nan + 0;
+    my ($kept_nan) = Data::Shared::Manifest::snapshot($lower_nan);
+    is $kept_nan, 'nan', 'and so is one that numifies to NaN';
+    # A string spelled the way perl spells it is the one case no flag or PV
+    # can separate from the real thing, so it is refused with it.
+    my $canonical = 'Inf';
+    my $forced_canon = $canonical + 0;
+    ok !eval { Data::Shared::Manifest::snapshot($canonical); 1 },
+        "a string spelled exactly as perl spells Inf is refused with it";
     for my $label ('nan', 'NaN.shm', 'Infinity.shm', '-inf') {
         my ($keep) = Data::Shared::Manifest::snapshot($label);
         is $keep, $label, "the string '$label' is kept";
