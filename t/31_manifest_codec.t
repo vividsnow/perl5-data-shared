@@ -147,6 +147,34 @@ subtest 'a numeric mount argument survives the round trip exactly' => sub {
     }
 };
 
+# Which spelling JSON::PP picks for a number varies by version, by flag
+# history, and by whatever cpanm resolved: on eight of the ten perls this dist
+# supports it quoted a pristine 2**53, and the codec took that as "the encoder
+# says this is a string" and handed the float back unchanged, two digits short.
+# A pristine number's spelling must be settled before the encoder is asked
+# anything, so this stands in an encoder that quotes everything.
+subtest 'an exact integer survives an encoder that quotes every number' => sub {
+    my $quoting = do {
+        package Data::Shared::Test::QuotingEncoder;
+        sub new { bless {}, shift }
+        sub encode { my (undef, $v) = @_; return qq{"$v"} }
+        __PACKAGE__->new;
+    };
+    my $real = \&Data::Shared::Manifest::_encoder;
+    my ($stored, $pristine);
+    {
+        no warnings 'redefine';
+        local *Data::Shared::Manifest::_encoder = sub { $quoting };
+        ($stored)  = Data::Shared::Manifest::snapshot(2**53);
+        ($pristine) = Data::Shared::Manifest::snapshot(1e300);
+    }
+    my $json = JSON::PP->new->canonical(1)->ascii(1)->encode([$stored]);
+    cmp_ok(JSON::PP->new->decode($json)->[0], '==', 2**53,
+        '2**53 round trips even when the encoder quotes numbers');
+    cmp_ok($pristine, '==', 1e300, 'and a value its own spelling survives is untouched');
+    is ref(\&Data::Shared::Manifest::_encoder), ref($real), 'the real encoder is restored';
+};
+
 # \d matches non-ASCII digits, which numify to a prefix of the value.
 subtest 'a non-ASCII digit is not a composite option' => sub {
     my $root = Data::Shared->new(tempdir(CLEANUP => 1));

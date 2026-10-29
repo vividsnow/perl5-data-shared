@@ -91,6 +91,24 @@ sub _scalar_snapshot {
                 unless ($flags & B::SVp_POK()) && "$value" ne "$number";
         }
     }
+    # A whole number with no string half of its own: its spelling is ours to
+    # settle, before the encoder is consulted at all. Asked of perl, because
+    # which form JSON::PP picks varies by version, by flag history, and -- as
+    # four attempts at this established -- by whatever cpanm resolved that
+    # day. perl's own spelling carries NV_DIG significant digits, so 2**53
+    # comes back two short of what the store was built with.
+    if (!($flags & B::SVp_POK()) && $value == int($value)) {
+        my $copy = $value;              # a copy: stringifying $value would
+        my $short = "$copy";            # set POK and change what follows
+        if (0 + $short != $value) {
+            my $decimal = sprintf '%.0f', $value;   # not int(), a no-op at the bounds
+            # Numified on a copy so $decimal keeps a string's flags: given
+            # numeric ones, one JSON::PP writes digits and another the
+            # exponent form back again.
+            my $check = $decimal;
+            return $decimal if $check + 0 == $value;
+        }
+    }
     # Which of the two it writes depends on flag history the caller cannot see,
     # so ask the encoder rather than the flags: a string used once in numeric
     # context carries numeric flags and is still quoted.
@@ -101,29 +119,6 @@ sub _scalar_snapshot {
     # kills the store at the next topology change.
     Carp::croak("Data::Shared: '$value' is not a serializable mount argument")
         if $written =~ /\A-?(?:inf|nan)/i;
-    # A whole number that arrived as a float is written the way perl spells
-    # it, and that spelling carries NV_DIG significant digits -- so 2**53 came
-    # back two short of what the store was built with. Asked of perl, not of
-    # the encoder: which of the two forms JSON::PP picks turned out to vary by
-    # its version AND by whether anything had stringified the scalar first, so
-    # three releases disagreed about 2**53 and the test for it could not be
-    # written in terms of either.
-    if ($value == int($value)) {
-        my $copy = $value;              # a copy: stringifying $value would
-        my $short = "$copy";            # set POK and change what JSON::PP does
-        return $value if 0 + $short == $value;
-        # perl's own spelling loses digits here, so publish the digits as a
-        # string. Exact in every JSON::PP on every perl, and the backend
-        # numifies it to the value that was passed.
-        # Decimal spelling, not int(), which is a no-op at the integer bounds.
-        my $decimal = sprintf '%.0f', $value;
-        # Numified on a copy, so $decimal keeps a string's flags and nothing
-        # downstream can choose to write it as a number again: given numeric
-        # flags, one JSON::PP spells it in digits and an older one back in
-        # exponent form, which is the loss this branch exists to avoid.
-        my $check = $decimal;
-        return $decimal if $check + 0 == $value;
-    }
     return $value;
 }
 
