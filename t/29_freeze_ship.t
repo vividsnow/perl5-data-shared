@@ -231,4 +231,44 @@ subtest 'the freezability split the POD publishes is the one the registry has' =
         'and the list it prints is exactly the registry blockers';
 };
 
+# One flag used to mean both "a sealed file is tolerated here" and "keep this
+# walk's children out of the cache". open_sealed sets the first on the root for
+# good, so it got the second too: the documented way to read a shipped store
+# reopened the child on every access, took the composite's exclusive lock each
+# time, and handed back a different object from handle() every call.
+subtest 'a sealed root caches its children, and a walk still does not' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $maker = Data::Shared->new($dir);
+        eval { $maker->mount('u', ['hashmap:ss', 128, ['hashmap:ii', 16],
+                                   { cache_size => 2 }]); 1 }
+            or plan skip_all => "composite unavailable: $@";
+        $maker->set("/u/c$_/5", $_) for 1 .. 10;
+        $maker->get('/u/c9/5');
+        my $cache = $maker->{mounts}{u}{composite}{cache};
+        is scalar keys %$cache, 2, 'the cache holds what cache_size allows';
+        $maker->sync_all;
+        is scalar keys %$cache, 2, 'a sync_all walk over all ten does not fill it';
+        $maker->freeze_all or plan skip_all => 'nothing could be sealed';
+        is scalar keys %$cache, 2, 'nor does a freeze_all walk';
+    }
+
+    my $sealed = Data::Shared->open_sealed($dir);
+    my $opens = 0;
+    my $orig = \&Data::Shared::Composite::_open_child;
+    no warnings 'redefine';
+    local *Data::Shared::Composite::_open_child = sub { $opens++; $orig->(@_) };
+
+    is Data::Shared::shared_get($sealed, '/u/c1/5'), 1, 'a sealed read works';
+    my $cold = $opens;
+    Data::Shared::shared_get($sealed, '/u/c1/5') for 1 .. 5;
+    is $opens, $cold, 'and five more reads of that child reopen nothing';
+    my @h = map { $sealed->handle('/u/c1') } 1 .. 3;
+    is scalar(keys %{ { map { ($_ . '') => 1 } @h } }), 1,
+        'handle() hands back one object, as the hot-loop advice promises';
+    is scalar keys %{ $sealed->{mounts}{u}{composite}{cache} }, 1,
+        'because the sealed root caches like any other';
+    ok $sealed->unlink_all >= 1, 'and teardown still reclaims it';
+};
+
 done_testing;

@@ -36,6 +36,22 @@ sub _assert_index {
 my $ADD_KEY = sub { my ($h, $k, $v) = @_; return $h->add($k) };
 my $ESTIMATE_EXISTS = sub { my ($h, $k) = @_; return $h->estimate($k) > 0 ? 1 : 0 };
 
+# For an indexed family that exposes no capacity to compare against. The bound
+# is the backend's own node-index ceiling, which it reports by croaking past
+# it: without this, exists croaked for a negative index (numified into the
+# unsigned range) and for anything above the ceiling, where the promise is 1 or
+# 0 for any index, one outside the structure included.
+my $GRAPH_INDEX_MAX = 0xFFFFFFFF;
+sub _nonneg_exists {
+    my ($method) = @_;
+    return sub {
+        my ($h, $idx) = @_;
+        return 0 unless _index_shape_ok($idx);
+        return 0 if $idx < 0 || $idx > $GRAPH_INDEX_MAX;
+        return $h->$method($idx) ? 1 : 0;
+    };
+}
+
 sub _capacity_exists {
     return sub {
         my ($h, $idx) = @_;
@@ -179,7 +195,8 @@ our %REGISTRY = (
         # has_node is an honest exists, and get croaks on a node that is not
         # there, so without it a caller had no probe that answers rather than
         # dying.
-        verbs => { get => 'node_data', delete => 'remove_node', exists => 'has_node' },
+        verbs => { get => 'node_data', delete => 'remove_node',
+                   exists => _nonneg_exists('has_node') },
     },
     hashmap => {
         key => 'hashmap', dist => 'Data-HashMap-Shared',

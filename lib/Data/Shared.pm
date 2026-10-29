@@ -888,7 +888,7 @@ sub _recipe {
     } else {
         my $plan = Data::Shared::Storage::plan($self, $recipe->{resolved}, $name, $recipe->{args});
         Data::Shared::Storage::require_files($plan) if $self->{_opening};
-        Data::Shared::Storage::check_readonly($recipe->{resolved}) if $self->{strict_readonly};
+        Data::Shared::Storage::check_readonly($recipe->{resolved}, $name) if $self->{strict_readonly};
         $recipe->{storage_paths} = $plan->{paths};
     }
     return $recipe;
@@ -1247,7 +1247,10 @@ sub sync_all {
 sub freeze_all {
     my ($self) = @_;
     Carp::croak("Data::Shared: cannot freeze a read-only root") if $self->{readonly};
-    return Data::Shared::Manifest::with_lock($self, 0, sub {
+    # Exclusive: a shared lock let two producers each check a handle unfrozen
+    # and then both seal it, and the shared mode was only ever needed for a
+    # read-only root, which the line above has already refused.
+    return Data::Shared::Manifest::with_lock($self, 1, sub {
         $self->_assert_revision;
         my $n = 0;
         # Insertion order, not hash order: a croak part-way through leaves the

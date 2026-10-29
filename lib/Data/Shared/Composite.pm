@@ -441,7 +441,7 @@ sub _with_lock {
             # every other process sharing an anonymous root, in a futex wait no
             # Perl signal handler can break. RWLock recovers a dead owner's
             # lock. Write-locked throughout; _locked already guards re-entry.
-            Data::Shared::_require_class('Data::Sync::Shared::RWLock');
+            Data::Shared::_require_class('Data::Sync::Shared::RWLock', 'Data-Sync-Shared');
             $self->{lock_handle} = Data::Sync::Shared::RWLock->new(undef);
         }
         $self->{lock_handle}->wrlock;
@@ -731,8 +731,9 @@ sub _open_child {
     # sealed file refuses the writable constructor: a read through the sealing
     # root croaked for every child that had fallen out of the cache, and which
     # ones those were depended on the cache's state when freeze_all ran.
-    # Separate from frozen_ok, which also keeps a walk's transient instances
-    # out of the cache.
+    # Separate from frozen_ok, which says only that a sealed file is tolerated
+    # here; _walking is what keeps a whole-subtree walk's instances out of the
+    # cache.
     my %mode = (opening => $opening, strict_readonly => $self->{strict_readonly},
         pending_paths => $pending, cleanup => $cleanup, frozen_ok => $self->{_frozen_ok},
         # A child is reached from a read, so opening one is never the moment to
@@ -751,7 +752,12 @@ sub _open_child {
             || { key => $node->{resolved}{class}, dist => 'unknown', path_class => 'map', verbs => {} }, dt => {} };
         $rt = { kind => 'leaf', record => $record, handle => $handle, addr => $addr };
     }
-    return $rt if $cleanup || $self->{_frozen_ok};
+    # _walking, not _frozen_ok: the two were one flag, and open_sealed sets
+    # frozen_ok on the root for its whole life -- so the documented way to read
+    # a shipped store cached nothing, reopened the child on every access, took
+    # the composite's exclusive lock each time, and handed back a different
+    # object from handle() on every call.
+    return $rt if $cleanup || $self->{_walking};
     $self->{cache}{$id} = $rt;
     $self->_touch($id);
     $self->_evict;
@@ -1180,8 +1186,11 @@ sub sync {
     # ones: a child evicted from the cache was silently never flushed, so
     # sync_all did not mean what it says for a composite with more children
     # than its cache. A frozen child has nothing dirty but must stay
-    # reachable, hence the tolerant open.
+    # reachable, hence the tolerant open. _walking keeps the children this
+    # reaches for out of the cache, so a walk over more children than the
+    # cache holds does not evict what a caller is using.
     local $self->{_frozen_ok} = 1;
+    local $self->{_walking} = 1;
     my $root = $self->{root_weak};
     if (defined $self->{dir}) {
         # One at a time: holding every child open at once would run a large
@@ -1235,6 +1244,7 @@ sub freeze {
         # frozen. Without this the walk croaked on it and the store could end
         # up frozen in part: readable neither writably nor read-only.
         local $self->{_frozen_ok} = 1;
+        local $self->{_walking} = 1;
         for my $addr ($self->children_at(undef, [])) {
             my $rt = $self->_existing_child($root, $addr) or next;
             if ($rt->{kind} eq 'composite') { $n += $rt->{comp}->freeze }

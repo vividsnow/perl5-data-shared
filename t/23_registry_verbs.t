@@ -53,6 +53,22 @@ subtest 'exists is bounded for every integer leaf' => sub {
     # them. A partial install is ordinary with 39 separate dists.
     plan skip_all => 'no integer leaf available' unless $tested;
 };
+
+# graph was the one indexed family left out of that sweep, because it exposes
+# no capacity to bound against: has_node numified a negative index into the
+# unsigned range and croaked, and croaked again above its own node ceiling.
+subtest 'exists is bounded for graph too, which has no capacity to read' => sub {
+    my $r = Data::Shared->new;
+    mounted($r, 'g', 'graph', undef, 16, 16)
+        or plan skip_all => 'graph unavailable';
+    for my $idx (-1, 0, 3, 4294967295, 4294967296, 99999999999999) {
+        my $got = eval { shared_exists($r, "/g/$idx") };
+        ok !$@, "exists($idx) does not croak" or diag $@;
+        ok defined $got && ($got eq '1' || $got eq '0'), "exists($idx) is 1 or 0";
+    }
+    my $id = shared_call($r, '/g', 'add_node', 7);
+    is shared_exists($r, "/g/$id"), 1, 'and still answers 1 for a node that is there';
+};
 # Four indexed leaves guarded their index and three did not, so a non-ASCII
 # digit numified to 0 and the write landed on the wrong cell with only a
 # warning. Same class as the bitset/pool exists fix, one entry over.

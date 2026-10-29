@@ -121,11 +121,15 @@ sub _load {
 }
 
 sub check_readonly {
-    my ($resolved) = @_;
+    my ($resolved, $name) = @_;
     my $class = $resolved->{class};
     _load($resolved);
     return if $resolved->{entry} && $resolved->{entry}{immutable};
-    Carp::croak("Data::Shared: strict read-only access is not supported by $class")
+    # The mount as well as the class, where the caller knows it: the Cookbook
+    # sends a producer to this croak to find which mount blocks a shipped
+    # store, and a class name does not say which mount that was.
+    Carp::croak("Data::Shared: strict read-only access is not supported by $class"
+        . (defined $name && length $name ? " at mount '$name'" : ''))
         unless $class->can('new_readonly');
     return;
 }
@@ -137,7 +141,7 @@ sub construct {
     my $ctor = $resolved->{ctor} || 'new';
     my $opening = $root->{_opening} || $root->{readonly};
     require_files($plan) if $opening;
-    check_readonly($resolved) if $root->{strict_readonly};
+    check_readonly($resolved, $plan->{name}) if $root->{strict_readonly};
     _load($resolved);
     my $handle;
     if ($plan->{kind} eq 'perfecthash') {
