@@ -113,7 +113,13 @@ subtest 'sortedset incr requires a delta' => sub {
         is scalar @warnings, 0, "$spec: without warning its way through"
             or diag join '', @warnings;
         is shared_get($r, "/s/$member"), 10, "$spec: and the score is untouched";
-        ok !shared_exists($r, '/s/ghost'), "$spec: a refused incr leaves no member";
+        # On an ABSENT member, which is where the ghost came from. Asking after
+        # an address the test never touched proved nothing: the refused incr
+        # above was aimed at a member that already existed.
+        my $ghost = $spec eq 'sortedset' ? 99 : 'ghost';
+        ok !eval { shared_incr($r, "/s/$ghost"); 1 },
+            "$spec: a bare incr on an absent member is refused too";
+        ok !shared_exists($r, "/s/$ghost"), "$spec: a refused incr leaves no member";
         ok eval { shared_incr($r, "/s/$member", 5); 1 }, "$spec: a delta still works" or diag $@;
         is shared_get($r, "/s/$member"), 15, "$spec: and applies it";
     }

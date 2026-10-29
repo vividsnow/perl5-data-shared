@@ -213,12 +213,20 @@ subtest 'the freezability split the POD publishes is the one the registry has' =
         open my $fh, '<', $INC{'Data/Shared.pm'} or die $!;
         local $/; <$fh>;
     };
-    like $pod, qr/only 21 of the 39 families can be\s*\nsealed/, 'the POD says 21';
-    like $pod, qr/any of the other 17/, 'and 17';
-    for my $key (@{ $by{neither} }) {
-        next if $key =~ /timingwheel/;      # written as "the timing wheels"
-        like $pod, qr/C<\Q$key\E>/, "the POD names $key as a blocker";
-    }
+    # Matched against the blocker list itself, not the whole document: every
+    # one of these family names appears elsewhere in the POD, so searching the
+    # document passed with a family deleted from the list -- which is the one
+    # thing this subtest exists to catch.
+    my ($sealable, $total) = $pod =~ /only ([0-9]+) of the ([0-9]+) families can be/;
+    is $sealable, scalar @{ $by{sealable} }, 'the POD states how many can be sealed';
+    is $total, scalar keys %$registry, 'out of the right total';
+    my ($stated, $list) = $pod =~ /any of the other ([0-9]+)\s*\n\s*\((.*?)\)/s;
+    is $stated, scalar @{ $by{neither} }, 'and how many block the predicate';
+    my @named = $list ? $list =~ /C<([^>]+)>/g : ();
+    push @named, grep { /timingwheel/ } @{ $by{neither} }     # "the timing wheels"
+        if $list && $list =~ /the timing wheels/;
+    is_deeply [sort @named], [sort @{ $by{neither} }],
+        'and the list it prints is exactly the registry blockers';
 };
 
 done_testing;

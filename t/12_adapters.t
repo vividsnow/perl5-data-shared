@@ -104,7 +104,9 @@ for my $a (qw(Map Set Indexed Queue Sketch Sync)) {
     is(Data::Shared::Adapter::Queue->perform_push($h, $entry, [], 44), 1, 'queue perform_push');
     is(Data::Shared::Adapter::Queue->perform_pop($h, $entry, []), 44, 'queue perform_pop');
     my $no_push = { key => 'mock', verbs => {} };
-    ok !$no_push->{push} && !Data::Shared::Adapter::Queue->make_push($h, $no_push), 'queue no push undef';
+    # is(), not ok(!...), as the sync case two lines down already does: the
+    # negated form passed just as well for a 0, which is not what it says.
+    is(Data::Shared::Adapter::Queue->make_push($h, $no_push), undef, 'queue no push undef');
     ok !eval { Data::Shared::Adapter::Queue->perform_push($h, $no_push, [], 1); 1 }, 'queue perform_push croaks';
     ok !eval { Data::Shared::Adapter::Map->perform_push($h, $map_entry, [], 1); 1 }, 'map perform_push croaks';
     ok !eval { Data::Shared::Adapter::Sync->perform_pop($h, $map_entry, []); 1 }, 'sync perform_pop croaks';

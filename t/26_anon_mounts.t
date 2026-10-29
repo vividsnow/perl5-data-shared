@@ -17,9 +17,23 @@ ok $mounted, 'buffer mounts on an anonymous root' or diag $@;
 shared_set($root, '/b/0', 42);
 is shared_get($root, '/b/0'), 42, 'and round-trips';
 
-# A class without new_anon must still surface its own error, not a fallback one.
+# A class without new_anon must still surface its own error, not a fallback
+# one. This used to be asked of perfecthash, whose spec form is validated
+# before any constructor runs, so it passed on an unrelated croak and would
+# have passed with the fallback deleted. Every installed backend mounts
+# anonymously, natively or through new_anon, so the case needs a stand-in.
+# The fallback is tried second and the FIRST error is the one that must reach
+# the caller, so the stand-in fails both ways and the test names which error it
+# got.
+{
+    package Data::Shared::Test::NoAnon;
+    sub new      { die "NoAnon needs a file\n" }
+    sub new_anon { die "NoAnon has no anonymous form\n" }
+}
+$INC{'Data/Shared/Test/NoAnon.pm'} = 1;
 my $other = Data::Shared->new;
-ok !eval { $other->mount('p', 'perfecthash', undef); 1 },
-    'a backend with no anonymous form still errors';
+ok !eval { $other->mount('p', 'Data::Shared::Test::NoAnon', undef, 8); 1 },
+    'a backend with no working anonymous form still errors';
+like $@, qr/NoAnon needs a file/, "with the constructor's own error, not the fallback's";
 
 done_testing;
