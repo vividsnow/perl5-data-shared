@@ -1,5 +1,4 @@
 .github/workflows/ci.yml
-.gitignore
 bench/benchmark.pl
 bench/composite.pl
 bench/mounts.pl
@@ -19,6 +18,7 @@ eg/sets-and-filters.pl
 eg/sketches.pl
 eg/string-zset.pl
 eg/sync-and-timers.pl
+LICENSE
 lib/Data/Shared.pm
 lib/Data/Shared/Adapter/Indexed.pm
 lib/Data/Shared/Adapter/Map.pm

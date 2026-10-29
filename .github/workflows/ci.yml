@@ -18,7 +18,7 @@ jobs:
         with:
           perl-version: ${{ matrix.perl }}
       # Backends are recommends, so every job that wants them asks explicitly.
-      # Only test-alpine installs core deps alone, deliberately.
+      # test-no-backends and test-alpine install required deps alone.
       - run: cpanm -n --with-recommends --installdeps .
       - run: perl Makefile.PL
       # This row installs every leaf, so make it prove all 39 ran rather than
@@ -31,7 +31,8 @@ jobs:
   # platform the rest of the matrix uses. test-alpine covers the same contract
   # on musl, but it is a container job whose runner-injected node is a known
   # failure mode there, and this contract is too load-bearing to be covered
-  # only by the job most likely not to start. 268 of the 483 tests run here.
+  # only by the job most likely not to start. This row exercises the default
+  # install without recommended backends.
   test-no-backends:
     runs-on: ubuntu-latest
     name: no backends (default install)
@@ -84,5 +85,47 @@ jobs:
           perl-version: '5.40'
       - run: cpanm -n Test::Kwalitee Test::Pod Test::Pod::Coverage
       - run: cpanm -n --with-recommends --installdeps .
-      - run: perl Makefile.PL && make
-      - run: AUTHOR_TESTING=1 prove -Ilib xt/
+      - run: perl Makefile.PL && make && make distdir
+      # Validate the files and META that ship, from the release directory.
+      - run: |
+          cd Data-Shared-*/
+          AUTHOR_TESTING=1 prove -Ilib xt/
+
+  test-threads:
+    runs-on: ubuntu-latest
+    name: ithreads / Perl 5.40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+          multi-thread: 'true'
+      # The facade has no XS: exercise backends built for the threaded Perl.
+      - run: cpanm -n --with-recommends --installdeps .
+      - run: perl Makefile.PL && make test
+        env:
+          DS_ALL_BACKENDS: 1
+      - name: roots are skipped when cloning an ithread
+        run: |
+          perl -Mblib <<'PERL'
+          use strict;
+          use warnings;
+          use threads;
+          use Test::More;
+          use File::Temp qw(tempdir);
+          use Scalar::Util qw(blessed);
+          use Data::Shared qw(shared_get shared_set);
+
+          my $dir = tempdir(CLEANUP => 1);
+          my $root = Data::Shared->new($dir);
+          $root->mount('cache', 'hashmap:ii', undef, 16);
+          shared_set($root, '/cache/1', 42);
+          my $result = threads->create(sub {
+              my $own = Data::Shared->open($dir);
+              return { class => blessed($root), value => shared_get($own, '/cache/1') };
+          })->join;
+          ok !defined($result->{class}), 'parent root is not cloned into the thread';
+          is $result->{value}, 42, 'thread can open its own root and backend';
+          is shared_get($root, '/cache/1'), 42, 'parent root still works';
+          done_testing;
+          PERL

@@ -1,66 +1,17 @@
-Data::Shared lifecycle/bookkeeping benchmark, 2026-10-17
-Perl 5.40.2, x86_64 Linux, HashMap 0.23, one sample per implementation.
-Baseline: source immediately before persistence/lifecycle hardening.
-Revised: locked lifecycle, validated reopen, shared counts, constant-time LRU,
-and root-owned compiled dispatch. Backend files use the same formats.
+Data::Shared scaling benchmark notes
 
-Command: perl bench/scaling.pl
-Defaults: creation sizes 100,1000,3000; working set 128; iterations 2000;
-workers 4. A copy of the same script ran against the saved baseline source.
+Command for a fresh measurement against the installed backends:
+  perl bench/scaling.pl
 
-Baseline
+Controls: DS_BENCH_SIZES, DS_BENCH_WORKING_SET, DS_BENCH_ITERATIONS,
+DS_BENCH_WORKERS.
 
-Perl v5.40.2; wall time and process CPU time; RSS includes the Perl interpreter and allocator history
-Creation scaling (anonymous children; cache_size permits every child in both implementations)
-   100 children  wall=  0.011 s CPU=  0.010 s    113.3 wall us/child RSS=16856 KiB
-  1000 children  wall=  0.144 s CPU=  0.140 s    144.0 wall us/child RSS=37560 KiB
-  3000 children  wall=  1.180 s CPU=  1.180 s    393.2 wall us/child RSS=83616 KiB
+The historical 2026-10-17 baseline/revised tables and derived comparisons
+have been removed. The baseline required a saved pre-hardening source tree
+that is not in this distribution, and neither sample identified an exact
+source revision. Running the shipped script cannot reproduce that comparison.
 
-Working set: 128 file-backed children, 2000 cycling compiled reads
-cache=   1 wall= 0.071 s CPU= 0.070 s p50=  34.09 p95=  44.11 p99=  59.84 wall us RSS=23508 KiB
-cache=  32 wall= 0.079 s CPU= 0.080 s p50=  37.91 p95=  56.03 p99=  63.18 wall us RSS=24260 KiB
-cache= 128 wall= 0.039 s CPU= 0.040 s p50=  18.12 p95=  25.03 p99=  30.99 wall us RSS=26052 KiB
-
-Contention: 4 processes, 2000 increments each, one shared child counter
-8000 operations wall=0.024 s worker CPU=0.050 s 329543 op/s p50=8.11 p95=12.87 p99=15.97 wall us
-worker RSS KiB: 20148, 20140, 20144, 20116
-
-Revised
-
-Perl v5.40.2; wall time and process CPU time; RSS includes the Perl interpreter and allocator history
-Creation scaling (anonymous children; cache_size=child_count)
-   100 children  wall=  0.006 s CPU=  0.000 s     57.3 wall us/child RSS=17736 KiB
-  1000 children  wall=  0.064 s CPU=  0.060 s     64.4 wall us/child RSS=38244 KiB
-  3000 children  wall=  0.186 s CPU=  0.190 s     62.2 wall us/child RSS=83796 KiB
-
-Working set: 128 file-backed children, 2000 cycling compiled reads
-cache=   1 wall= 0.097 s CPU= 0.100 s p50=  45.06 p95=  60.08 p99=  75.10 wall us RSS=23644 KiB
-cache=  32 wall= 0.103 s CPU= 0.100 s p50=  46.97 p95=  64.13 p99= 128.98 wall us RSS=24404 KiB
-cache= 128 wall= 0.015 s CPU= 0.020 s p50=   6.91 p95=  13.11 p99=  15.97 wall us RSS=26196 KiB
-
-Contention: 4 processes, 2000 increments each, one shared child counter
-8000 operations wall=0.023 s worker CPU=0.050 s 351076 op/s p50=8.11 p95=11.92 p99=15.97 wall us
-worker RSS KiB: 20820, 20820, 20820, 20820
-
-Interpretation:
-- Creation of 3000 anonymous children fell from 1.180 s to 0.186 s in these
-  samples, about 6.3x faster. Revised cost was about 57-64 wall us per child
-  across the sampled sizes. Tests also verify that ordinary creation does
-  not enumerate the registry. Anonymous children remain retained in memory.
-- With the entire 128-child working set resident, revised median read latency
-  was 6.91 us versus 18.12 us in the baseline. LRU updates are now constant
-  time. RSS was similar in these samples; the structural improvement does
-  not claim to reduce the native segment memory per child.
-- With cache_size=1, median reopening latency increased from 34.09 us to
-  45.06 us. Reopening now takes the lifecycle lock and validates required
-  files. This is a measured correctness/performance tradeoff.
-- Four writers completed all 8000 increments without lost updates. Aggregate
-  throughput was about 0.33-0.35 million operations/s in both samples. The
-  lifecycle changes preserve ordinary leaf-operation concurrency.
-- The working-set experiment has warm filesystem pages. Percentiles include
-  instrumentation and scheduling and are not production latency guarantees.
-- RSS includes the interpreter and allocator history. Creation samples are
-  sequential, and the contention samples are brief. Repeat and increase
-  DS_BENCH_ITERATIONS for workload-specific conclusions.
-- Environment controls: DS_BENCH_SIZES, DS_BENCH_WORKING_SET,
-  DS_BENCH_ITERATIONS, and DS_BENCH_WORKERS.
+Record the source revision, Perl/backend versions, commands and environment
+with new output. Working-set timings use warm filesystem pages and include
+instrumentation and scheduling. RSS includes the interpreter and allocator
+history. Repeat measurements on an idle host for workload-specific conclusions.

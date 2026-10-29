@@ -1,95 +1,21 @@
-Data::Shared benchmark, 2026-10-17, after review revisions
-Historical flat-dispatch sample from the initial review. See scaling-results.txt
-for the subsequent lifecycle/bookkeeping comparison.
-Single sample on a shared x86_64 Linux host; expect substantial variance.
-Perl 5.40.2; HashMap 0.23; Queue::Int 0.10; NDArray 0.06; HyperLogLog 0.06.
+Data::Shared benchmark notes
 
-Commands:
+Recorded dispatch measurements and their environment are documented in the
+PERFORMANCE section of Data::Shared (perldoc Data::Shared).
+
+Commands for fresh measurements against the installed backends:
   DS_BENCH_TIME=2 perl bench/benchmark.pl
   DS_BENCH_TIME=2 perl bench/overhead.pl
   DS_BENCH_TIME=1 perl bench/composite.pl
+  perl bench/mounts.pl
 
-Rates use measured CPU time. DS_BENCH_TIME is a minimum per case.
+The historical 2026-10-17 samples have been removed. They predated the
+released implementation, their exact source revision was not recorded, and
+the dispatch table duplicated the POD with different results. The notes
+also mixed samples and denominator corrections without complete provenance.
 
-Flat operations
+Run on an idle host and record the source revision, Perl/backend versions,
+commands and environment with the output. CPU throughput and warm-cache
+composite timings do not describe cold-storage latency or crash durability.
 
-Data::Shared facade overhead (higher is better; native = leaf called directly)
-Each group runs for 2s per case. Indicative only; see results.txt.
-
-== HashMap::II get ==
-              Rate   string    array     call compiled   native
-string    198582/s       --     -14%     -28%     -63%     -97%
-array     231670/s      17%       --     -16%     -57%     -96%
-call      276451/s      39%      19%       --     -48%     -96%
-compiled  536312/s     170%     131%      94%       --     -91%
-native   6220180/s    3032%    2585%    2150%    1060%       --
-
-== HashMap::II set ==
-              Rate   string compiled   native
-string    157894/s       --     -68%     -97%
-compiled  497244/s     215%       --     -92%
-native   6302145/s    3891%    1167%       --
-
-== Queue::Int push+pop ==
-              Rate   string compiled   native
-string    109966/s       --     -53%     -95%
-compiled  231746/s     111%       --     -90%
-native   2360645/s    2047%     919%       --
-
-== HyperLogLog add / count via shared_call ==
-            Rate   call native
-call    243425/s     --   -95%
-native 5166993/s  2023%     --
-
-== NDArray get [0,1] ==
-              Rate   string compiled   native
-string    172945/s       --     -63%     -95%
-compiled  462360/s     167%       --     -87%
-native   3697488/s    2038%     700%       --
-
-Dispatch overhead
-
-native           11218310/s    0.09 us/op
-perl closure      8262252/s    0.12 us/op
-string             347247/s    2.88 us/op
-array              431426/s    2.32 us/op
-compiled           971667/s    1.03 us/op
-call               425143/s    2.35 us/op
-sanity: 5000
-
-Composite operations
-
-Composite reads: 64 children, file cache_size=1, at least 1s CPU per case
-anonymous  native                8119504/s     0.12 us/op
-anonymous  string warm            132782/s     7.53 us/op
-anonymous  compiled warm          167020/s     5.99 us/op
-anonymous  compiled cycling       163141/s     6.13 us/op
-file       native                7915203/s     0.13 us/op
-file       string warm            123675/s     8.09 us/op
-file       compiled warm          159288/s     6.28 us/op
-file       compiled cycling        26912/s    37.16 us/op
-
-Notes:
-- The dispatch table above predates the shipped compiled binding, so its
-  compiled row no longer describes this code; do not compare against it. The
-  ratios below were re-measured against the current code on an idle host
-  (loadavg 0.13).
-  Flat compiled HashMap gets were 4.7x the string rate in both the comparison
-  benchmark and the overhead run. Direct native gets were about 7.3x the
-  compiled rate. Results from separate groups are not directly comparable;
-  host load and CPU frequency varied substantially.
-- Warm composite reads cost about 6 us CPU/op. Cycling through 64 file-backed
-  children with cache_size=1 cost about 37 us CPU/op, mostly from reopening
-  child handles and mappings. The filesystem page cache was warm; this is
-  not a cold-storage latency measurement.
-- Anonymous composite cycling preserves all child data after the fix.
-  Those children stay open, since anonymous segments cannot be reopened.
-- These are single-process CPU throughput measurements. They do not measure
-  contention, tail latency, resident memory, or crash durability.
-- bench/overhead.pl now divides countit iterations by measured cpu_p,
-  rather than the requested minimum duration. Older overhead-table rates
-  used that incorrect denominator and should not be used for comparisons.
-- A redundant closure was removed from compiled queue push/pop. No general
-  before/after speedup is claimed: shared-host variance was too large.
-- Prefer native handles and backend batch methods in the innermost loops.
-  Profile a real workload before adding an XS facade dispatcher.
+See bench/scaling.pl for creation, RSS, working-set and contention experiments.

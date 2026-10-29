@@ -48,6 +48,8 @@ WriteMakefile(
         # structures they mount instead of compiling all 39. Use
         # `cpanm --with-recommends` to get the lot.
         prereqs => { runtime => { recommends => \%backends } },
+        # MakeMaker already excludes t and inc; extend that list.
+        no_index => { directory => [qw(xt eg bench)] },
         resources   => {
             repository => {
                 type => 'git',
