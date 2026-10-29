@@ -2,6 +2,7 @@ package Data::Shared::Adapter::Indexed;
 use strict;
 use warnings;
 use Carp ();
+use Data::Shared::Registry ();      # the argument guards live there
 
 our $VERSION = '0.01';
 
@@ -40,6 +41,7 @@ sub make_verb {
     if ($verb eq 'set' || $verb eq 'incr') {
         return sub {
             my ($rest, @a) = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a) if $verb eq 'incr';
             _check_indices($entry, $rest, $verb);
             return $handle->$method(@$rest, @a);
         };
@@ -70,7 +72,11 @@ sub make_bound {
         return sub { Carp::croak($msg) };
     }
     if ($verb eq 'set' || $verb eq 'incr') {
-        return sub { my @a = @_; return $handle->$method(@idx, @a) };
+        return sub {
+            my @a = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a) if $verb eq 'incr';
+            return $handle->$method(@idx, @a);
+        };
     }
     return sub { return $handle->$method(@idx) };
 }

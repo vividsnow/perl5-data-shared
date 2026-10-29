@@ -36,6 +36,19 @@ sub _assert_index {
 my $ADD_KEY = sub { my ($h, $k, $v) = @_; return $h->add($k) };
 my $ESTIMATE_EXISTS = sub { my ($h, $k) = @_; return $h->estimate($k) > 0 ? 1 : 0 };
 
+# incr exists for its delta, so an explicit undef one is a caller's missing
+# variable rather than a request to add nothing. Passed through it added 0 and
+# returned the unchanged value as a success: the last silent member of the
+# missing-argument class the entries below guard by hand for sortedset,
+# bitset, disjointset and radixtree. A delta left out entirely still means the
+# backend's own default, which is what the POD documents.
+sub _assert_delta {
+    my ($key, @args) = @_;
+    Carp::croak("$key: incr delta must be a number, not undef")
+        if @args && !defined $args[0];
+    return;
+}
+
 # For an indexed family that exposes no capacity to compare against. The bound
 # is the backend's own node-index ceiling, which it reports by croaking past
 # it: without this, exists croaked for a negative index (numified into the

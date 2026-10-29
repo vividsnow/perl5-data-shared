@@ -896,6 +896,12 @@ sub _verb_at_child {
                 };
                 _rethrow($err, $clean ? '' : $@);
             }
+            # Registration created the member with score 0 a moment ago, so the
+            # caller's write is always an update and a sortedset set answers 0
+            # for one -- which reads as a failed write of a score that did land.
+            # $was_parent is the question the caller is really asking: did this
+            # address exist before the call.
+            return 1 if $verb eq 'set' && !$was_parent && !$result;
             return $result;
         }, 1);
     }
@@ -1040,8 +1046,14 @@ sub delete_subtree {
             ? Data::Shared::_dispatch_record('get', $self->{parent_record}, [$addr]) : undef;
         my $ok = eval {
             if (defined $id) {
-                $self->_index_remove('a:' . $addr);
+                # 'c:' before 'a:'. A kill between the two then leaves the
+                # registration without its constructed marker, which is the
+                # score-only state the code already handles and a retry
+                # completes. The other way round left a marker no registration
+                # names: the retry returned success and the child's directory
+                # stayed on disk with nothing able to reclaim it.
                 $self->_index_remove('c:' . $addr);
+                $self->_index_remove('a:' . $addr);
                 $self->_index_put('s:', $count - 1);
             }
             $self->_parent_unregister($addr);

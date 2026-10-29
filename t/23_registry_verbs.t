@@ -191,4 +191,26 @@ subtest 'a one-dimensional leaf refuses a second index' => sub {
     like $@, qr/takes one index/, 'and says so';
 };
 
+# The last silent member of the missing-argument class the registry guards by
+# hand for sortedset, bitset, disjointset and radixtree: incr exists for its
+# delta, and an explicit undef one added 0 and reported the unchanged value as
+# a success, so a metric fed an undef went quietly flat.
+subtest 'an explicit undef incr delta is refused on every tier' => sub {
+    my $r = Data::Shared->new;
+    mounted($r, 'c', 'hashmap:ii', undef, 64) or plan skip_all => 'hashmap unavailable';
+    shared_set($r, '/c/1', 10);
+
+    is shared_incr($r, '/c/1'), 11, 'a delta left out still means the default';
+    for my $tier (['string', sub { shared_incr($r, '/c/1', undef) }],
+                  ['array', sub { Data::Shared::shareda_incr($r, ['c', 1], undef) }],
+                  ['compiled', sub {
+                      Data::Shared::sharedc_incr($r, Data::Shared::shared_compile('/c/1'), undef) }]) {
+        my ($name, $call) = @$tier;
+        ok !eval { $call->(); 1 }, "the $name tier refuses an undef delta";
+        like $@, qr/incr delta must be a number, not undef/, "and says so ($name)";
+    }
+    is shared_get($r, '/c/1'), 11, 'and none of them changed the value';
+    is shared_incr($r, '/c/1', 5), 16, 'a real delta still applies';
+};
+
 done_testing;

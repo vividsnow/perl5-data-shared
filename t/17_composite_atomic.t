@@ -656,4 +656,46 @@ subtest 'teardown waits for a composite lock it does not hold' => sub {
     ok !-d "$dir/.children/users", 'and then removed the directory';
 };
 
+# A kill between delete_subtree's two index removals leaves one of them behind,
+# and which one decides whether the delete can ever finish. With the
+# registration gone first, the surviving marker is named by nothing: a retry
+# reported success and left the child's directory on disk for good. With the
+# marker gone first, what survives is the registration -- the score-only state
+# the code already handles -- and the retry completes.
+subtest 'the delete order leaves the crash state a retry can finish' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('u', ['hashmap:ss', 64, ['hashmap:ii', 16]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    $root->set('/u/alice/5', 1);
+    my $comp = $root->{mounts}{u}{composite};
+    my $id = $comp->{index}->get('a:alice');
+
+    my @order;
+    my $orig = \&Data::Shared::Composite::_index_remove;
+    {
+        no warnings 'redefine';
+        local *Data::Shared::Composite::_index_remove = sub {
+            push @order, $_[1] if $_[1] =~ /\A[ac]:/;
+            return $orig->(@_);
+        };
+        $root->delete('/u/alice');
+    }
+    is_deeply \@order, ['c:alice', 'a:alice'],
+        'the constructed marker goes before the registration';
+
+    # And the state that order leaves behind is recoverable: drop only the
+    # marker by hand, as a kill between the two would, and retry.
+    $root->set('/u/bob/5', 2);
+    my $bid = $comp->{index}->get('a:bob');
+    my $bdir = "$dir/.children/u/child-$bid";
+    ok -d $bdir, 'the second child has its directory';
+    $comp->{index}->remove('c:bob');
+    undef $root;
+
+    my $retry = Data::Shared->open($dir);
+    ok $retry->delete('/u/bob'), 'a retry over the surviving registration completes';
+    ok !-d $bdir, 'and the directory is gone';
+};
+
 done_testing;

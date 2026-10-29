@@ -2,6 +2,7 @@ package Data::Shared::Adapter::Set;
 use strict;
 use warnings;
 use Carp ();
+use Data::Shared::Registry ();      # the argument guards live there
 
 our $VERSION = '0.01';
 
@@ -37,6 +38,7 @@ sub make_verb {
         my $by = $handle->can('incr_by');
         return sub {
             my ($rest, @a) = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a);
             my $key = _key($entry, $rest, $verb);
             return $handle->$by($key, $a[0]) if @a && $by;
             return $handle->$method($key, @a);
@@ -64,6 +66,7 @@ sub make_bound {
         my $by = $handle->can('incr_by');
         return sub {
             my @a = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a);
             return $handle->$by($key, $a[0]) if @a && $by;
             return $handle->$method($key, @a);
         };

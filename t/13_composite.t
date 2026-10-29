@@ -88,6 +88,14 @@ subtest 'sortedset int of roaringbitmap' => sub {
     is shared_get($r, '/board/42'), 0, 'auto score 0';
     shared_set($r, '/board/42', 900);
     is shared_get($r, '/board/42'), 900, 'score set after child exists';
+
+    # Registration creates the member with score 0 first, so the caller's write
+    # is always an update and the backend answers 0 for one -- which read as a
+    # failed write of a score that did land.
+    is shared_set($r, '/board/7', 1.5), 1, 'a score write to a new child says it wrote';
+    is shared_get($r, '/board/7'), '1.5', 'and the score is there';
+    is shared_set($r, '/board/7', 2.5), 0, 'writing it again adds no member';
+    is shared_get($r, '/board/7'), '2.5', 'and still updates the score';
 };
 
 subtest 'three levels: hashmap of kdtree of hashmap' => sub {

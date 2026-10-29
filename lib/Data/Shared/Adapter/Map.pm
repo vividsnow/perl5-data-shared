@@ -2,6 +2,9 @@ package Data::Shared::Adapter::Map;
 use strict;
 use warnings;
 use Carp ();
+# The argument guards live there, and an adapter is reachable on its own: the
+# facade had always loaded it first, so calling into it was a latent die.
+use Data::Shared::Registry ();
 
 our $VERSION = '0.01';
 
@@ -44,6 +47,7 @@ sub make_verb {
         my $by = $handle->can('incr_by');
         return sub {
             my ($rest, @a) = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a);
             my $key = _key($entry, $rest, $verb);
             return $handle->$by($key, $a[0]) if @a && $by;
             return $handle->$method($key, @a);
@@ -71,6 +75,7 @@ sub make_bound {
         my $by = $handle->can('incr_by');
         return sub {
             my @a = @_;
+            Data::Shared::Registry::_assert_delta($entry->{key}, @a);
             return $handle->$by($key, $a[0]) if @a && $by;
             return $handle->$method($key, @a);
         };
