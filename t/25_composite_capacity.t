@@ -37,6 +37,12 @@ for my $len (126, 200, 254) {
                                  { max_children => 5 }]); 1 },
         'the correct option still mounts';
     is $root->mount_info('t')->{composite}, 1, 'and it really is composite';
+    # An empty one asks for the defaults. It fell through to the typo branch
+    # and croaked naming no key at all: "unknown composite options ''".
+    my $empty = eval { $root->mount('e', ['hashmap:ss', 64, ['hashmap:ss', 8], {}]); 1 };
+    ok $empty, 'an empty options hash asks for the defaults' or diag $@;
+    is eval { $root->mount_info('e')->{composite} }, 1, 'and still mounts a composite'
+        if $empty;
 }
 
 # The index file is sized from max_children when it is created, so remounting

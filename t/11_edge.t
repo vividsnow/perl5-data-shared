@@ -303,6 +303,22 @@ subtest 'an explicit backing path must be absolute' => sub {
     ok eval { $here->mount('derived', 'hashmap:ii', undef, 16); 1 },
         'a derived path under a relative root still mounts' or diag $@;
     chdir $start or die $!;
+
+    # The rule was enforced in one of the three branches that accept a path the
+    # caller named. sortedset:strings takes two of them in an options hash, and
+    # published a relative one that every later process resolved against its
+    # own working directory.
+    SKIP: {
+        eval { require Data::SortedSet::Shared::Strings; 1 }
+            or skip 'Data::SortedSet::Shared::Strings not installed', 3;
+        my $s = Data::Shared->new("$dir/strings");
+        ok !eval { $s->mount('names', 'sortedset:strings',
+                             { max => 100, set => 'rel-set.shm' }); 1 },
+            'a relative set path is refused too';
+        like $@, qr/must be absolute/, 'by the same rule';
+        ok eval { $s->mount('names', 'sortedset:strings', { max => 100 }); 1 },
+            'and leaving both paths to be derived still mounts' or diag $@;
+    }
 };
 
 done_testing;

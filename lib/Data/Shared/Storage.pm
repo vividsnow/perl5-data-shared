@@ -20,9 +20,11 @@ sub plan {
         $plan->{kind} = 'perfecthash';
         if (@args == 1 && defined $args[0] && !ref $args[0]) {
             $plan->{file} = $args[0];
+            push @{ $plan->{explicit} }, $args[0];
         } elsif (@args == 1 && ref $args[0] eq 'HASH') {
             my $opt = $args[0];
             $plan->{file} = $opt->{path};
+            push @{ $plan->{explicit} }, $opt->{path} if defined $opt->{path};
             $plan->{file} = $root->_file_for($name) if !defined $plan->{file} && defined $root->{dir};
             $plan->{build} = exists $opt->{build_int} ? 'build_int' : exists $opt->{build_str} ? 'build_str' : undef;
             $plan->{keys} = $opt->{ $plan->{build} } if $plan->{build};
@@ -48,6 +50,7 @@ sub plan {
             if !(@args == 1 && ref $args[0] eq 'HASH') && @args % 2;
         my %opt = @args == 1 && ref $args[0] eq 'HASH' ? %{ $args[0] } : @args;
         Carp::croak("sortedset:strings mount requires 'max'") unless defined $opt{max};
+        push @{ $plan->{explicit} }, grep { defined $_ } @opt{qw(set keys)};
         if (defined $root->{dir}) {
             $opt{set} = $root->_file_for($name) unless defined $opt{set};
             $opt{keys} = $root->_file_for($name . '__keys') unless defined $opt{keys};
@@ -62,15 +65,15 @@ sub plan {
             unshift @args, $root->_file_for($name);
         }
         elsif (@args && defined $args[0] && !ref $args[0]) {
-            # The caller named this file, rather than the facade deriving it
-            # from the root directory. Only such a path is checked below: a
-            # derived one is relative exactly when the root's own directory is,
-            # which is legitimate and resolved consistently elsewhere.
-            $plan->{explicit_file} = 1;
+            push @{ $plan->{explicit} }, $args[0];
         }
         $plan->{file} = $args[0] if @args && defined $args[0] && !ref $args[0];
     }
     $plan->{paths} = [$plan->{file}] if $plan->{kind} ne 'strings' && defined $plan->{file};
+    # Which paths the caller named, rather than the facade deriving them from
+    # the root directory. Per path, not per plan: sortedset:strings takes two,
+    # and the caller may name one and leave the other to be derived.
+    my %explicit = map { $_ => 1 } grep { !ref $_ } @{ $plan->{explicit} || [] };
     for my $path (@{ $plan->{paths} }) {
         Carp::croak("Data::Shared: invalid backing path for '$name'")
             if ref $path || !length($path) || index($path, "\0") >= 0;
@@ -79,11 +82,13 @@ sub plan {
         # working directory that process happened to have: at best the open
         # failed, at worst it found a different file of the same name and
         # attached to it. Refused rather than silently anchored, because only
-        # the caller knows which directory they meant.
+        # the caller knows which directory they meant. A derived path is
+        # relative exactly when the root's own directory is, which is
+        # legitimate and resolved consistently elsewhere.
         Carp::croak("Data::Shared: backing path for '$name' must be absolute,"
             . " since every process that opens this store resolves it again"
             . " (got '$path')")
-            if $plan->{explicit_file} && $path !~ m{\A/};
+            if $explicit{$path} && $path !~ m{\A/};
     }
     return $plan;
 }

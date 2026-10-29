@@ -17,7 +17,10 @@ my %PARENT_OK = map { $_ => 1 } qw(hashmap sortedset kdtree graph);
 
 sub _is_opts_hash {
     my ($h) = @_;
-    return 0 unless ref $h eq 'HASH' && %$h;
+    # An empty one says "no options", which is what the defaults are for. It
+    # used to fall through to the typo branch below and croak naming no key at
+    # all: "unknown composite options ''".
+    return 0 unless ref $h eq 'HASH';
     for my $k (keys %$h) { return 0 unless $k eq 'max_children' || $k eq 'cache_size' }
     return 1;
 }
