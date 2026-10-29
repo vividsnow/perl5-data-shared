@@ -107,11 +107,24 @@ sub _scalar_snapshot {
     if ($written =~ /[eE]/ && $value == int($value)) {
         # Through the decimal spelling, not int(): int() hands back the same
         # float at the integer bounds, so the conversion did nothing for
-        # exactly the values it was written for. Re-encoded to confirm, so a
-        # value no integer type holds is left alone rather than changed for
-        # nothing.
-        my $exact = sprintf('%.0f', $value) + 0;
-        return $exact if $exact == $value && _encoder()->encode($exact) !~ /[eE]/;
+        # exactly the values it was written for.
+        my $decimal = sprintf '%.0f', $value;
+        return $value unless $decimal + 0 == $value;
+        my $exact = $decimal + 0;
+        # Bare digits, not merely "no exponent": one JSON::PP writes this
+        # integer as digits, another quotes it, and a third keeps the exponent
+        # whatever the flags say -- and only the first is a number that
+        # reopens as itself.
+        return $exact if _encoder()->encode($exact) =~ /\A-?[0-9]+\z/;
+        # The encoder keeps the exponent whatever the flags say. That only
+        # matters if the exponent form does not come back as the same number,
+        # which is where %.15g drops the low digits of 2**53 -- 1e300 survives
+        # it and stays the short spelling.
+        return $value if _encoder()->decode($written) == $value;
+        # Otherwise publish the digits as a string rather than a number that
+        # reopens as a different one: a JSON string round trips byte for byte
+        # in every JSON::PP, and the backend numifies it to what was passed.
+        return $decimal;
     }
     return $value;
 }
