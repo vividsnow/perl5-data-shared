@@ -117,7 +117,12 @@ sub _scalar_snapshot {
         # numifies it to the value that was passed.
         # Decimal spelling, not int(), which is a no-op at the integer bounds.
         my $decimal = sprintf '%.0f', $value;
-        return $decimal if $decimal + 0 == $value;
+        # Numified on a copy, so $decimal keeps a string's flags and nothing
+        # downstream can choose to write it as a number again: given numeric
+        # flags, one JSON::PP spells it in digits and an older one back in
+        # exponent form, which is the loss this branch exists to avoid.
+        my $check = $decimal;
+        return $decimal if $check + 0 == $value;
     }
     return $value;
 }
