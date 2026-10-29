@@ -1943,14 +1943,15 @@ per-call overhead depends on the tier. A sample run of
 F<bench/overhead.pl> on one x86_64 host, reading one integer key, rates
 taken from measured CPU time:
 
-    native handle    0.08 us/op
-    compiled         0.65 us/op
-    array path       2.60 us/op
-    shared_call      2.60 us/op
-    string path      3.40 us/op
+    native handle    0.09 us/op
+    compiled         0.64 us/op
+    array path       2.6  us/op
+    shared_call      2.8  us/op
+    string path      3.1  us/op
 
-Those are one host's figures and the string tier varied by about 15% run
-to run; the ordering is the durable part, not the values.
+Those are one host's figures, taken from three consecutive runs on an
+idle host that agreed within 2%; the ordering is the durable part, not
+the values.
 
 The string and array tiers pay for path parsing and mount resolution on
 every call. A compiled path skips both: a live binding is checked only
@@ -1969,12 +1970,13 @@ flat compiled paths.
 Creating flat mounts costs quadratic total time in their number: each one
 validates and republishes the whole manifest, so the marginal cost of one
 more doubles as the count doubles. F<bench/mounts.pl> measures this; on the
-same host the average was 1.4 ms per mount at 25 mounts and 8.0 ms at 200,
-i.e. 1.6 s to create 200, with the 200th alone costing 16 ms. Keys are not
-affected: writing 10_000 keys into one flat mount took 38 ms and never
+same host the average was 1.2 ms per mount at 25 mounts and 7.1 ms at 200,
+i.e. 1.4 s to create 200, with the 200th alone costing 17 ms. Keys are not
+affected: writing 10_000 keys into one flat mount took 35 ms and never
 touches the manifest, which that script also asserts. Opening such a root
-is superlinear too, and paid by every process that opens it: 0.15 s to
-replay 400 mounts on the same host.
+is superlinear too, and paid by every process that opens it: 0.14 s to
+replay 400 mounts on the same host, which is the one size that script
+replays.
 A namespace with hundreds of B<mounts> belongs in a composite mount
 (L</DEEP PATHS (COMPOSITES)>) instead, where children are registered in the
 parent and the root manifest stays a single record.
