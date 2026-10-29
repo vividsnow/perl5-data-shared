@@ -1630,8 +1630,9 @@ before shipping the directory -- but only 21 of the 39 families can be
 sealed at all. C<perfecthash> is immutable and needs no sealing, so it
 does not block the predicate; a store holding any of the other 17
 (C<buffer>, C<queue>, C<stack>, C<deque>, C<heap>, C<log>, C<pool>,
-C<pubsub>, C<reqrep>, C<ringbuffer>, C<sync>, the timing wheels,
-C<reservoir>, C<topk>, C<segmenttree>, C<disjointset>) or the
+C<pubsub>, C<reqrep>, C<ringbuffer>, C<sync>, C<timingwheel>,
+C<hiertimingwheel>, C<reservoir>, C<topk>, C<segmenttree>,
+C<disjointset>) or the
 C<sortedset:strings> variant can never report C<frozen>. C<frozen> is a
 predicate and does not say which mount blocks it;
 C<< open_readonly($dir, strict => 1) >> does, by naming the first

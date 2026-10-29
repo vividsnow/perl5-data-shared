@@ -222,9 +222,11 @@ subtest 'the freezability split the POD publishes is the one the registry has' =
     is $total, scalar keys %$registry, 'out of the right total';
     my ($stated, $list) = $pod =~ /any of the other ([0-9]+)\s*\n\s*\((.*?)\)/s;
     is $stated, scalar @{ $by{neither} }, 'and how many block the predicate';
+    # Every family named outright, with no prose standing in for a pair: the
+    # two timing wheels used to be "the timing wheels", and the only way to
+    # check that was to take their names from the registry -- so that end of
+    # the comparison could not fail.
     my @named = $list ? $list =~ /C<([^>]+)>/g : ();
-    push @named, grep { /timingwheel/ } @{ $by{neither} }     # "the timing wheels"
-        if $list && $list =~ /the timing wheels/;
     is_deeply [sort @named], [sort @{ $by{neither} }],
         'and the list it prints is exactly the registry blockers';
 };
