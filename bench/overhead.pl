@@ -7,8 +7,7 @@ use Benchmark qw(countit);
 use Data::Shared qw(shared_get shareda_get shared_compile sharedc_get shared_call);
 
 my $root = Data::Shared->new;
-$root->mount('cache', 'hashmap:ii', undef, 100_000);
-my $native = $root->handle('/cache');
+my $native = $root->mount('cache', 'hashmap:ii', undef, 100_000);
 $native->put($_, $_ * 10) for 1 .. 1000;
 
 my $cp = shared_compile('/cache/500');

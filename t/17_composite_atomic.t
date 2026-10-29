@@ -10,16 +10,34 @@ use Data::Shared qw(shared_compile sharedc_get);
 eval { require Data::HashMap::Shared::SS; require Data::Sync::Shared::RWLock; 1 }
     or plan skip_all => "composite backends unavailable: $@";
 
-sub maps {
-    my ($root, %opt) = @_;
+sub map_store {
+    my (%opt) = @_;
+    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
     $root->mount('users', { spec => 'hashmap:ss', args => [128],
         child => { spec => 'hashmap:ss', args => [128] }, max_children => 16,
         cache_size => 2, %opt });
+    return $root;
+}
+
+sub hold_lock {
+    my ($path, $mode, $lock, $signal) = @_;
+    pipe my $held_r, my $held_w or die $!;
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        close $held_r;
+        my $fh;
+        my $ok = CORE::open($fh, $mode, $path) && flock $fh, $lock;
+        syswrite $held_w, $ok ? $signal : "failed\n";
+        select undef, undef, undef, 1.5;
+        POSIX::_exit($ok ? 0 : 1);
+    }
+    close $held_w;
+    return ($pid, $held_r);
 }
 
 subtest 'constructor failure releases the child budget and partial files' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, max_children => 1);
+    my $root = map_store(max_children => 1);
     my $construct = \&Data::Shared::_construct;
     {
         no warnings 'redefine';
@@ -41,8 +59,7 @@ subtest 'constructor failure releases the child budget and partial files' => sub
 };
 
 subtest 'failed readiness publication is rolled back' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, max_children => 1);
+    my $root = map_store(max_children => 1);
     my $put = Data::HashMap::Shared::SS->can('put');
     {
         no warnings qw(redefine once);
@@ -84,8 +101,7 @@ subtest 'score-only registration survives failed lazy construction' => sub {
 };
 
 subtest 'child count does not enumerate all addresses during writes' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, max_children => 64);
+    my $root = map_store(max_children => 64);
     {
         no warnings 'redefine';
         local *Data::Shared::Composite::_count_addresses = sub { die "unexpected registry scan\n" };
@@ -97,8 +113,7 @@ subtest 'child count does not enumerate all addresses during writes' => sub {
 };
 
 subtest 'file cache evicts the least recently used child' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, cache_size => 2);
+    my $root = map_store(cache_size => 2);
     $root->set("/users/$_/name", $_) for qw(a b);
     $root->get('/users/a/name');
     $root->set('/users/c/name', 'c');
@@ -108,8 +123,7 @@ subtest 'file cache evicts the least recently used child' => sub {
 };
 
 subtest 'missing child storage is not regenerated on a cache miss' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, cache_size => 1);
+    my $root = map_store(cache_size => 1);
     $root->set('/users/a/key', 'a');
     $root->set('/users/b/key', 'b');
     my $path = $root->dir . '/.children/users/child-0/child.shm';
@@ -122,8 +136,7 @@ subtest 'missing child storage is not regenerated on a cache miss' => sub {
 subtest 'concurrent first writers publish one shared child' => sub {
     local $SIG{ALRM} = sub { die "concurrent writers timed out\n" };
     alarm 20;
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $go_r, my $go_w or die $!;
     # PERL_UNICODE puts a :utf8 layer on every new handle, and sysread and
@@ -165,8 +178,7 @@ subtest 'concurrent first writers publish one shared child' => sub {
 };
 
 subtest 'another process deletes and recreates a compiled target' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     $root->set('/users/a/key', 'old');
     my $path = shared_compile('/users/a/key');
     is sharedc_get($root, $path), 'old', 'old target cached';
@@ -192,8 +204,7 @@ subtest 'another process deletes and recreates a compiled target' => sub {
 subtest 'deletion waits for in-progress construction' => sub {
     local $SIG{ALRM} = sub { die "construction/delete coordination timed out\n" };
     alarm 20;
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $release_r, my $release_w or die $!;
     pipe my $deleted_r, my $deleted_w or die $!;
@@ -253,8 +264,7 @@ subtest 'deletion waits for in-progress construction' => sub {
 subtest 'interrupted creation releases the lock and repairs the live counter' => sub {
     local $SIG{ALRM} = sub { die "interrupted creator timed out\n" };
     alarm 20;
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root, max_children => 1);
+    my $root = map_store(max_children => 1);
     pipe my $ready_r, my $ready_w or die $!;
     pipe my $wait_r, my $wait_w or die $!;
     binmode $_, ':raw' for $ready_r, $ready_w, $wait_r, $wait_w;
@@ -295,8 +305,7 @@ subtest 'interrupted creation releases the lock and repairs the live counter' =>
 };
 
 subtest 'missing composite index cannot silently discard the hierarchy' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     $root->set('/users/a/key', 'saved');
     my $index = $root->dir . '/.children/users/index.shm';
     unlink $index or die $!;
@@ -306,8 +315,7 @@ subtest 'missing composite index cannot silently discard the hierarchy' => sub {
 };
 
 subtest 'legacy readiness markers and counters remain readable' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     $root->set('/users/a/key', 'saved');
     my $index = $root->{mounts}{users}{composite}{index};
     $index->put('c:a', 1);
@@ -333,8 +341,7 @@ subtest 'nested deletion retires the shared instance before cleanup' => sub {
 };
 
 subtest 'freeze through call at a composite is refused, not half-applied' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     $root->set('/users/a/key', 'saved');
     ok !eval { $root->node('/users')->call('freeze'); 1 }, 'call(freeze) at a composite croaks';
     like $@, qr/cannot freeze composite mount 'users' through call\(\)/, 'and says why';
@@ -346,8 +353,7 @@ subtest 'freeze through call at a composite is refused, not half-applied' => sub
 };
 
 subtest 'frozen composite storage can be unlinked by its producer' => sub {
-    my $root = Data::Shared->new(tempdir(CLEANUP => 1));
-    maps($root);
+    my $root = map_store();
     $root->set('/users/a/key', 'saved');
     $root->freeze_all;
     ok $root->unlink_all >= 1, 'producer unlinked frozen root';
@@ -482,18 +488,7 @@ subtest 'teardown respects a read-only composite lock' => sub {
     my $lockfile = "$dir/.children/users/.lock";
     chmod 0400, $lockfile or die $!;
 
-    pipe my $held_r, my $held_w or die $!;
-    my $pid = fork;
-    plan skip_all => 'cannot fork' unless defined $pid;
-    unless ($pid) {
-        close $held_r;
-        my $fh;
-        my $ok = CORE::open($fh, '<', $lockfile) && flock $fh, Fcntl::LOCK_EX();
-        syswrite $held_w, $ok ? "held\n" : "failed\n";
-        select undef, undef, undef, 1.5;
-        POSIX::_exit($ok ? 0 : 1);
-    }
-    close $held_w;
+    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_EX(), "held\n");
     is scalar <$held_r>, "held\n", 'a worker holds the read-only lock';
     my $start = Time::HiRes::time();
     $root->unmount('users');
@@ -516,18 +511,7 @@ subtest 'teardown waits for a nested composite lock' => sub {
     my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
     ok $nested, 'the nested composite has its own lock' or plan skip_all => 'no nested lock';
 
-    pipe my $held_r, my $held_w or die $!;
-    my $pid = fork;
-    plan skip_all => 'cannot fork' unless defined $pid;
-    unless ($pid) {
-        close $held_r;
-        my $fh;
-        my $ok = CORE::open($fh, '+<', $nested) && flock $fh, Fcntl::LOCK_EX();
-        syswrite $held_w, $ok ? "held\n" : "failed\n";
-        select undef, undef, undef, 1.5;
-        POSIX::_exit($ok ? 0 : 1);
-    }
-    close $held_w;
+    my ($pid, $held_r) = hold_lock($nested, '+<', Fcntl::LOCK_EX(), "held\n");
     is scalar <$held_r>, "held\n", 'a worker holds the nested lock';
     my $start = Time::HiRes::time();
     $root->unmount('atlas');
@@ -555,18 +539,7 @@ subtest 'tearing down a sealed store waits for a nested lock it never cached' =>
     my ($nested) = glob "$dir/.children/atlas/child-*/.lock";
     ok $nested, 'the sealed store has a nested lock' or plan skip_all => 'no nested lock';
 
-    pipe my $held_r, my $held_w or die $!;
-    my $pid = fork;
-    plan skip_all => 'cannot fork' unless defined $pid;
-    unless ($pid) {
-        close $held_r;
-        my $fh;
-        my $ok = CORE::open($fh, '<', $nested) && flock $fh, Fcntl::LOCK_EX();
-        syswrite $held_w, $ok ? "held\n" : "failed\n";
-        select undef, undef, undef, 1.5;
-        POSIX::_exit($ok ? 0 : 1);
-    }
-    close $held_w;
+    my ($pid, $held_r) = hold_lock($nested, '<', Fcntl::LOCK_EX(), "held\n");
     is scalar <$held_r>, "held\n", 'a reader holds the nested lock';
 
     my $sealed = Data::Shared->open_sealed($dir);
@@ -646,18 +619,7 @@ subtest 'teardown waits for a shared holder, not only an exclusive one' => sub {
     $root->set('/users/alice/k', 'v');
     my $lockfile = "$dir/.children/users/.lock";
 
-    pipe my $held_r, my $held_w or die $!;
-    my $pid = fork;
-    plan skip_all => 'cannot fork' unless defined $pid;
-    unless ($pid) {
-        close $held_r;
-        my $fh;
-        my $ok = CORE::open($fh, '<', $lockfile) && flock $fh, Fcntl::LOCK_SH();
-        syswrite $held_w, $ok ? "shared\n" : "failed\n";
-        select undef, undef, undef, 1.5;
-        POSIX::_exit($ok ? 0 : 1);
-    }
-    close $held_w;
+    my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_SH(), "shared\n");
     is scalar <$held_r>, "shared\n", 'a reader holds it shared';
     my $start = Time::HiRes::time();
     $root->unmount('users');
@@ -677,18 +639,7 @@ subtest 'teardown waits for a composite lock it does not hold' => sub {
     my $lockfile = "$dir/.children/users/.lock";
     ok -e $lockfile, 'the composite has its own lock';
 
-    pipe my $held_r, my $held_w or die $!;
-    my $pid = fork;
-    plan skip_all => 'cannot fork' unless defined $pid;
-    unless ($pid) {
-        close $held_r;
-        my $fh;
-        my $ok = CORE::open($fh, '+<', $lockfile) && flock $fh, Fcntl::LOCK_EX();
-        syswrite $held_w, $ok ? "held\n" : "failed\n";
-        select undef, undef, undef, 1.5;
-        POSIX::_exit($ok ? 0 : 1);
-    }
-    close $held_w;
+    my ($pid, $held_r) = hold_lock($lockfile, '+<', Fcntl::LOCK_EX(), "held\n");
     my $ack = <$held_r>;
     is $ack, "held\n", 'a worker holds it';
 

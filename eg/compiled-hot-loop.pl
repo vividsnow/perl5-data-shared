@@ -7,9 +7,8 @@ use Time::HiRes qw(time);
 use Data::Shared qw(shared_get shared_compile sharedc_get);
 
 my $root = Data::Shared->new;
-my $h = eval { $root->mount('cache', 'hashmap:ii', undef, 100_000) };
-die "hashmap backend unavailable: $@" unless $h;
-my $native = $root->handle('/cache');
+my $native = eval { $root->mount('cache', 'hashmap:ii', undef, 100_000) };
+die "hashmap backend unavailable: $@" unless $native;
 $native->put($_, $_ * 10) for 1 .. 1000;
 
 my $cp = shared_compile('/cache/500');
@@ -20,10 +19,11 @@ for my $name (qw(string compiled)) {
 }
 
 my $n = 50_000;
-my $start = time();
-shared_get($root, '/cache/500') for 1 .. $n;
-printf "string   %d gets in %.2fs\n", $n, time() - $start;
-$start = time();
-sharedc_get($root, $cp) for 1 .. $n;
-printf "compiled %d gets in %.2fs (see bench/ for stable numbers)\n", $n, time() - $start;
-print "native handle is also available via \$root->handle('/cache')\n";
+for my $case (['string', sub { shared_get($root, '/cache/500') }],
+              ['compiled', sub { sharedc_get($root, $cp) }]) {
+    my ($name, $get) = @$case;
+    my $start = time();
+    $get->() for 1 .. $n;
+    printf "%-8s %d gets in %.2fs\n", $name, $n, time() - $start;
+}
+print "see bench/ for stable numbers; \$root->handle('/cache') gives the native handle\n";

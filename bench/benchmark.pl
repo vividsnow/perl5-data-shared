@@ -14,8 +14,7 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
 {
     print "== HashMap::II get ==\n";
     my $root = Data::Shared->new;
-    $root->mount('cache', 'hashmap:ii', undef, 100_000);
-    my $native = $root->handle('/cache');
+    my $native = $root->mount('cache', 'hashmap:ii', undef, 100_000);
     $native->put($_, $_ * 10) for 1 .. 1000;
     my $cp = shared_compile('/cache/500');
     my $arr = ['cache', '500'];
@@ -39,8 +38,7 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
     # operation: they are not comparable with the single-op cases above.
     print "\n== Queue::Int push+pop (rate is per push+pop pair) ==\n";
     my $root = Data::Shared->new;
-    $root->mount('jobs', 'queue:int', undef, 8192);
-    my $native = $root->handle('/jobs');
+    my $native = $root->mount('jobs', 'queue:int', undef, 8192);
     my $cp = shared_compile('/jobs');
     cmpthese(-$secs, {
         native   => sub { $native->push(42); my $v = $native->pop },
@@ -52,8 +50,7 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
 {
     print "\n== HyperLogLog add / count via shared_call ==\n";
     my $root = Data::Shared->new;
-    $root->mount('visitors', 'hyperloglog', undef, 14);
-    my $native = $root->handle('/visitors');
+    my $native = $root->mount('visitors', 'hyperloglog', undef, 14);
     # count as well as add, which the heading has always claimed: a read and a
     # write through the escape hatch do not cost the same.
     cmpthese(-$secs, {
@@ -67,8 +64,7 @@ print "Each group runs for ${secs}s per case. Indicative only; see results.txt.\
 {
     print "\n== NDArray get [0,1] ==\n";
     my $root = Data::Shared->new;
-    $root->mount('lat', 'ndarray', undef, 'f64', 10, 10);
-    my $native = $root->handle('/lat');
+    my $native = $root->mount('lat', 'ndarray', undef, 'f64', 10, 10);
     $native->set(0, 1, 1.5);
     my $cp = shared_compile('/lat/0/1');
     cmpthese(-$secs, {
