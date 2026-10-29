@@ -22,6 +22,7 @@ sub root_with {
 # reported success. @_ < 3, not an undef test: an explicit undef still means
 # the caller meant to pass something, as Node::delete reads it.
 subtest 'a valueless set is refused, not taken as false' => sub {
+    my $tested = 0;
     my @cases = (
         ['bitset',    [256],      '/m/10',  1,    'bit'],
         ['radixtree', [1024, 4096], '/m/foo', 7,    'value'],
@@ -38,7 +39,13 @@ subtest 'a valueless set is refused, not taken as false' => sub {
         # The backend warns about the undef value itself; that is its call.
         local $SIG{__WARN__} = sub {};
         ok eval { shared_set($root, $path, undef); 1 }, "$spec still accepts an explicit undef";
+        $tested++;
     }
+    # With none of the three installed -- the default install, which has no
+    # backends at all -- every case was skipped by that `next` and the subtest
+    # ran no assertion, which Test::More reports as a failure, not a skip.
+    plan skip_all => 'none of bitset, radixtree or sortedset is available'
+        unless $tested;
 };
 
 # The exists verbs of these entries refuse a non-integer index. Their siblings

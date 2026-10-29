@@ -292,6 +292,11 @@ subtest 'an explicit backing path must be absolute' => sub {
     ok !eval { $root->mount('stats', 'hashmap:ii', 'stats.shm', 16); 1 },
         'a relative explicit path is refused';
     like $@, qr/must be absolute/, 'and says why';
+    # The refusal above is decided before any backend loads, so it holds on a
+    # default install with none of them. Everything below actually mounts.
+    SKIP: {
+        eval { require Data::HashMap::Shared::II; 1 }
+            or skip 'hashmap backend unavailable', 2;
     ok eval { $root->mount('stats', 'hashmap:ii', "$dir/stats.shm", 16); 1 },
         'the absolute form mounts' or diag $@;
     # A path the facade derives is relative exactly when the root's directory
@@ -303,6 +308,7 @@ subtest 'an explicit backing path must be absolute' => sub {
     ok eval { $here->mount('derived', 'hashmap:ii', undef, 16); 1 },
         'a derived path under a relative root still mounts' or diag $@;
     chdir $start or die $!;
+    }
 
     # The rule was enforced in one of the three branches that accept a path the
     # caller named. sortedset:strings takes two of them in an options hash, and

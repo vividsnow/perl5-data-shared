@@ -118,6 +118,11 @@ subtest 'three levels: hashmap of kdtree of hashmap' => sub {
 # required the child class only at the first deep write, so it mounted,
 # published and reopened, and then failed in every process that wrote to it.
 subtest 'a composite checks its child backend at mount time' => sub {
+    # The parent has to load for the child check to be what fails: without it
+    # the refusal below is about hashmap, and the message assertion was testing
+    # the wrong absent backend.
+    eval { require Data::HashMap::Shared::SS; 1 }
+        or plan skip_all => 'hashmap backend unavailable, so the child check cannot be isolated';
     my $r = Data::Shared->new(tempdir(CLEANUP => 1));
     ok !eval { $r->mount('c', ['hashmap:ss', 64, ['Data::Shared::NoSuchBackend', 8]]); 1 },
         'an unloadable child class is refused at mount';
