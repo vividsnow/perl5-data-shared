@@ -1006,7 +1006,9 @@ sub handle_at {
     return $rt->{handle};
 }
 
-sub _retire_child {
+# Storage only. The index entries, the cache and the directory are the
+# caller's to deal with, in the order each teardown needs them.
+sub _remove_child_storage {
     my ($rt) = @_;
     if ($rt->{kind} eq 'composite') { $rt->{comp}->destroy }
     elsif ($rt->{handle}->can('unlink')) { $rt->{handle}->unlink }
@@ -1063,7 +1065,7 @@ sub delete_subtree {
                 # delete had failed, while the very next failure point reported
                 # the same state accurately.
                 my $ok = eval {
-                    _retire_child($rt);
+                    _remove_child_storage($rt);
                     1;
                 };
                 unless ($ok) {
@@ -1110,13 +1112,13 @@ sub destroy {
                 $self->_index_remove('a:' . $addr);
                 $self->_index_remove('c:' . $addr);
                 $self->_forget($id);
-                _retire_child($rt) if $rt;
+                _remove_child_storage($rt) if $rt;
             }
             $self->_index_put('s:', 0);
         } else {
             # Frozen indexes already reject the mutation marker before any creation.
             for my $rt (values %{ $self->{cache} }) {
-                _retire_child($rt);
+                _remove_child_storage($rt);
             }
         }
         $self->{parent_handle}->unlink if $self->{parent_handle} && $self->{parent_handle}->can('unlink');

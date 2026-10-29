@@ -205,9 +205,10 @@ sub _dispatch_record_pushpop {
 }
 
 sub _dispatch_record_call {
-    my ($mount, $rest, $method, @args) = @_;
-    my $handle = $mount->{handle};
-    my $label = defined $mount->{name} ? "mount '$mount->{name}'" : 'handle';
+    # A mount record or a composite child's: both carry the name the path used.
+    my ($record, $rest, $method, @args) = @_;
+    my $handle = $record->{handle};
+    my $label = defined $record->{name} ? "mount '$record->{name}'" : 'handle';
     Carp::croak("Data::Shared: $label (" . ref($handle) . ") has no method '$method'")
         unless $handle->can($method);
     my @full = (@$rest, @args);
@@ -599,10 +600,10 @@ sub _require_class {
 }
 
 sub _storage_name {
-    my ($safe) = @_;
-    $safe =~ s{/}{__}g;
-    $safe =~ s{[^A-Za-z0-9_.-]}{_}g;
-    return $safe;
+    my ($name) = @_;
+    $name =~ s{/}{__}g;
+    $name =~ s{[^A-Za-z0-9_.-]}{_}g;
+    return $name;
 }
 
 sub _file_for {
