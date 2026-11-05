@@ -431,6 +431,25 @@ subtest 'a teardown blocked part-way can be retried' => sub {
 # replayable by somebody else: it used to name storage that was already
 # gone, which open, new and open_sealed all refuse, so the remains could
 # only be removed by hand.
+# destroy marks the index 'x:' before it removes anything, so a composite
+# can be met already tombstoned. Cleanup is exempt from the 'instance was
+# deleted' refusal for exactly that reason -- an exemption mutation cannot
+# reach, because the croak it prevents is caught upstream: with it removed
+# the teardown still completes, so only the outcome can be asserted. The
+# counter probe in tmp/r35/cleanup-count.pl shows the exemption taken twice
+# in this very scenario.
+subtest 'teardown completes over an already tombstoned composite' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('u', ['hashmap:ss', 64, ['hashmap:ii', 16]]); 1 }
+        or plan skip_all => "composite unavailable: $@";
+    shared_set($root, '/u/alice/1', 1);
+    $root->{mounts}{u}{composite}{index}->put('x:', 1);
+    ok $root->unlink_all, 'the teardown reports work done';
+    ok !-d "$dir/.children/u", 'the composite directory is gone';
+    ok !-e "$dir/manifest.json", 'and so is the manifest';
+};
+
 subtest 'a teardown killed part-way is finished by another process' => sub {
     my $dir = tempdir(CLEANUP => 1);
     {
