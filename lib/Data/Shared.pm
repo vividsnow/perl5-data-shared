@@ -1234,8 +1234,21 @@ sub unlink_all {
         $self->_assert_revision if $published;
         my $n = 0;
         # Insertion order, so a partial failure's survivors stay deterministic.
-        for my $name (@{ $self->{order} }) {
-            my $mount = $self->{mounts}{$name};
+        my @retiring = map { $self->{mounts}{$_} } @{ $self->{order} };
+        # Publish the removal before taking the storage, the way unmount does.
+        # Killed between the two, this left a manifest naming a file that was
+        # already gone, and then NOTHING could replay the store -- open, new
+        # and open_sealed all refused it -- so the rest could only be removed
+        # by hand. With every path on the ledger first, a fresh root replays
+        # an empty topology and its own unlink_all finishes the job.
+        if ($published && defined $self->{dir} && @retiring) {
+            $self->_record_retained($_->{storage_paths}) for @retiring;
+            @{$self}{qw(mounts order _nest_depth)} = ({}, [], 0);
+            $self->{_revision}++;
+            $self->_write_manifest;
+            $self->_invalidate_compiled;
+        }
+        for my $mount (@retiring) {
             my $handle = $mount->{handle};
             next unless $handle->can('unlink');
             # Native unlink returns undef for bitset/queue/stack, handles for bloom/roaring/radix.
@@ -1266,7 +1279,11 @@ sub unlink_all {
         }
         # Teardown also reclaims unpublished composite storage left by interrupted creation.
         if (defined $self->{dir}) {
-            my $children = "$self->{dir}/.children";
+            # readdir answers in bytes, so both sweeps below join their names
+            # to the byte spelling of the root: concatenating them to a
+            # character-string directory read them as Latin-1 and tested a
+            # path that does not exist, leaving every non-ASCII stray behind.
+            my $children = $self->_ledger_resolve('.children');
             if (opendir my $dh, $children) {
                 my @orphans = map { "$children/$_" } grep { $_ ne '.' && $_ ne '..' } readdir $dh;
                 closedir $dh;
@@ -1285,10 +1302,11 @@ sub unlink_all {
             # manifest write holds this same exclusive lock, so a temp seen
             # here is abandoned, never one in flight.
             if (opendir my $dh, $self->{dir}) {
-                my @stray = grep { (/\.shm\z/ || /\A\.manifest-/) && -f "$self->{dir}/$_" }
+                my @stray = map { $self->_ledger_resolve($_) }
+                    grep { /\.shm\z/ || /\A\.manifest-/ }
                     grep { $_ ne '.' && $_ ne '..' } readdir $dh;
                 closedir $dh;
-                $n += grep { CORE::unlink "$self->{dir}/$_" } @stray;
+                $n += grep { -f $_ && CORE::unlink $_ } @stray;
             }
         }
         $self->{mounts} = {};
@@ -1582,7 +1600,10 @@ C<unlink_all> removes mounts, the manifest and all retained storage,
 including storage retained by other processes. It also unlinks every
 F<.shm> file directly in the root directory, which reclaims what an
 interrupted mount left but takes any other F<.shm> kept there with it,
-and every F<.manifest-> temporary a killed publication abandoned.
+and every F<.manifest-> temporary a killed publication abandoned. A mount
+interrupted between construction and publication is reclaimed only if its
+backing file is one of those: a path you gave outside the root, or a
+sidecar with another suffix, is left for its caller.
 It leaves F<.manifest.lock>, which another process may still hold. C<freeze_all> and C<unlink_all> croak
 on a read-only root.
 

@@ -232,7 +232,10 @@ ROOT AND MOUNTS
     including storage retained by other processes. It also unlinks every
     .shm file directly in the root directory, which reclaims what an
     interrupted mount left but takes any other .shm kept there with it, and
-    every .manifest- temporary a killed publication abandoned. It leaves
+    every .manifest- temporary a killed publication abandoned. A mount
+    interrupted between construction and publication is reclaimed only if
+    its backing file is one of those: a path you gave outside the root, or a
+    sidecar with another suffix, is left for its caller. It leaves
     .manifest.lock, which another process may still hold. "freeze_all" and
     "unlink_all" croak on a read-only root.
 

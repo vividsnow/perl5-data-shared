@@ -368,8 +368,19 @@ subtest 'a retained entry resolves against a wide-character root' => sub {
     shared_set($root, '/m/1', 7);
     $root->unmount('m');
     is scalar(() = glob "$dir/*.shm"), 1, 'the retained file is on disk';
+    # A stray the ledger never named, which only the directory sweep can
+    # reach: readdir answers in bytes, and joining them to this character
+    # string tested a path that does not exist, so the sweep walked past it.
+    my $stray = "$dir/\x{3b3}stray.shm";
+    { my $h = Data::HashMap::Shared::II->new($stray, 16) }
+    ok -f $stray, 'and an unpublished stray beside it';
     ok $root->unlink_all, 'unlink_all succeeds';
     is scalar(() = glob "$dir/*.shm"), 0, 'and the retained file is really gone';
+    ok !-f $stray, 'and so is the stray';
+    opendir my $dh, $dir or die $!;
+    my @left = sort grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+    is_deeply \@left, ['.manifest.lock'], 'leaving only the lock, as under an ASCII root';
 };
 
 # The ownership check runs before _mutate scopes the path cache, so a rotation
@@ -413,6 +424,49 @@ subtest 'a teardown blocked part-way can be retried' => sub {
     ok $root->unlink_all, 'the retry completes';
     ok !-d "$dir/.children/users", 'the directory is gone';
     ok !-e "$dir/manifest.json", 'and so is the manifest';
+};
+
+# The retry above keeps the same root object. A process killed part-way
+# through a teardown does not, and the manifest it leaves behind has to be
+# replayable by somebody else: it used to name storage that was already
+# gone, which open, new and open_sealed all refuse, so the remains could
+# only be removed by hand.
+subtest 'a teardown killed part-way is finished by another process' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    {
+        my $root = Data::Shared->new($dir);
+        eval { $root->mount('a', 'hashmap:ii', undef, 64); 1 }
+            or plan skip_all => "hashmap unavailable: $@";
+        $root->mount('b', 'hashmap:ii', undef, 64);
+        shared_set($root, '/a/1', 1);
+        shared_set($root, '/b/1', 1);
+    }
+    my $pid = fork;
+    plan skip_all => 'cannot fork' unless defined $pid;
+    unless ($pid) {
+        my $root = Data::Shared->open($dir);
+        my $seen = 0;
+        no warnings 'redefine';
+        my $orig = \&Data::HashMap::Shared::II::unlink;
+        # The first mount's storage goes; the process dies before the second.
+        local *Data::HashMap::Shared::II::unlink = sub {
+            kill 9, $$ if $seen++;
+            return $orig->(@_);
+        };
+        eval { $root->unlink_all };
+        POSIX::_exit(0);
+    }
+    waitpid $pid, 0;
+    is $? & 127, 9, 'the worker died mid-teardown';
+    ok !-e "$dir/a.shm", 'the first storage is gone';
+    ok -e "$dir/b.shm", 'the second is still there';
+    my $next = eval { Data::Shared->open($dir) };
+    ok $next, 'and another process can still open the store' or diag $@;
+    is_deeply [$next ? $next->mounts : ('did not open')], [],
+        'which replays an empty topology';
+    ok $next && $next->unlink_all, 'whose own teardown finishes the job';
+    ok !-e "$dir/b.shm", 'the stranded storage is reclaimed';
+    ok !-e "$dir/manifest.json", 'and the manifest is gone';
 };
 
 # Between publishing a manifest without the mount and removing its storage,
