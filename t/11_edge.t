@@ -199,12 +199,18 @@ subtest 'hashref specs and special constructors' => sub {
     if ($@) { plan skip_all => "backend unavailable: $@"; return }
     shared_call($r, '/w', 'add', 'x', 1.0);
     is shared_call($r, '/w', 'seen'), 1, 'hashref spec with ctor';
-    my $r2 = Data::Shared->new;
-    $r2->mount('board', 'sortedset:strings', max => 100, set => undef, keys => undef);
-    shared_set($r2, '/board/alice', 42);
-    is shared_get($r2, '/board/alice'), 42, 'strings via list form anonymous';
-    ok !eval { $r2->mount('bad', 'sortedset:strings', {}); 1 }, 'strings without max croaks';
-    like $@, qr/requires 'max'/, 'max error';
+    # Its own guard: the reservoir one above says nothing about this family,
+    # so a machine with one and not the other failed here instead of skipping.
+    SKIP: {
+        my $r2 = Data::Shared->new;
+        skip 'sortedset:strings unavailable', 3
+            unless eval { $r2->mount('board', 'sortedset:strings',
+                              max => 100, set => undef, keys => undef); 1 };
+        shared_set($r2, '/board/alice', 42);
+        is shared_get($r2, '/board/alice'), 42, 'strings via list form anonymous';
+        ok !eval { $r2->mount('bad', 'sortedset:strings', {}); 1 }, 'strings without max croaks';
+        like $@, qr/requires 'max'/, 'max error';
+    }
 };
 
 subtest 'perfecthash forms' => sub {
@@ -242,13 +248,27 @@ subtest 'readonly pushpop and compiled mutators croak' => sub {
     my $h = eval { $r->mount('jobs', 'queue:int', undef, 100) };
     if ($@) { plan skip_all => "backend unavailable: $@"; return }
     shared_push($r, '/jobs', 42);
+    # A queue has no set verb and /jobs has no key component, so set on this
+    # mount croaks on a WRITABLE root too: the refusal has to be read, not
+    # just counted, and a verb the mount supports has to carry the set case.
+    # buffer, not hashmap: a freeze-capable family refuses a read-only open
+    # of a live file, and freezing it would hand the refusal to the backend.
+    my $keyed = eval { $r->mount('cache', 'buffer:i64', undef, 64); 1 };
     my $ro = Data::Shared->open_readonly($dir);
     ok $ro->readonly, 'readonly root';
-    ok !eval { shared_push($ro, '/jobs', 1); 1 }, 'readonly push croaks';
-    like $@, qr/read-only/, 'readonly push error';
-    ok !eval { shared_pop($ro, '/jobs'); 1 }, 'readonly pop croaks';
-    ok !eval { sharedc_push($ro, shared_compile('/jobs'), 1); 1 }, 'readonly compiled push croaks';
-    ok !eval { sharedc_set($ro, shared_compile('/jobs'), 1); 1 }, 'readonly compiled set croaks';
+    for my $case (['shared_push',  sub { shared_push($ro, '/jobs', 1) },                  'push'],
+                  ['shared_pop',   sub { shared_pop($ro, '/jobs') },                      'pop'],
+                  ['sharedc_push', sub { sharedc_push($ro, shared_compile('/jobs'), 1) }, 'push'],
+                  ['sharedc_pop',  sub { sharedc_pop($ro, shared_compile('/jobs')) },     'pop'],
+                  ($keyed ? (['sharedc_set',    sub { sharedc_set($ro, shared_compile('/cache/1'), 1) },    'set'],
+                             ['sharedc_delete', sub { sharedc_delete($ro, shared_compile('/cache/1')) },    'delete'],
+                             ['sharedc_incr',   sub { sharedc_incr($ro, shared_compile('/cache/1'), 1) },   'incr'],
+                             ['shareda_set',    sub { shareda_set($ro, ['cache', 1], 1) },                  'set']) : ())) {
+        my ($name, $code, $verb) = @$case;
+        ok !eval { $code->(); 1 }, "readonly $name croaks";
+        like $@, qr/\AData::Shared: root is read-only, cannot \Q$verb\E\b/,
+            "and it is the facade that refuses $name";
+    }
 };
 
 subtest 'adapter error branches' => sub {

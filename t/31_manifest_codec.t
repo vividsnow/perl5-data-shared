@@ -77,7 +77,7 @@ subtest 'an unrepresentable mount argument is refused at mount time' => sub {
          qr/not a serializable mount argument/],
         ['lone surrogate in a path', sub {
             no warnings 'utf8';
-            $_[0]->mount('x', 'hashmap:ss', '/tmp/a' . chr(0xD800) . '.shm', 100) },
+            $_[0]->mount('x', 'hashmap:ss', $_[0]->dir . '/a' . chr(0xD800) . '.shm', 100) },
          qr/not representable in a manifest/],
     );
     for my $case (@bad) {
@@ -149,14 +149,16 @@ subtest 'only a real Inf or NaN is refused, not a string that looks like one' =>
     ok !eval { Data::Shared::Manifest::snapshot($real_inf); 1 },
         'a real Inf is refused even after being stringified';
     ok !eval { Data::Shared::Manifest::snapshot('NaN' + 0); 1 }, 'and a real NaN';
-    # int() sets IOK on the NV it rounds, so an Inf that had been through any
-    # integer context no longer looked like a float to the guard; the encoder
-    # then quoted it and the quoted-value shortcut took that for a string.
+    # This pair used to claim that int() sets IOK on the NV it rounds, so an
+    # Inf through integer context stopped looking like a float to the guard.
+    # It does not: int() reads the NV and writes its own target, leaving the
+    # source NOK|POK -- the same flags the stringified case above already has,
+    # which made these two a second spelling of it. Kept as the arithmetic
+    # spelling of Inf (9**9**9 rather than 'Inf' + 0), which is what a caller
+    # writes, with the quoting encoder in force.
     my $rounded = 9**9**9;
-    my $rounded_iv = int($rounded);
     my $rounded_pv = "$rounded";
     my $rounded_nan = 'NaN' + 0;
-    my $nan_iv = int($rounded_nan);
     my $nan_pv = "$rounded_nan";
     my $lookalike = 'inf';
     my $lookalike_nv = $lookalike + 0;
@@ -164,7 +166,7 @@ subtest 'only a real Inf or NaN is refused, not a string that looks like one' =>
         no warnings 'redefine';
         local *Data::Shared::Manifest::_encoder = sub { $QUOTING };
         ok !eval { Data::Shared::Manifest::snapshot($rounded); 1 },
-            'an Inf that has been rounded and printed is refused too';
+            'an Inf written as 9**9**9 and printed is refused too';
         ok !eval { Data::Shared::Manifest::snapshot($rounded_nan); 1 }, 'and such a NaN';
         my ($still) = Data::Shared::Manifest::snapshot($lookalike);
         is $still, 'inf', 'while the lookalike string is still kept';

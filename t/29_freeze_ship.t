@@ -104,6 +104,11 @@ subtest 'freeze_all seals in mount order' => sub {
     ok !eval { $root->freeze_all; 1 }, 'a failing mount aborts the pass';
     my @state = map { $root->{mounts}{"m$_"}{handle}->frozen ? 1 : 0 } 1 .. 6;
     is_deeply \@state, [1, 1, 1, 0, 0, 0], 'everything before it is sealed, nothing after';
+    # Every other frozen() assertion in this file reads an all-sealed store,
+    # an all-live one, an empty one, or one with an unsealable mount: a
+    # frozen() that answered for the first mount, or for any mount rather
+    # than all of them, would have passed all of them.
+    ok !$root->frozen, 'and the store does not report itself sealed';
 };
 
 # The counter rebuild must not run against a sealed index: it cannot take the

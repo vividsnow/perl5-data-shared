@@ -336,6 +336,10 @@ subtest 'a composite child cannot name its own backing path' => sub {
     my $root = Data::Shared->new($dir);
     plan skip_all => 'sortedset:strings unavailable'
         unless eval { $root->mount('probe', 'sortedset:strings', { max => 8 }); 1 };
+    # Every composite below uses hashmap:ss as the parent, which the probe
+    # above says nothing about.
+    plan skip_all => 'hashmap:ss unavailable'
+        unless eval { require Data::HashMap::Shared::SS; 1 };
 
     for my $case (['set alone', { max => 8, set => "$dir/s.set" }],
                   ['keys alone', { max => 8, keys => "$dir/s.keys" }],
@@ -416,6 +420,11 @@ subtest 'a composite child cannot name its own backing path' => sub {
     shared_call($root, '/fine/bob', 'add', 'y', 2);
     is shared_call($root, '/fine/bob', 'score', 'x'), undef,
         'and each child keeps its own members';
+    # Not only that bob lacks alice's member: creating bob must not have
+    # truncated alice, and bob's own write must have landed. An undef for
+    # 'x' alone is also what a child that lost everything would answer.
+    is shared_call($root, '/fine/alice', 'score', 'x'), 1, 'alice still has hers';
+    is shared_call($root, '/fine/bob', 'score', 'y'), 2, 'and bob has his';
 
     # A flat mount is one store, so naming its path stays legal.
     ok eval { $root->mount('flat', 'sortedset:strings',
@@ -480,6 +489,8 @@ subtest 'a malformed child spec is refused before the composite publishes' => su
     my $root = Data::Shared->new($dir);
     plan skip_all => 'sortedset:strings unavailable'
         unless eval { $root->mount('probe', 'sortedset:strings', { max => 8 }); 1 };
+    plan skip_all => 'hashmap:ss unavailable'
+        unless eval { require Data::HashMap::Shared::SS; 1 };
     my $i = 0;
     for my $case (['an empty option hash', ['sortedset:strings', {}], qr/requires 'max'/],
                   ['an odd option list', ['sortedset:strings', 'max', 8, 'set'],

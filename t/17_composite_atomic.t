@@ -8,7 +8,10 @@ use Fcntl ();
 use Time::HiRes ();
 use Data::Shared qw(shared_compile sharedc_get);
 
-eval { require Data::HashMap::Shared::SS; require Data::Sync::Shared::RWLock; 1 }
+# Only the file-backed composite is exercised here, so the anonymous
+# root's RWLock is not a prerequisite: requiring it skipped the whole file
+# on a machine that had everything this file actually uses.
+eval { require Data::HashMap::Shared::SS; 1 }
     or plan skip_all => "composite backends unavailable: $@";
 
 sub map_store {
@@ -22,10 +25,12 @@ sub map_store {
 
 sub hold_lock {
     # $seconds is passed at every call site rather than defaulted: each caller
-    # then asserts it waited for less than it, and the two numbers belong
-    # together where a flake has to be read.
+    # asserts the teardown waited, and the hold it waited for belongs beside
+    # the assertion where a flake has to be read.
     my ($path, $mode, $lock, $signal, $seconds) = @_;
     pipe my $held_r, my $held_w or die $!;
+    # PERL_UNICODE puts :utf8 on a new handle, and syswrite refuses one.
+    binmode $_, ':raw' for $held_r, $held_w;
     my $pid = fork;
     plan skip_all => 'cannot fork' unless defined $pid;
     unless ($pid) {
@@ -545,6 +550,10 @@ subtest 'teardown respects a read-only composite lock' => sub {
     $root->set('/users/alice/k', 'v');
     my $lockfile = "$dir/.children/users/.lock";
     chmod 0400, $lockfile or die $!;
+    # Mode 0400 means nothing to uid 0, so the read-only fallback this
+    # subtest exists for would never be reached in a root container.
+    plan skip_all => 'running as root: a read-only lock is still writable'
+        if $> == 0 || do { open my $w, '+<', $lockfile or 0 };
 
     my ($pid, $held_r) = hold_lock($lockfile, '<', Fcntl::LOCK_EX(), "held\n", 1.5);
     is scalar <$held_r>, "held\n", 'a worker holds the read-only lock';
@@ -639,6 +648,7 @@ subtest 'a read-only reader rechecks identity after waiting for the lock' => sub
     my $ro = eval { Data::Shared->open_readonly($dir) };
     $ro or plan skip_all => "read-only open unavailable: $@";
     pipe my $held_r, my $held_w or die $!;
+    binmode $_, ':raw' for $held_r, $held_w;
     my $pid = fork;
     plan skip_all => 'cannot fork' unless defined $pid;
     unless ($pid) {

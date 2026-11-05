@@ -197,6 +197,8 @@ subtest 'storage is removed while the topology lock is held' => sub {
     # sleep on either side proved nothing -- late scheduling made the ordering
     # come out right whether or not the lock was held.
     pipe my $entered_r, my $entered_w or die "pipe: $!";
+    # PERL_UNICODE puts :utf8 on a new handle, and syswrite refuses one.
+    binmode $_, ':raw' for $entered_r, $entered_w;
     my $root = Data::Shared->new($dir);
     $root->mount('keep', 'hashmap:ii', undef, 16);
     $root->mount('scratch', SlowUnlink->new($stamp, $entered_w));
@@ -235,7 +237,7 @@ subtest 'storage is removed while the topology lock is held' => sub {
 # The ledger is published and read by another process, so a root opened as a
 # relative path recorded a relative one, which the next process resolved
 # against its own working directory and removed whatever sat there.
-subtest 'retained paths are recorded absolute' => sub {
+subtest 'retained paths are recorded against the root, not the caller' => sub {
     my $base = tempdir(CLEANUP => 1);
     my $elsewhere = tempdir(CLEANUP => 1);
     my $start = Cwd::getcwd();
@@ -253,14 +255,19 @@ subtest 'retained paths are recorded absolute' => sub {
     # satisfies and one relative to the caller does not.
     my ($entry) = $manifest =~ /"retained"\s*:\s*\[\s*"([^"]+)"/;
     ok defined $entry, 'the ledger records the retained storage';
-    my $resolved = (defined $entry && $entry =~ m{\A/}) ? $entry : "$base/state/" . ($entry // '');
-    ok -e $resolved, 'and it resolves against the root, not the caller';
+    # The root was created as 'state' from $base, so the two spellings differ:
+    # relative to the root is '.children/users' and relative to the caller
+    # would be 'state/.children/users'. Accepting either told them apart from
+    # nothing, and the entry is not absolute at all.
+    is $entry, '.children/users', 'the entry is relative to the root';
+    ok -e "$base/state/$entry", 'and resolves there';
     # The next process opens it by absolute path from a different directory: a
     # relative entry resolved against this cwd instead, removing whatever sat
     # there and leaving the store's own storage behind.
-    my $next = Data::Shared->open("$base/state");
-    is $next->unlink_all, 2, 'unlink_all reclaims it from another directory';
+    my $n = eval { Data::Shared->open("$base/state")->unlink_all };
+    my $err = $@;
     chdir $start or die $!;
+    is $n, 2, 'unlink_all reclaims it from another directory' or diag $err;
     ok !-d "$base/state/.children/users", 'the composite directory is gone';
 };
 
@@ -414,9 +421,14 @@ subtest 'a teardown blocked part-way can be retried' => sub {
 # -- that no call could reclaim. The ledger now covers that window.
 subtest 'a kill between the publish and the removal leaves the file reclaimable' => sub {
     my $dir = tempdir(CLEANUP => 1);
+    # Held outside the root: unlink_all also sweeps stray .shm files in the
+    # root directory, so a backing file inside it would be reclaimed whether
+    # or not the ledger named it, and the assertion below would pass with the
+    # ledger ignored entirely.
+    my $hold = tempdir(CLEANUP => 1);
     {
         my $root = Data::Shared->new($dir);
-        $root->mount('m1', 'hashmap:ss', undef, 128);
+        $root->mount('m1', 'hashmap:ss', "$hold/m1.shm", 128);
         shared_set($root, '/m1/secret', 'olddata');
     }
     my $pid = fork;
@@ -431,13 +443,18 @@ subtest 'a kill between the publish and the removal leaves the file reclaimable'
     }
     waitpid $pid, 0;
     is $? & 127, 9, 'the worker died in the window';
-    ok -e "$dir/m1.shm", 'its storage is still on disk';
+    ok -e "$hold/m1.shm", 'its storage is still on disk';
     my $manifest = do { open my $fh, '<', "$dir/manifest.json" or die $!; local $/; <$fh> };
     unlike $manifest, qr/"m1"/, 'the manifest no longer names the mount';
     like $manifest, qr/"retained"\s*:\s*\[[^\]]*m1/, 'but the ledger names the storage';
     my $next = Data::Shared->open($dir);
     ok $next->unlink_all, 'so another process can reclaim it';
-    ok !-e "$dir/m1.shm", 'and the storage is gone';
+    ok !-e "$hold/m1.shm", 'and the storage is gone';
+    # What the window costs if it is not reclaimed: a later mount of the same
+    # name adopts the file and serves what the dead process had written.
+    my $again = Data::Shared->new($dir);       # unlink_all took the manifest too
+    $again->mount('m1', 'hashmap:ss', "$hold/m1.shm", 128);
+    is shared_get($again, '/m1/secret'), undef, 'and a remount starts empty';
 };
 
 # The complement of the kill window above: once the removal succeeds the entry
