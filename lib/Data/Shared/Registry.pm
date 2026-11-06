@@ -27,7 +27,7 @@ sub _assert_index {
 # A set-like leaf has nothing to store a value in, so set means add and the
 # value is dropped; a sketch answers exists from a positive estimate.
 my $ADD_KEY = sub { my ($h, $k, $v) = @_; return $h->add($k) };
-# An indexed leaf with no removal: delete writes the identity element.
+# An indexed leaf with no removal, so delete writes zero in place.
 my $SET_ZERO = sub { my ($h, $i) = @_; return $h->set($i, 0) };
 my $ESTIMATE_EXISTS = sub { my ($h, $k) = @_; return $h->estimate($k) > 0 ? 1 : 0 };
 
@@ -427,7 +427,6 @@ my %NATIVE_READONLY = map { $_ => 1 } qw(bitset bloomfilter countingbloomfilter 
     cuckoofilter ddsketch fenwick fenwick2d graph hashmap histogram hyperloglog intern
     intervaltree kdtree minhash ndarray radixtree roaringbitmap sortedset spatialhash);
 for my $key (keys %REGISTRY) {
-    # Every entry used to repeat its own name as a `key` field.
     $REGISTRY{$key}{key} = $key;
     $REGISTRY{$key}{min_version} = $MIN_VERSION{$key};
     $REGISTRY{$key}{freeze} = $NATIVE_READONLY{$key} ? 1 : 0;
@@ -455,10 +454,8 @@ sub entry_for_class {
     return undef;
 }
 
-# How a family takes its backing path. Composite and Storage each worked this
-# out from the class name and the ctor, with a vocabulary of its own
-# ('handle'/'options'/'leading' against 'perfecthash'/'strings'/'normal'), so
-# one concept had two three-way spellings in two modules.
+# How a family takes its backing path; Composite and Storage both read it
+# from here rather than deriving it from the class name and the ctor.
 sub resolve_spec {
     my $resolved = _resolve_spec(@_) or return undef;
     $resolved->{convention} =

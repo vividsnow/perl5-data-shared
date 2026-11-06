@@ -20,8 +20,7 @@ sub plan {
     # by the absolute-path rule at the end of this sub and nowhere else, so it
     # stays out of the plan the caller gets back.
     my @explicit;
-    # The convention the registry resolved: this sub and Composite each used
-    # to work it out again from the class name and the ctor.
+    # The convention the registry resolved.
     $plan->{kind} = $resolved->{convention};
     if ($plan->{kind} eq 'handle') {
         if (@args == 1 && defined $args[0] && !ref $args[0]) {
@@ -43,10 +42,8 @@ sub plan {
         }
         Carp::croak('Data::Shared: perfecthash mount requires a path') unless defined $plan->{file};
     } elsif ($plan->{kind} eq 'options') {
-        # Reject the path placeholder before interpreting the list as key/value options.
-        # Both spellings of the placeholder: ':file' used to fall through to
-        # the key/value reading below, where (':file', {max => 8}) became the
-        # pair (':file' => {...}) and the croak said 'max' was missing.
+        # Reject either spelling of the path placeholder before reading the
+        # list as key/value options.
         Carp::croak("Data::Shared: sortedset:strings takes options, not a path"
             . " placeholder: pass max => N (and optionally set/keys)")
             if @args && (!defined $args[0] || (!ref $args[0] && $args[0] eq ':file'));
@@ -70,17 +67,14 @@ sub plan {
         elsif (@args && defined $args[0] && !ref $args[0]) {
             push @explicit, $args[0];
         }
-        # A reference in the path slot set no file, so it reached neither the
-        # invalid-path check below nor the absolute-path one, and the backend
-        # stringified it into a file called ARRAY(0x...) in the working
-        # directory. For these families slot 0 is the backing file.
+        # For these families slot 0 is the backing file, and a reference there
+        # reaches no other check: the backend would stringify it into a name.
         Carp::croak("Data::Shared: invalid backing path for '$name'")
             if @args && ref $args[0];
         $plan->{file} = $args[0] if @args && defined $args[0];
     }
     # construct hardcodes load() and new() for these two kinds, so a named
-    # ctor was accepted, written into a composite's chain signature -- which
-    # is what gates reopening -- and then ignored.
+    # ctor could only be accepted and then ignored.
     Carp::croak("Data::Shared: a $class spec does not take a ctor;"
         . ' it is constructed by ' . ($plan->{kind} eq 'handle' ? 'load' : 'new'))
         if $resolved->{ctor_named} && $plan->{kind} ne 'leading';

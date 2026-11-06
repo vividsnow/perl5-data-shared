@@ -160,8 +160,7 @@ sub with_lock {
     # lock only its own caller can release. Refuse instead of hanging: two
     # shared holders are the one combination that cannot deadlock. The file's
     # identity is the key, not its path: '$dir/', '$dir//' and '$dir/.' name
-    # the same lock and each spelt its own key, so the guard missed and the
-    # process deadlocked against itself instead of croaking.
+    # the same lock.
     my ($dev, $ino) = (stat $fh)[0, 1];
     my $key = defined $ino ? "$dev:$ino" : $path;
     if (my $held = $HELD{$key}) {

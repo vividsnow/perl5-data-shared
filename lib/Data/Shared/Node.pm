@@ -24,13 +24,10 @@ sub _abs {
     my ($self, $rel) = @_;
     return [ @{ $self->{components} } ]
         if !defined $rel || (!ref $rel && ($rel eq '' || $rel eq '/'));
-    # A compiled path is relative, so it appends; a Node is absolute, so
-    # appending one gave /users/users/alice.
+    # A compiled path is relative and appends; a Node is absolute.
     Carp::croak('Data::Shared: a Data::Shared::Node is an absolute cursor, not a relative path')
         if blessed($rel) && $rel->isa('Data::Shared::Node');
-    # Arrayref components are validated there, as $root->node([...]) is: a
-    # cursor built from an undef or a reference constructed silently and
-    # failed later, on use.
+    # Arrayref components are validated there, as $root->node([...]) is.
     return [ @{ $self->{components} }, @{ Data::Shared::_rel_components($rel) } ];
 }
 
@@ -106,8 +103,8 @@ Data::Shared::Node - A cursor into a Data::Shared namespace
 Returned by C<< $root->node($path) >> and by C<shared_get> on an
 intermediate composite path. Holds a root plus absolute path
 components; every method appends its relative path argument (string
-or arrayref, omitted for the node itself) and delegates to the
-corresponding C<shareda_*> function in L<Data::Shared>.
+or arrayref, omitted for the node itself) and dispatches it through
+L<Data::Shared>.
 
 =head2 root, components, path
 

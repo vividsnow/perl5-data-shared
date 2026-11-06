@@ -26,10 +26,9 @@ sub make_bound_pop  { return undef }
 sub perform_push { Carp::croak("Data::Shared: push is not supported for this mount (use shared_call)") }
 sub perform_pop  { Carp::croak("Data::Shared: pop is not supported for this mount (use shared_call)") }
 
-# The slow path: build the verb and call it, or say it does not exist. Four
-# adapters wrote these three steps out, two of them character for character;
-# only the wording that points at a better route differs, so that is what an
-# adapter overrides. Sync has no verbs at all and keeps its own.
+# The slow path: build the verb and call it, or say it does not exist. An
+# adapter overrides only the wording that points at a better route; Sync has
+# no verbs at all and keeps its own perform.
 sub perform {
     my ($class, $verb, $handle, $entry, $rest, @args) = @_;
     my $code = $class->make_verb($verb, $handle, $entry);

@@ -9,9 +9,6 @@ our $VERSION = '0.01';
 
 our @CARP_NOT = qw(Data::Shared);
 
-# Every component of an indexed path is an index. See Adapter::Map::_key for
-# why the check lives with the key handling: a bound closure resolves its
-# indices once, so the compiled tier pays nothing per call.
 # Fixed for the lifetime of a handle, so the closures below resolve it once
 # instead of asking an NDArray mount its rank on every call.
 sub _dims {
