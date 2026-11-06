@@ -13,11 +13,10 @@ sub CLONE_SKIP { 1 }
 
 sub DESTROY {
     my ($self) = @_;
-    my $bc = $self->{_bc} or return;
+    my $owners = $self->{_owners} or return;
     my $id = refaddr($self);
-    for my $entry (values %$bc) {
-        my $root = $entry->[2] or next;
-        delete $root->{_compiled}{$id};
+    for my $root (values %$owners) {
+        delete $root->{_compiled}{$id} if $root;
     }
 }
 

@@ -54,9 +54,9 @@ DESCRIPTION
     into ithreads ("CLONE_SKIP").
 
     Every error this facade raises begins with "Data::Shared: ", so one
-    pattern catches them all; a message without that prefix came from a
-    leaf's own API or from the operating system, and is reported as the leaf
-    wrote it.
+    pattern catches them all. A message without that prefix was raised by
+    something the facade called -- a leaf's API, a factory you passed, or
+    the operating system -- and is reported as it was written.
 
     The leaf dists are recommended rather than required, so installing this
     facade does not compile all 39 of them. Install the ones you mount;
@@ -71,9 +71,12 @@ ROOT AND MOUNTS
     Without a directory, creates an anonymous root. With a directory,
     creates it if needed; if a manifest.json already exists there it is
     replayed (every mount reopened), otherwise an empty manifest is written.
-    When the root is file-backed and a mount's constructor arguments are
-    empty or start with one "undef" or one ':file', the facade supplies
-    "$dir/<name>.shm" as the backing file. A second placeholder is an error.
+    When the root is file-backed and a family takes its backing path as the
+    leading constructor argument, empty arguments or a leading "undef" or
+    ':file' make the facade supply "$dir/<name>.shm", the name sanitized. A
+    family that takes the path in its options ("sortedset:strings") or
+    builds it itself ("perfecthash") refuses the placeholder and says what
+    it wants instead.
 
   Data::Shared->open($dir)
     Requires an existing directory and manifest. The complete manifest
@@ -232,12 +235,13 @@ ROOT AND MOUNTS
     including storage retained by other processes. It also unlinks every
     .shm file directly in the root directory, which reclaims what an
     interrupted mount left but takes any other .shm kept there with it, and
-    every .manifest- temporary a killed publication abandoned. A mount
+    every .manifest- temporary a killed publication abandoned. A flat mount
     interrupted between construction and publication is reclaimed only if
     its backing file is one of those: a path you gave outside the root, or a
-    sidecar with another suffix, is left for its caller. It leaves
-    .manifest.lock, which another process may still hold. "freeze_all" and
-    "unlink_all" croak on a read-only root.
+    sidecar with another suffix, is left for its caller. Composite storage
+    under .children is removed whole, whatever the suffixes inside it. It
+    leaves .manifest.lock, which another process may still hold.
+    "freeze_all" and "unlink_all" croak on a read-only root.
 
 SHARING A ROOT
     Topology changes serialize under a directory lock and revision. A root
@@ -470,10 +474,13 @@ DEEP PATHS (COMPOSITES)
     lifecycle lock. After a holder dies, the kernel releases file locks;
     anonymous locks recover the dead owner's lock, costing about 20 kB of
     shared mapping per composite. Unpublished child directories require
-    explicit recovery: no API reports them, and only "unlink_all" reclaims
-    them. A preexisting unpublished directory for a reserved child is an
-    error. Recovery covers exceptions and limited interruption, without
-    promising power-loss transactions or automatic orphan cleanup.
+    explicit recovery: no API reports them, and they go only with the
+    composite that owns them, by "unmount" with "unlink" or by "unlink_all".
+    A composite kept alive for months therefore keeps the storage of every
+    construction a kill interrupted. A preexisting unpublished directory for
+    a reserved child is an error. Recovery covers exceptions and limited
+    interruption, without promising power-loss transactions or automatic
+    orphan cleanup.
 
 PERFORMANCE
     The facade is pure Perl; every operation ends in the leaf's XS, so

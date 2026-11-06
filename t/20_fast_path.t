@@ -85,6 +85,31 @@ is sharedc_pop($root, $cq), 99, 'literal push round-trips';
     is $cold, 3, 'a new mount retires the binding exactly once';
 }
 
+# A compiled path carries no root of its own, so one path serving two roots is
+# ordinary use. The binding slot holds a single root, and the miss a second
+# root causes used to re-resolve the mount and rebuild the closure on every
+# call -- this tier doing more work per call than the string one it beats.
+{
+    my $other = Data::Shared->new;
+    my $spare = eval { $other->mount('cache', 'hashmap:ii', undef, 1024); 1 };
+    SKIP: {
+        skip 'a second root is unavailable', 3 unless $spare;
+        my $cm = shared_compile('/cache/5');
+        sharedc_set($root,  $cm, 1);
+        sharedc_set($other, $cm, 2);
+        sharedc_get($root, $cm);
+        sharedc_get($other, $cm);
+        my $resolved = 0;
+        my $resolve = \&Data::Shared::_resolve;
+        no warnings 'redefine';
+        local *Data::Shared::_resolve = sub { $resolved++; return $resolve->(@_) };
+        for (1 .. 5) { sharedc_get($root, $cm); sharedc_get($other, $cm) }
+        is $resolved, 0, 'ten warm reads alternating two roots resolve nothing again';
+        is sharedc_get($root,  $cm), 1, 'and the first root still answers its own value';
+        is sharedc_get($other, $cm), 2, 'and the second root answers its own';
+    }
+}
+
 # sharedc_call has no fast path by design, so it enters the binder every time
 # and the binder's own memo is all that stops a rebuild per call. Disabling
 # that memo altogether changed no value anywhere in the suite.

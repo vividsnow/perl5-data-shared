@@ -109,8 +109,8 @@ sub _check_components {
 
 sub _check_root {
     my ($root) = @_;
-    # Every dispatch passes through here, and the exact class is a string
-    # compare where isa is a method call; a subclass still reaches isa.
+    # The exact class is a string compare where isa is a method call; a
+    # subclass still reaches isa.
     return $root if ref($root) eq 'Data::Shared';
     Carp::croak("Data::Shared: first argument must be a Data::Shared root")
         unless blessed($root) && $root->isa('Data::Shared');
@@ -127,9 +127,7 @@ sub _resolve {
         }
     } else {
         # Longest prefix wins, but no mount name is deeper than the deepest
-        # one, so the walk starts there rather than at the path's own depth:
-        # one nested name used to cost every dispatch in the store a join and
-        # a lookup per component below the mount it hits.
+        # one, so the walk starts there rather than at the path's own depth.
         my $n = @$components;
         $n = $root->{_nest_depth} if $root->{_nest_depth} < $n;
         for (; $n >= 1; $n--) {
@@ -180,13 +178,9 @@ sub _adapter_for {
 
 my %MUTATING = map { $_ => 1 } qw(set delete incr push pop);
 
-# The string and compiled call tiers refuse the root for the same reason, and
-# said it in two different sentences. Every other root verb already agreed
-# across all four tiers.
 my $CALL_NEEDS_MOUNT = 'Data::Shared: a call path must name a mount';
 
 # Strip only the final location; a message may contain its own " at ...".
-# Four places carried this regex, and Composite carried two of them.
 sub _strip_location {
     my ($msg) = @_;
     return $msg if ref $msg;
@@ -194,7 +188,6 @@ sub _strip_location {
     return $msg;
 }
 
-# What the root itself means, per verb. All four dispatchers ask this.
 sub _root_verb {
     my ($verb, $root) = @_;
     return $root if $verb eq 'get';
@@ -360,6 +353,14 @@ sub _compiled_code {
     # The same liveness test the sharedc_* fast path uses, which also covers
     # a cached closure whose weak reference has expired.
     if (my $code = _bound_hit($root, $cp, $key)) { return $code }
+    # The slot above holds one root, so a path alternated between two of them
+    # missed it every time; the binding each root already owns is reusable.
+    if (my $owned = $root->{_compiled}{refaddr $cp}) {
+        if (my $code = $owned->{$key}) {
+            _cache_compiled($root, $cp, $key, $code);
+            return $code;
+        }
+    }
     my $components = $cp->{components};
     # Only sharedc_call arrives here with no components: both compiled verb
     # dispatchers answer the root through _root_verb before binding.
@@ -406,13 +407,16 @@ sub _compiled_code {
 sub _cache_compiled {
     my ($root, $cp, $key, $bound) = @_;
     my $id = refaddr($cp);
-    if (my $old = $cp->{_bc}{$key}) {
-        if (my $owner = $old->[2]) {
-            delete $owner->{_compiled}{$id}{$key};
-            delete $owner->{_compiled}{$id} unless keys %{ $owner->{_compiled}{$id} || {} };
-        }
-    }
     $root->{_compiled}{$id}{$key} = $bound;
+    my $ra = refaddr($root);
+    if (!$cp->{_owners}{$ra}) {
+        # Every root that owns a binding for this path, for DESTROY to reach.
+        # Pruned of the ones that have gone away, so a path held for the life
+        # of a process cannot accumulate one entry per root it has served.
+        delete @{ $cp->{_owners} }{ grep { !$cp->{_owners}{$_} } keys %{ $cp->{_owners} } };
+        $cp->{_owners}{$ra} = $root;
+        weaken($cp->{_owners}{$ra});
+    }
     my $entry = $cp->{_bc}{$key} = [$root->{gen}, $bound, $root];
     weaken($entry->[1]);
     weaken($entry->[2]);
@@ -423,8 +427,7 @@ sub _check_native_call {
     # A package-qualified spelling reaches the same method -- perl dispatches
     # $handle->'Data::HashMap::Shared::II::unlink' to unlink -- while matching
     # none of the verb comparisons that follow, here and at the retirement and
-    # composite-lifecycle branches. A read-only root unlinked its own backing
-    # file that way, and a writable one unlinked it without retiring the mount.
+    # composite-lifecycle branches.
     Carp::croak("Data::Shared: a call takes a bare method name, not '$method'")
         if index($method, ':') >= 0;
     Carp::croak("Data::Shared: root is read-only, cannot call '$method'")
@@ -846,8 +849,8 @@ sub _recipe {
         my $plan = Data::Shared::Storage::plan($self, $recipe->{resolved}, $name, $recipe->{args});
         Data::Shared::Storage::require_files($plan) if $self->{_opening};
         Data::Shared::Storage::check_readonly($recipe->{resolved}, $name) if $self->{strict_readonly};
-        # Kept for the install phase, which ran the same pure planning again.
-        # Both phases are inside _mutate's lock, so it cannot go stale.
+        # The install phase reuses this plan instead of planning again; one
+        # manifest lock covers both, so it cannot go stale.
         $recipe->{plan} = $plan;
         $recipe->{storage_paths} = $plan->{paths};
     }
@@ -863,11 +866,8 @@ sub _replay_manifest {
     # Load retained paths before replay so adopted storage can leave the ledger.
     $self->{_retained} = [ @{ $data->{retained} || [] } ];
     my $check = bless { %$self, mounts => {} }, ref $self;
-    # Building the recipes used to run outside the eval, so a manifest whose
-    # spec the facade refuses reported as though the caller had just written
-    # it -- no store named, and not under the documented prefix. Every mount
-    # is still built and checked before any is installed, so a bad manifest
-    # installs nothing.
+    # Every mount is built and checked before any is installed, so a bad
+    # manifest installs nothing and every failure names the store.
     my @recipes;
     my $ok = eval {
         for my $m (@{ $data->{mounts} }) {
@@ -875,7 +875,7 @@ sub _replay_manifest {
             # An invariant, not a reachable error: JSON can only produce
             # scalars, arrays, hashes and its own booleans, and snapshot calls
             # all of those serializable, so no manifest can carry a transient
-            # spec. Mutation cannot probe this line for the same reason.
+            # spec.
             Carp::croak('Data::Shared: transient spec in manifest') if $recipe->{transient};
             Carp::croak("Data::Shared: duplicate mount '$recipe->{name}'") if $check->{mounts}{$recipe->{name}};
             $check->_check_storage_paths($recipe->{name}, @{ $recipe->{storage_paths} });
@@ -1062,7 +1062,6 @@ sub _forget_retained {
     return;
 }
 
-# Both callers prune by ledger form and then act only on a real change.
 sub _drop_retained {
     my ($self, @paths) = @_;
     return 0 unless @paths && @{ $self->{_retained} };
@@ -1136,7 +1135,6 @@ sub _rel_components {
 sub _path_components {
     my ($self, $path) = @_;
     return [] if !defined $path;
-    # A Node is already absolute, so it replaces rather than appends.
     return [ @{ $path->{components} } ] if blessed($path) && $path->isa('Data::Shared::Node');
     return _rel_components($path);
 }
@@ -1235,12 +1233,9 @@ sub unlink_all {
         my $n = 0;
         # Insertion order, so a partial failure's survivors stay deterministic.
         my @retiring = map { $self->{mounts}{$_} } @{ $self->{order} };
-        # Publish the removal before taking the storage, the way unmount does.
-        # Killed between the two, this left a manifest naming a file that was
-        # already gone, and then NOTHING could replay the store -- open, new
-        # and open_sealed all refused it -- so the rest could only be removed
-        # by hand. With every path on the ledger first, a fresh root replays
-        # an empty topology and its own unlink_all finishes the job.
+        # Publish the removal before taking the storage, the way unmount does:
+        # a manifest naming a file that is already gone replays nowhere, while
+        # an empty topology plus the ledger lets any root finish the job.
         if ($published && defined $self->{dir} && @retiring) {
             $self->_record_retained($_->{storage_paths}) for @retiring;
             @{$self}{qw(mounts order _nest_depth)} = ({}, [], 0);
@@ -1280,9 +1275,7 @@ sub unlink_all {
         # Teardown also reclaims unpublished composite storage left by interrupted creation.
         if (defined $self->{dir}) {
             # readdir answers in bytes, so both sweeps below join their names
-            # to the byte spelling of the root: concatenating them to a
-            # character-string directory read them as Latin-1 and tested a
-            # path that does not exist, leaving every non-ASCII stray behind.
+            # through _ledger_resolve rather than to the directory as it is.
             my $children = $self->_ledger_resolve('.children');
             if (opendir my $dh, $children) {
                 my @orphans = map { "$children/$_" } grep { $_ ne '.' && $_ ne '..' } readdir $dh;
@@ -1327,9 +1320,8 @@ sub stats {
     return \%out;
 }
 
-# A method call puts the root in $_[0], which is exactly where the function
-# wants it, so the method IS the function: wrapping it only added a frame and
-# a copy of @_.
+# A method call puts the root in $_[0], which is where the function wants it,
+# so the method IS the function.
 {
     no warnings 'once';
     *get    = \&shared_get;
@@ -1408,8 +1400,9 @@ B<Linux only, 64-bit Perl>, matching every leaf. Handles are never
 cloned into ithreads (C<CLONE_SKIP>).
 
 Every error this facade raises begins with C<Data::Shared: >, so one
-pattern catches them all; a message without that prefix came from a leaf's
-own API or from the operating system, and is reported as the leaf wrote it.
+pattern catches them all. A message without that prefix was raised by
+something the facade called -- a leaf's API, a factory you passed, or the
+operating system -- and is reported as it was written.
 
 The leaf dists are recommended rather than required, so installing this
 facade does not compile all 39 of them. Install the ones you mount;
@@ -1426,10 +1419,12 @@ File-backed composites use the directory lock and do not need it.
 Without a directory, creates an anonymous root. With a directory,
 creates it if needed; if a F<manifest.json> already exists there it is
 replayed (every mount reopened), otherwise an empty manifest is
-written. When the root is file-backed and a mount's constructor
-arguments are empty or start with one C<undef> or one C<':file'>, the
-facade supplies C<$dir/E<lt>nameE<gt>.shm> as the backing file. A second
-placeholder is an error.
+written. When the root is file-backed and a family takes its backing path
+as the leading constructor argument, empty arguments or a leading C<undef>
+or C<':file'> make the facade supply C<$dir/E<lt>nameE<gt>.shm>, the name
+sanitized. A family that takes the path in its options
+(C<sortedset:strings>) or builds it itself (C<perfecthash>) refuses the
+placeholder and says what it wants instead.
 
 =head2 Data::Shared->open($dir)
 
@@ -1600,10 +1595,11 @@ C<unlink_all> removes mounts, the manifest and all retained storage,
 including storage retained by other processes. It also unlinks every
 F<.shm> file directly in the root directory, which reclaims what an
 interrupted mount left but takes any other F<.shm> kept there with it,
-and every F<.manifest-> temporary a killed publication abandoned. A mount
-interrupted between construction and publication is reclaimed only if its
-backing file is one of those: a path you gave outside the root, or a
-sidecar with another suffix, is left for its caller.
+and every F<.manifest-> temporary a killed publication abandoned. A flat
+mount interrupted between construction and publication is reclaimed only
+if its backing file is one of those: a path you gave outside the root, or
+a sidecar with another suffix, is left for its caller. Composite storage
+under F<.children> is removed whole, whatever the suffixes inside it.
 It leaves F<.manifest.lock>, which another process may still hold. C<freeze_all> and C<unlink_all> croak
 on a read-only root.
 
@@ -1854,8 +1850,10 @@ marker triggers a rebuild on writable open or the next lifecycle lock.
 After a holder dies, the kernel releases file locks; anonymous locks recover
 the dead owner's lock, costing about 20 kB of shared mapping per composite.
 Unpublished child directories require explicit recovery: no API reports them,
-and only C<unlink_all> reclaims them. A preexisting unpublished directory for
-a reserved child is an error. Recovery covers exceptions and limited
+and they go only with the composite that owns them, by C<unmount> with
+C<unlink> or by C<unlink_all>. A composite kept alive for months therefore
+keeps the storage of every construction a kill interrupted. A preexisting
+unpublished directory for a reserved child is an error. Recovery covers exceptions and limited
 interruption, without promising power-loss transactions or automatic orphan cleanup.
 
 =head1 PERFORMANCE
