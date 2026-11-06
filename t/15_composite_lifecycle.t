@@ -139,4 +139,25 @@ subtest 'retiring an address that was never created creates nothing' => sub {
     is_deeply [sort $root->children('/users')], ['alice'], 'no child was created to remove it';
 };
 
+# A sortedset parent records a score for an address before any child storage
+# exists, so delete and teardown both meet a registration whose child was
+# never built. Each walk must pass over it rather than open it: with either
+# guard gone, both die on the missing child directory.
+subtest 'a scored child that was never built is deleted and torn down' => sub {
+    my $dir = tempdir(CLEANUP => 1);
+    my $root = Data::Shared->new($dir);
+    eval { $root->mount('board', ['sortedset', 1000, ['hashmap:ii', 16, ['hashmap:ii', 8]]]); 1 }
+        or plan skip_all => "sortedset composite unavailable: $@";
+    $root->set('/board/7', 42);
+    is_deeply [$root->children('/board')], [7], 'a score alone registers the address';
+    is $root->delete('/board/7'), 1, 'deleting it opens no storage that was never built';
+    $root->set('/board/9', 11);
+    $root->set('/board/11', 5);
+    $root->set('/board/11/100/1', 7);
+    is $root->get('/board/11/100/1'), 7, 'a sibling that was built reads back';
+    ok eval { $root->unmount('board', unlink => 1); 1 },
+        'teardown passes over the scored-only child' or diag $@;
+    is_deeply [$root->mounts], [], 'and the mount is gone';
+};
+
 done_testing;

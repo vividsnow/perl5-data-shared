@@ -264,8 +264,8 @@ subtest 'a non-ASCII digit is not a composite option' => sub {
 
 # Manifest::read validates the header, every mount record and the retained
 # ledger, and mutation testing found four of those refusals observed by
-# nothing: a rewrite of this validation could drop one and the suite would
-# not notice. Each refusal must also name the store it came from.
+# nothing. Each refusal must also name the store it came from; the duplicate
+# name is the one case replay would refuse anyway.
 subtest 'a manifest the reader cannot trust is refused, naming the store' => sub {
     plan skip_all => $HASHMAP if $HASHMAP;
     my @cases = (
@@ -277,6 +277,8 @@ subtest 'a manifest the reader cannot trust is refused, naming the store' => sub
             sub { $_[0]{mounts}[0]{name} = undef }],
         ['a mount name that is a reference' => qr/invalid mount name/,
             sub { $_[0]{mounts}[0]{name} = ['x'] }],
+        ['two mounts with one name'         => qr/duplicate mount 'cache'/,
+            sub { push @{ $_[0]{mounts} }, { %{ $_[0]{mounts}[0] } } }],
         ['a retained ledger that is not a list' => qr/invalid retained storage/,
             sub { $_[0]{retained} = 'nope' }],
         ['a retained entry that is empty'   => qr/invalid retained storage/,

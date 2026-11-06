@@ -27,6 +27,10 @@ subtest 'hashmap:ss of bloomfilter' => sub {
     is shared_get($r, '/users/alice/event-1'), undef, 'missing deep get undef';
     is_deeply [$r->children('/users')], [], 'read does not create';
     is shared_exists($r, '/users/alice'), 0, 'missing child exists 0';
+    # A get of the child address itself answers a cursor once the child is
+    # there, so it must answer undef while it is not: a caller testing the
+    # result would otherwise hold a live cursor to a child that never existed.
+    is shared_get($r, '/users/alice'), undef, 'missing child get is undef, not a cursor';
 
     shared_set($r, '/users/alice/event-42', 1);
     is shared_exists($r, '/users/alice'), 1, 'child exists after write';

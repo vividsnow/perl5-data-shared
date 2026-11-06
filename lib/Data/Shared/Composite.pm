@@ -15,9 +15,6 @@ sub CLONE_SKIP { 1 }
 
 my %PARENT_OK = map { $_ => 1 } qw(hashmap sortedset kdtree graph);
 
-# Both spellings of a composite spec take a fixed set of keys, and only the
-# arrayref one said so: a hashref spec's misspelled max_children was ignored
-# and the mount silently took the default.
 sub _refuse_unknown_keys {
     my ($hash, $what, @allowed) = @_;
     my %ok = map { $_ => 1 } @allowed;
@@ -74,9 +71,6 @@ sub parse_node {
         }
         # A trailing hashref here is a constructor argument -- sortedset's
         # options, perfecthash's build spec -- so it cannot also be a child.
-        # Written as one, it silently became an argument and the level below
-        # it vanished: the mount succeeded one level short and the deep write
-        # died in the backend.
         if (@elems && ref $elems[-1] eq 'HASH'
                 && grep { exists $elems[-1]{$_} } qw(spec type class key child)) {
             Carp::croak('Data::Shared: a child spec in an arrayref composite spec must be'
@@ -98,18 +92,12 @@ sub parse_node {
 }
 
 # One leading undef or ':file' asks the facade to supply the file, so it is
-# not an argument. Everything that reads a spec's args must look past it: the
-# guard below read them unstripped, and an even-length [undef, {...}] became
-# the key/value list (undef => {...}), naming nothing.
+# not an argument: everything that reads a spec's args must look past it.
 sub _strip_placeholder {
     my ($args) = @_;
     my @a = @$args;
     my $placeholder = sub { @a && (!defined $a[0] || (!ref $a[0] && $a[0] eq ':file'))};
     shift @a if $placeholder->();
-    # A second one slipped past the guard the same way the first did, and the
-    # mount was accepted: the composite published, and then every child
-    # creation died in the backend layer saying 'max' was missing when it had
-    # been given. One placeholder is one file.
     Carp::croak("Data::Shared: a spec names the backing-path placeholder"
         . " (undef or ':file') more than once; the facade supplies one file")
         if $placeholder->();
@@ -137,13 +125,8 @@ sub _preflight {
         Data::Shared::Storage::_load($current->{resolved});
         last if $opening;
     }
-    # Only the parent's own arguments were ever planned, so a malformed CHILD
-    # spec mounted, published, and then every child creation died in
-    # Storage::plan -- an empty or odd option list, a perfecthash child with
-    # nothing to build from. plan touches no filesystem, so planning each
-    # child level here refuses the shape before anything is published. Not on
-    # reopen: the spec in the manifest was planned when it was first mounted,
-    # and an untouched child must not block reading or retiring the rest.
+    # plan touches no filesystem, so planning each child level here refuses a
+    # malformed child spec before anything is published.
     unless ($opening) {
         # The same shape a child gets: its own directory below the composite.
         my $as_child = bless { dir => defined $dir ? "$dir/child-0" : undef }, 'Data::Shared';
@@ -183,10 +166,9 @@ sub _validate_node {
     _refuse_shared_child_path($node->{child});
 }
 
-# One spec serves every child, so a path in it names one file for all of them;
-# the croak below says the rest. Only the families that can name a path at all
-# -- in their options, or as the argument a handle constructor takes -- can
-# express it.
+# One spec serves every child, so a path in it names one file for all of them.
+# Only the families that can name a path at all -- in their options, or as the
+# argument a handle constructor takes -- can express it.
 sub _refuse_shared_child_path {
     my ($child) = @_;
     my $args = _strip_placeholder($child->{args} || []);
@@ -354,9 +336,7 @@ sub _key_int_bits {
 }
 
 # The variant name when there is one, else the class's last component. Both
-# questions below asked this of variant and class with a pattern each, so the
-# two spellings of one lookup could drift apart. Verified identical over all
-# 87 specs the registry resolves.
+# questions below ask it of this one helper rather than matching their own.
 sub _key_probe {
     my ($resolved) = @_;
     return lc $resolved->{variant} if defined $resolved->{variant};
@@ -483,9 +463,8 @@ sub _freeze_once {
     return 1;
 }
 
-# Resolved once: every composite open asked for it twice, and resolve_spec
-# scans the ten hashmap variants to build a fresh hashref each time. Nothing
-# writes to a resolved spec for the index, so one copy is shared.
+# Nothing writes to a resolved spec for the index, so one copy is shared
+# instead of resolving it again on every composite open.
 my $INDEX_SPEC;
 sub _index_spec { return $INDEX_SPEC ||= Data::Shared::Registry::resolve_spec('hashmap:ss') }
 
@@ -605,7 +584,6 @@ sub _is_index_parent {
 sub _parent_exists {
     my ($self, $addr) = @_;
     return defined $self->_reg_id($addr) ? 1 : 0 if $self->_is_index_parent;
-    return 0 unless $self->{parent_handle};
     my $r = Data::Shared::_dispatch_record('exists', $self->{parent_record}, [$addr]);
     return $r ? 1 : 0;
 }
@@ -613,7 +591,6 @@ sub _parent_exists {
 sub _parent_register {
     my ($self, $addr, $id) = @_;
     return if $self->_is_index_parent;
-    return unless $self->{parent_handle};
     my $key = $self->{node}{resolved}{entry}{key} || '';
     if ($key eq 'sortedset') {
         if (!$self->_parent_exists($addr)) {
@@ -642,7 +619,6 @@ sub _parent_register {
 sub _parent_unregister {
     my ($self, $addr) = @_;
     return if $self->_is_index_parent;
-    return unless $self->{parent_handle};
     if ($self->_parent_exists($addr)) {
         Data::Shared::_dispatch_record('delete', $self->{parent_record}, [$addr]);
         Carp::croak('Data::Shared: cannot unregister child in parent backend') if $self->_parent_exists($addr);
